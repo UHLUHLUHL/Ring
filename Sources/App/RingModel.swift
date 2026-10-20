@@ -252,7 +252,7 @@ enum RingMotion {
     /// Draw the check, hold it briefly, then use the normal ring close animation.
     static let successVisible = 1.35
     static let fold = 0.4
-    static let close = 0.48
+    static let close = 0.30
     static var closeDuration: Double { NSWorkspace.shared.accessibilityDisplayShouldReduceMotion ? 0.18 : close }
     static var dismissal: Animation {
         .timingCurve(0.65, 0, 0.25, 1, duration: closeDuration)
