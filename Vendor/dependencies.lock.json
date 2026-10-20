@@ -1,0 +1,37 @@
+{
+  "webp": {
+    "version": "1.6.0",
+    "url": "https://storage.googleapis.com/downloads.webmproject.org/releases/webp/libwebp-1.6.0.tar.gz",
+    "sha256": "e4ab7009bf0629fd11982d4c2aa83964cf244cffba7347ecd39019a9e38c4564"
+  },
+  "avif": {
+    "version": "1.4.2",
+    "url": "https://codeload.github.com/AOMediaCodec/libavif/tar.gz/refs/tags/v1.4.2",
+    "sha256": "2b645287340ba5a631d268b551dc2d72bd73ac33335962dd36dcdb6d8366921d"
+  },
+  "aom": {
+    "version": "3.15.2",
+    "url": "https://aomedia.googlesource.com/aom/+archive/refs/tags/v3.15.2.tar.gz",
+    "sha256": "7db5a4dcd170f83254e7b91a53d40556070cdc7ff9a7d40a76e4aa8da6792e9f"
+  },
+  "jpeg": {
+    "version": "3.2.0",
+    "url": "https://codeload.github.com/libjpeg-turbo/libjpeg-turbo/tar.gz/refs/tags/3.2.0",
+    "sha256": "980dd81f425082aa6d7c9e47fef27554ce7a9ffc8e2f6e863b97d263c5c50858"
+  },
+  "nasm": {
+    "version": "2.16.03",
+    "url": "https://www.nasm.us/pub/nasm/releasebuilds/2.16.03/nasm-2.16.03.tar.xz",
+    "sha256": "1412a1c760bbd05db026b6c0d1657affd6631cd0a63cddb6f73cc6d4aa616148"
+  },
+  "cmake": {
+    "version": "3.31.8",
+    "url": "https://github.com/Kitware/CMake/releases/download/v3.31.8/cmake-3.31.8-macos-universal.tar.gz",
+    "sha256": "d1449f969c54d5c00886d5b643340d493dfb3c81cb39ee29b35453395c11ebf7"
+  },
+  "qpdf": {
+    "version": "12.4.2",
+    "url": "https://codeload.github.com/qpdf/qpdf/tar.gz/refs/tags/v12.4.2",
+    "sha256": "88ddeb5f25c6e9156f3113fc3994d3a5e0cdfeee398cd09dd00fabc9dac9f573"
+  }
+}

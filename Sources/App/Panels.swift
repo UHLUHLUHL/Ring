@@ -1,0 +1,541 @@
+import AppKit
+import ImageIO
+import SwiftUI
+
+// MARK: - Shared panel chrome
+
+struct GlassPanel<Content: View>: View {
+    let title: String
+    let subtitle: String
+    let width: CGFloat
+    let onClose: () -> Void
+    @ViewBuilder let content: Content
+
+    var body: some View {
+        VStack(spacing: 14) {
+            ZStack {
+                Text(title).font(.system(size: 15, weight: .bold))
+                HStack {
+                    Button(action: onClose) {
+                        Image(systemName: "xmark")
+                            .font(.system(size: 11, weight: .bold))
+                            .frame(width: 28, height: 28)
+                    }
+                    .buttonStyle(.glass)
+                    .buttonBorderShape(.circle)
+                    Spacer()
+                    Text(subtitle)
+                        .font(.system(size: 12)).foregroundStyle(.secondary)
+                        .lineLimit(1).truncationMode(.middle)
+                        .frame(maxWidth: 150, alignment: .trailing)
+                }
+            }
+            content
+        }
+        .padding(20)
+        .frame(width: width)
+        .glassEffect(.regular, in: RoundedRectangle(cornerRadius: 30, style: .continuous))
+        .hitTestableGlass(RoundedRectangle(cornerRadius: 30, style: .continuous))
+    }
+}
+
+struct FieldLabel: View {
+    let text: String
+    var body: some View {
+        Text(text)
+            .font(.system(size: 13, weight: .medium))
+            .foregroundStyle(.secondary)
+            .frame(width: 52, alignment: .leading)
+    }
+}
+
+/// One labelled control row of a tool panel: label column on the panel's leading edge,
+/// control filling the rest up to the trailing edge, so every row shares the same two edges.
+struct PanelRow<Content: View>: View {
+    let label: String
+    @ViewBuilder var content: Content
+    var body: some View {
+        HStack(spacing: 12) {
+            FieldLabel(text: label)
+            content.frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+/// Segmented control whose segments share the full row width. SwiftUI's segmented Picker keeps
+/// its intrinsic width on macOS and sat centred in the row, so its edges matched nothing else.
+struct FillSegmented<Value: CaseIterable & Hashable & RawRepresentable>: NSViewRepresentable where Value.RawValue == String {
+    @Binding var selection: Value
+    private let values = Array(Value.allCases)
+
+    init(selection: Binding<Value>) { _selection = selection }
+
+    func makeNSView(context: Context) -> NSSegmentedControl {
+        let control = NSSegmentedControl(labels: values.map(\.rawValue), trackingMode: .selectOne,
+                                         target: context.coordinator, action: #selector(Coordinator.changed(_:)))
+        control.segmentDistribution = .fillEqually
+        control.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        control.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        return control
+    }
+
+    func updateNSView(_ control: NSSegmentedControl, context: Context) {
+        context.coordinator.parent = self
+        control.selectedSegment = values.firstIndex(of: selection) ?? -1
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator(self) }
+
+    final class Coordinator: NSObject {
+        var parent: FillSegmented
+        init(_ parent: FillSegmented) { self.parent = parent }
+        @objc func changed(_ sender: NSSegmentedControl) {
+            guard parent.values.indices.contains(sender.selectedSegment) else { return }
+            parent.selection = parent.values[sender.selectedSegment]
+        }
+    }
+}
+
+func pixelSize(of url: URL) -> CGSize {
+    guard let src = CGImageSourceCreateWithURL(url as CFURL, nil),
+          let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any],
+          let w = props[kCGImagePropertyPixelWidth] as? Int,
+          let h = props[kCGImagePropertyPixelHeight] as? Int else { return CGSize(width: 1000, height: 1000) }
+    let rotated = (props[kCGImagePropertyOrientation] as? Int ?? 1) >= 5
+    return CGSize(width: rotated ? h:w, height: rotated ? w:h)
+}
+
+/// A bounded preview; full-resolution pixels are loaded only by the engine on save.
+func panelPreview(of url:URL)->NSImage? {
+    guard let source=CGImageSourceCreateWithURL(url as CFURL,[kCGImageSourceShouldCache:false] as CFDictionary),
+          let image=CGImageSourceCreateThumbnailAtIndex(source,0,[kCGImageSourceCreateThumbnailFromImageAlways:true,
+              kCGImageSourceThumbnailMaxPixelSize:1024,kCGImageSourceCreateThumbnailWithTransform:true] as CFDictionary) else { return nil }
+    return NSImage(cgImage:image,size:.zero)
+}
+
+// MARK: - Crop
+
+struct CropPanel: View {
+    @ObservedObject var model: RingModel
+
+    enum Ratio: String, CaseIterable, Identifiable {
+        case free = "자유", square = "1:1", fourThree = "4:3", threeFour = "3:4", wide = "16:9", tall = "9:16"
+        var id: String { rawValue }
+        var value: CGFloat? {
+            switch self {
+            case .free: return nil
+            case .square: return 1
+            case .fourThree: return 4.0 / 3
+            case .threeFour: return 3.0 / 4
+            case .wide: return 16.0 / 9
+            case .tall: return 9.0 / 16
+            }
+        }
+    }
+
+    @State private var crop = CGRect(x: 0, y: 0, width: 1, height: 1) // normalized to the image
+    @State private var dragStart: CGRect?
+    @State private var ratio: Ratio = .free
+    private let image: NSImage?
+    private let pixels: CGSize
+    private let jpegSampling: JPEGSampling?
+    private let orientation: Int
+    private let area = CGSize(width: 380, height: 300)
+
+    init(model: RingModel) {
+        self.model = model
+        image = panelPreview(of:model.file.url)
+        pixels = pixelSize(of: model.file.url)
+        jpegSampling = ["jpg","jpeg"].contains(model.file.url.pathExtension.lowercased()) ? (try? JPEGSampling(Data(contentsOf:model.file.url,options:.mappedIfSafe))) : nil
+        let source = CGImageSourceCreateWithURL(model.file.url as CFURL,nil)
+        let props = source.flatMap { CGImageSourceCopyPropertiesAtIndex($0,0,nil) as? [CFString:Any] }
+        orientation = props?[kCGImagePropertyOrientation] as? Int ?? 1
+    }
+
+    private var fitted: CGRect {
+        let s = min(area.width / pixels.width, area.height / pixels.height) * 0.92
+        let w = pixels.width * s, h = pixels.height * s
+        return CGRect(x: (area.width - w) / 2, y: (area.height - h) / 2, width: w, height: h)
+    }
+
+    private var cropOnScreen: CGRect {
+        let f = fitted
+        return CGRect(x: f.minX + crop.minX * f.width, y: f.minY + crop.minY * f.height,
+                      width: crop.width * f.width, height: crop.height * f.height)
+    }
+
+    var body: some View {
+        GlassPanel(title: model.regionTitle, subtitle: model.file.name, width: 420, onClose: model.backToRing) {
+            preview
+                .onChange(of:crop) { _,value in
+                    guard case .crop = model.regionPurpose,let sampling=jpegSampling,
+                          let raw=try? ImageEdits.rawRect(value,width:sampling.width,height:sampling.height,orientation:orientation) else { return }
+                    let snapped=ImageEdits.displayRect(sampling.snapped(raw),width:sampling.width,height:sampling.height,orientation:orientation)
+                    if abs(snapped.minX-value.minX)>0.0000001 || abs(snapped.minY-value.minY)>0.0000001 || abs(snapped.width-value.width)>0.0000001 || abs(snapped.height-value.height)>0.0000001 { crop=snapped }
+                }
+            if let sampling=jpegSampling,case .crop = model.regionPurpose {
+                Text("JPEG 무손실 · \(sampling.mcuWidth)×\(sampling.mcuHeight)px 격자로 선택")
+                    .font(.system(size:11)).foregroundStyle(.secondary)
+            }
+            PanelRow(label: "비율") {
+                FillSegmented(selection: $ratio)
+                    .onChange(of: ratio) { _, r in apply(ratio: r) }
+            }
+            PanelRow(label: "크기") {
+                HStack(spacing: 8) {
+                    Text("W").font(.system(size: 12, weight: .medium)).foregroundStyle(.secondary)
+                    TextField("", value: pixelBinding(\.width), format: .number.grouping(.never))
+                        .textFieldStyle(.roundedBorder).frame(maxWidth: .infinity)
+                    Text("H").font(.system(size: 12, weight: .medium)).foregroundStyle(.secondary)
+                        .padding(.leading, 4)
+                    TextField("", value: pixelBinding(\.height), format: .number.grouping(.never))
+                        .textFieldStyle(.roundedBorder).frame(maxWidth: .infinity)
+                    Text("px").font(.system(size: 12)).foregroundStyle(.secondary)
+                }
+            }
+            HStack(spacing: 8) {
+                Button("초기화") { withAnimation(.snappy) { crop = CGRect(x: 0, y: 0, width: 1, height: 1); ratio = .free } }
+                    .buttonStyle(.glass)
+                Spacer()
+                Button("취소", action: model.backToRing).buttonStyle(.glass)
+                Button("적용") { model.applyRegion(crop) }
+                    .disabled(model.isWorking)
+                    .buttonStyle(.glassProminent)
+                    .keyboardShortcut(.defaultAction)
+            }
+            .controlSize(.regular)
+        }
+    }
+
+    private var preview: some View {
+        let f = fitted, c = cropOnScreen
+        return ZStack(alignment: .topLeading) {
+            RoundedRectangle(cornerRadius: 18, style: .continuous).fill(.black.opacity(0.06))
+            if let image {
+                Image(nsImage: image).resizable()
+                    .frame(width: f.width, height: f.height)
+                    .offset(x: f.minX, y: f.minY)
+                    .shadow(color: .black.opacity(0.18), radius: 6, y: 2)
+            }
+            // Dim everything outside the crop rectangle (one even-odd path, painted once).
+            Path { p in p.addRect(f); p.addRect(c) }
+                .fill(.black.opacity(0.5), style: FillStyle(eoFill: true))
+            cropFrame(c)
+            Text("\(Int(crop.width * pixels.width)) × \(Int(crop.height * pixels.height))")
+                .font(.system(size: 11, weight: .bold)).foregroundStyle(.white)
+                .padding(.horizontal, 8).padding(.vertical, 3)
+                .background(Capsule().fill(Color.accentColor))
+                .offset(x: c.minX + 8, y: c.minY + 8)
+        }
+        .frame(width: area.width, height: area.height)
+        .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+    }
+
+    private func cropFrame(_ c: CGRect) -> some View {
+        ZStack(alignment: .topLeading) {
+            Rectangle().strokeBorder(Color.accentColor, lineWidth: 2)
+                .frame(width: c.width, height: c.height)
+                .overlay {
+                    Path { p in
+                        for k in 1...2 {
+                            let x = c.width * CGFloat(k) / 3, y = c.height * CGFloat(k) / 3
+                            p.move(to: CGPoint(x: x, y: 0)); p.addLine(to: CGPoint(x: x, y: c.height))
+                            p.move(to: CGPoint(x: 0, y: y)); p.addLine(to: CGPoint(x: c.width, y: y))
+                        }
+                    }
+                    .stroke(Color.accentColor.opacity(0.35), lineWidth: 1)
+                }
+                .contentShape(Rectangle())
+                .gesture(drag(edges: [.top, .bottom, .leading, .trailing], move: true))
+                .offset(x: c.minX, y: c.minY)
+            ForEach(Handle.all, id: \.self) { h in
+                handleView(h)
+                    .position(x: c.minX + h.ux * c.width, y: c.minY + h.uy * c.height)
+                    .gesture(drag(edges: h.edges, move: false))
+            }
+        }
+    }
+
+    struct Handle: Hashable {
+        let ux: CGFloat, uy: CGFloat
+        var edges: Edge.Set {
+            var e: Edge.Set = []
+            if ux == 0 { e.insert(.leading) }; if ux == 1 { e.insert(.trailing) }
+            if uy == 0 { e.insert(.top) }; if uy == 1 { e.insert(.bottom) }
+            return e
+        }
+        var isCorner: Bool { ux != 0.5 && uy != 0.5 }
+        static let all: [Handle] = [(0, 0), (0.5, 0), (1, 0), (0, 0.5), (1, 0.5), (0, 1), (0.5, 1), (1, 1)].map { Handle(ux: $0.0, uy: $0.1) }
+    }
+
+    private func handleView(_ h: Handle) -> some View {
+        let size: CGSize = h.isCorner ? CGSize(width: 14, height: 14)
+            : (h.uy == 0.5 ? CGSize(width: 6, height: 28) : CGSize(width: 28, height: 6))
+        return RoundedRectangle(cornerRadius: min(size.width, size.height) / 2)
+            .fill(.white)
+            .overlay(RoundedRectangle(cornerRadius: min(size.width, size.height) / 2).stroke(Color.accentColor, lineWidth: 2))
+            .frame(width: size.width, height: size.height)
+            .shadow(color: .black.opacity(0.2), radius: 2, y: 1)
+            .frame(width: 30, height: 30)
+            .contentShape(Rectangle())
+    }
+
+    private func drag(edges: Edge.Set, move: Bool) -> some Gesture {
+        DragGesture(minimumDistance: 1)
+            .onChanged { v in
+                let start = dragStart ?? crop
+                if dragStart == nil { dragStart = crop }
+                let dx = v.translation.width / fitted.width, dy = v.translation.height / fitted.height
+                var r = start
+                if move {
+                    r.origin.x = min(max(0, start.minX + dx), 1 - start.width)
+                    r.origin.y = min(max(0, start.minY + dy), 1 - start.height)
+                } else {
+                    var minX = start.minX, maxX = start.maxX, minY = start.minY, maxY = start.maxY
+                    if edges.contains(.leading) { minX = min(max(0, minX + dx), maxX - 0.05) }
+                    if edges.contains(.trailing) { maxX = max(min(1, maxX + dx), minX + 0.05) }
+                    if edges.contains(.top) { minY = min(max(0, minY + dy), maxY - 0.05) }
+                    if edges.contains(.bottom) { maxY = max(min(1, maxY + dy), minY + 0.05) }
+                    r = CGRect(x: minX, y: minY, width: maxX - minX, height: maxY - minY)
+                    if let value = ratio.value { r = constrain(r, to: value, anchorTop: edges.contains(.bottom) || !edges.contains(.top)) }
+                }
+                crop = r
+            }
+            .onEnded { _ in dragStart = nil }
+    }
+
+    /// Keeps the pixel aspect ratio by deriving height from width, then fits inside the image.
+    private func constrain(_ r: CGRect, to value: CGFloat, anchorTop: Bool) -> CGRect {
+        var w = r.width
+        var h = w * pixels.width / value / pixels.height
+        if h > 1 { h = 1; w = h * value * pixels.height / pixels.width }
+        var y = anchorTop ? r.minY : r.maxY - h
+        y = min(max(0, y), 1 - h)
+        let x = min(max(0, r.minX), 1 - w)
+        return CGRect(x: x, y: y, width: w, height: h)
+    }
+
+    private func apply(ratio r: Ratio) {
+        guard let value = r.value else { return }
+        // Largest rectangle of this ratio, centred on the current crop.
+        var w: CGFloat = 1
+        var h = w * pixels.width / value / pixels.height
+        if h > 1 { h = 1; w = h * value * pixels.height / pixels.width }
+        let cx = min(max(crop.midX, w / 2), 1 - w / 2), cy = min(max(crop.midY, h / 2), 1 - h / 2)
+        withAnimation(.snappy) { crop = CGRect(x: cx - w / 2, y: cy - h / 2, width: w, height: h) }
+    }
+
+    private func pixelBinding(_ key: KeyPath<CGSize, CGFloat>) -> Binding<Int> {
+        Binding(
+            get: { Int((key == \CGSize.width ? crop.width : crop.height) * pixels[keyPath: key]) },
+            set: { px in
+                let n = min(max(CGFloat(px) / pixels[keyPath: key], 0.05), 1)
+                if key == \CGSize.width { crop.size.width = n; crop.origin.x = min(crop.minX, 1 - n) }
+                else { crop.size.height = n; crop.origin.y = min(crop.minY, 1 - n) }
+                ratio = .free
+            })
+    }
+}
+
+// MARK: - Add background
+
+struct AddBackgroundPanel: View {
+    @ObservedObject var model: RingModel
+
+    enum Background: Equatable {
+        case gradient(Int), solid(Int), custom, image
+    }
+    enum Ratio: String, CaseIterable, Identifiable {
+        case auto = "자동", square = "1:1", wide = "16:9", portrait = "4:5", tall = "9:16"
+        var id: String { rawValue }
+        var value: CGFloat? {
+            switch self {
+            case .auto: return nil
+            case .square: return 1
+            case .wide: return 16.0 / 9
+            case .portrait: return 4.0 / 5
+            case .tall: return 9.0 / 16
+            }
+        }
+    }
+
+    static let gradients: [[Color]] = [
+        [Color(red: 1, green: 0.45, blue: 0.35), Color(red: 1, green: 0.8, blue: 0.3)],
+        [Color(red: 0.55, green: 0.6, blue: 1), Color(red: 0.95, green: 0.6, blue: 0.9)],
+        [Color(red: 0.3, green: 0.85, blue: 0.75), Color(red: 0.2, green: 0.5, blue: 0.95)],
+        [Color(red: 0.98, green: 0.98, blue: 1), Color(red: 0.82, green: 0.86, blue: 0.95)],
+        [Color(red: 0.15, green: 0.15, blue: 0.2), Color(red: 0.38, green: 0.32, blue: 0.55)],
+        [Color(red: 1, green: 0.62, blue: 0.72), Color(red: 0.6, green: 0.4, blue: 1)],
+        [Color(red: 0.97, green: 0.78, blue: 0.52), Color(red: 0.88, green: 0.38, blue: 0.3)],
+        [Color(red: 0.4, green: 0.88, blue: 0.5), Color(red: 0.92, green: 0.95, blue: 0.35)],
+    ]
+    static let solids: [Color] = [.white, Color(white: 0.9), Color(white: 0.11), .red, .orange, .green, .blue, .purple]
+
+    @State private var background: Background = .gradient(0)
+    @State private var customColor: Color = .teal
+    @State private var bgImage: NSImage?
+    @State private var bgImageURL: URL?
+    @State private var padding: Double = 160
+    @State private var corner: Double = 24
+    @State private var shadow: Double = 24
+    @State private var ratio: Ratio = .auto
+    private let image: NSImage?
+    private let pixels: CGSize
+    private let area = CGSize(width: 416, height: 240)
+
+    init(model: RingModel) {
+        self.model = model
+        image = panelPreview(of:model.file.url)
+        pixels = pixelSize(of: model.file.url)
+    }
+
+    var body: some View {
+        GlassPanel(title: "배경 추가", subtitle: model.file.name, width: 456, onClose: model.backToRing) {
+            preview
+            VStack(alignment: .leading, spacing: 8) {
+                Text("배경").font(.system(size: 13, weight: .medium)).foregroundStyle(.secondary)
+                HStack(spacing: 8) {
+                    ForEach(0..<Self.gradients.count, id: \.self) { i in
+                        swatch(.gradient(i)) { LinearGradient(colors: Self.gradients[i], startPoint: .topLeading, endPoint: .bottomTrailing) }
+                    }
+                    Button(action: pickImage) {
+                        Image(systemName: "photo.badge.plus").font(.system(size: 15))
+                            .frame(width: 36, height: 36)
+                            .background(RoundedRectangle(cornerRadius: 10, style: .continuous).fill(.black.opacity(0.07)))
+                            .overlay(selectionRing(background == .image))
+                    }
+                    .buttonStyle(.plain).help("이미지를 배경으로")
+                }
+                HStack(spacing: 8) {
+                    ForEach(0..<Self.solids.count, id: \.self) { i in
+                        swatch(.solid(i)) { Self.solids[i] }
+                    }
+                    ColorPicker("", selection: Binding(get: { customColor }, set: { customColor = $0; background = .custom }))
+                        .labelsHidden().frame(width: 36, height: 36)
+                        .overlay(selectionRing(background == .custom).allowsHitTesting(false))
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            VStack(spacing: 4) {
+                sliderRow("여백", $padding, 0...400)
+                sliderRow("모서리", $corner, 0...80)
+                sliderRow("그림자", $shadow, 0...60)
+            }
+            PanelRow(label: "비율") {
+                FillSegmented(selection: $ratio)
+            }
+            HStack(spacing: 8) {
+                Button("초기화") {
+                    withAnimation(.snappy) { background = .gradient(0); padding = 160; corner = 24; shadow = 24; ratio = .auto }
+                }
+                .buttonStyle(.glass)
+                Spacer()
+                Button("취소", action: model.backToRing).buttonStyle(.glass)
+                Button("배경 넣어 저장", action: saveBackground)
+                    .disabled(model.isWorking)
+                    .buttonStyle(.glassProminent)
+                    .keyboardShortcut(.defaultAction)
+            }
+            .controlSize(.regular)
+        }
+    }
+
+    private var preview: some View {
+        // Output size in pixels, then scaled to fit the preview area.
+        let p = CGFloat(padding)
+        let natural = CGSize(width: pixels.width + 2 * p, height: pixels.height + 2 * p)
+        var out = natural
+        if let value = ratio.value {
+            out = natural.width / natural.height > value
+                ? CGSize(width: natural.width, height: natural.width / value)
+                : CGSize(width: natural.height * value, height: natural.height)
+        }
+        let s = min(area.width / out.width, area.height / out.height) * 0.94
+        let inner = CGSize(width: out.width - 2 * p, height: out.height - 2 * p)
+        let fit = min(inner.width / pixels.width, inner.height / pixels.height)
+        let imgSize = CGSize(width: pixels.width * fit * s, height: pixels.height * fit * s)
+        return ZStack {
+            RoundedRectangle(cornerRadius: 18, style: .continuous).fill(.black.opacity(0.06))
+            ZStack {
+                backgroundFill
+                if let image {
+                    Image(nsImage: image).resizable()
+                        .frame(width: imgSize.width, height: imgSize.height)
+                        .clipShape(RoundedRectangle(cornerRadius: CGFloat(corner) * s, style: .continuous))
+                        .shadow(color: .black.opacity(shadow > 0 ? 0.28 : 0), radius: CGFloat(shadow) * s, y: CGFloat(shadow) * s * 0.3)
+                }
+            }
+            .frame(width: out.width * s, height: out.height * s)
+            .clipShape(RoundedRectangle(cornerRadius: 4))
+        }
+        .frame(width: area.width, height: area.height)
+        .animation(.snappy, value: ratio)
+    }
+
+    @ViewBuilder private var backgroundFill: some View {
+        switch background {
+        case .gradient(let i): LinearGradient(colors: Self.gradients[i], startPoint: .topLeading, endPoint: .bottomTrailing)
+        case .solid(let i): Self.solids[i]
+        case .custom: customColor
+        case .image:
+            if let bgImage { Image(nsImage: bgImage).resizable().aspectRatio(contentMode: .fill) } else { Color.gray }
+        }
+    }
+
+    private func swatch<S: View>(_ value: Background, @ViewBuilder fill: () -> S) -> some View {
+        Button { withAnimation(.snappy) { background = value } } label: {
+            fill()
+                .frame(width: 36, height: 36)
+                .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).stroke(.black.opacity(0.08)))
+                .overlay(selectionRing(background == value))
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func selectionRing(_ on: Bool) -> some View {
+        RoundedRectangle(cornerRadius: 12.5, style: .continuous)
+            .stroke(Color.accentColor, lineWidth: 2.5)
+            .padding(-3.5)
+            .opacity(on ? 1 : 0)
+    }
+
+    private func sliderRow(_ label: String, _ value: Binding<Double>, _ range: ClosedRange<Double>) -> some View {
+        PanelRow(label: label) {
+            HStack(spacing: 12) {
+                Slider(value: value, in: range)
+                Text("\(Int(value.wrappedValue)) px")
+                    .font(.system(size: 12, weight: .medium).monospacedDigit())
+                    .foregroundStyle(.secondary)
+                    .frame(width: 56, alignment: .trailing)
+            }
+        }
+    }
+
+    private func saveBackground() {
+        let colors: [Color]
+        switch background {
+        case .gradient(let i):colors = Self.gradients[i]
+        case .solid(let i):colors = [Self.solids[i]]
+        case .custom:colors = [customColor]
+        case .image:colors = [.gray]
+        }
+        let rgba = colors.map { color -> RGBAColor in
+            let c = NSColor(color).usingColorSpace(.sRGB) ?? .white
+            return RGBAColor(red:c.redComponent,green:c.greenComponent,blue:c.blueComponent,alpha:c.alphaComponent)
+        }
+        model.run(.edit(.background(BackgroundOptions(colors:rgba,imageURL:background == .image ? bgImageURL:nil,
+                                                    padding:padding,corner:corner,shadow:shadow,ratio:ratio.value.map(Double.init)))))
+    }
+
+    private func pickImage() {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.image]
+        if panel.runModal() == .OK, let url = panel.url, let img = panelPreview(of:url) {
+            bgImageURL = url
+            bgImage = img
+            background = .image
+        }
+    }
+}
