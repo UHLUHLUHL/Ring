@@ -22,6 +22,12 @@ extension MediaEngine {
               options.targetBytes == nil || options.targetBytes! > 0 else {
             throw EngineError.invalid("애니메이션 시간·FPS·크기 오류 (최대 60fps·1,800프레임)")
         }
+        guard let sourceTrack=try await asset.loadTracks(withMediaType:.video).first else { throw EngineError.unsupported("비디오 트랙을 찾지 못했어요.") }
+        let naturalSize=try await sourceTrack.load(.naturalSize),preferredTransform=try await sourceTrack.load(.preferredTransform)
+        let displaySize=naturalSize.applying(preferredTransform)
+        func extractionSize(for dimension:Int)->CGSize {
+            VideoCropGeometry.extractionSize(width:abs(Double(displaySize.width)),height:abs(Double(displaySize.height)),ratio:options.cropRatio,maxDimension:dimension)
+        }
         let resources = AnimationResources.shared
         resources.enter(); defer { resources.leave() }
         var fps = options.fps, dimension = options.maxDimension, lastSize = 0
@@ -30,7 +36,7 @@ extension MediaEngine {
            target < Int64(initial.frames.count) * Int64(dimension * dimension) * 2 {
             let sample = initial.sample
             let encoded = try await AnimationPipeline.encode(asset: asset, start: options.start, fps: fps, dimension: dimension,
-                plan: sample, format: options.format, quality: 85, allowParallelWebP: false) { EngineProgress.report(0.03 + 0.07 * $0) }
+                extractionSize:extractionSize(for:dimension),cropRatio: options.cropRatio, plan: sample, format: options.format, quality: 85, allowParallelWebP: false) { EngineProgress.report(0.03 + 0.07 * $0) }
             let estimate = Double(encoded.bytes.count) * Double(initial.frames.count) / Double(sample.frames.count) * 1.10
             if estimate > Double(target) * 1.10 {
                 let ratio = max(0.4, min(0.95, sqrt(Double(target) / estimate) * 0.95))
@@ -41,7 +47,7 @@ extension MediaEngine {
             try Task.checkCancellation()
             let plan = AnimationPlan(duration: duration, fps: fps, format: options.format)
             let encoded = try await AnimationPipeline.encode(asset: asset, start: options.start, fps: fps, dimension: dimension,
-                plan: plan, format: options.format, quality: max(40, 85 - attempt * 10), allowParallelWebP: options.targetBytes == nil) {
+                extractionSize:extractionSize(for:dimension),cropRatio: options.cropRatio, plan: plan, format: options.format, quality: max(40, 85 - attempt * 10), allowParallelWebP: options.targetBytes == nil) {
                     EngineProgress.report(0.10 + 0.80 * $0)
                 }
             EngineProgress.report(0.92)

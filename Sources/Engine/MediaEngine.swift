@@ -9,7 +9,7 @@ enum MediaEngine {
     static func run(_ source:URL,to output:URL,operation:VideoOperation) async throws -> String {
         switch operation {
         case .trim(let start,let end): return try await trim(source,to:output,start:start,end:end)
-        case .compress(let bytes,let codec): return try await compress(source,to:output,targetBytes:bytes,codec:codec)
+        case .compress(let options): return try await compress(source,to:output,options:options)
         case .animation(let options): return try await animate(source,to:output,options:options)
         }
     }
@@ -34,8 +34,12 @@ enum MediaEngine {
         return "패스스루 트림 · 재인코딩 없음 · \(String(format:"%.3f",end-start))초 · 샘플 경계 컷"
     }
 
-    static func compress(_ source:URL,to output:URL,targetBytes:Int64,codec:VideoCodec) async throws -> String {
+    static func compress(_ source:URL,to output:URL,options:VideoCompressionOptions) async throws -> String {
+        let targetBytes = options.targetBytes, codec = options.codec
         guard targetBytes>0,targetBytes<=1_000_000_000_000 else { throw EngineError.invalid("목표 비디오 용량 오류") }
+        if let maxDimension = options.maxDimension, !(16...8192).contains(maxDimension) {
+            throw EngineError.invalid("최대 영상 변은 16~8,192px이어야 해요.")
+        }
         let asset=AVURLAsset(url:source),duration=try await asset.load(.duration)
         let video=try await asset.loadTracks(withMediaType:.video),audio=try await asset.loadTracks(withMediaType:.audio)
         guard duration.seconds.isFinite,duration.seconds>0,video.count==1,audio.count<=1 else { throw EngineError.unsupported("비디오 1트랙·오디오 최대 1트랙만 압축해요.") }
@@ -53,14 +57,20 @@ enum MediaEngine {
         for attempt in 0..<2 {
             try Task.checkCancellation()
             let cap=rate<400000 ? 480:rate<900000 ? 720:1080
-            let display=natural.applying(transform),shortSide=min(abs(display.width),abs(display.height))
-            let scale=min(1,Double(cap)/max(1,shortSide))
-            let width=max(2,Int((natural.width*scale/2).rounded(.down))*2),height=max(2,Int((natural.height*scale/2).rounded(.down))*2)
-            try await encode(asset,to:output,video:track,audio:audio.first,duration:duration,width:width,height:height,transform:transform,scale:scale,bitrate:rate,audioRate:audioRate,codec:codec)
+            let display=natural.applying(transform)
+            let crop=VideoCropGeometry.centeredSize(width:abs(Double(display.width)),height:abs(Double(display.height)),aspectRatio:options.cropRatio.aspectRatio)
+            let longSide=Double(max(crop.width,crop.height)),shortSide=Double(min(crop.width,crop.height))
+            let scale=min(1,min(Double(cap)/max(1,shortSide),Double(options.maxDimension ?? Int.max)/max(1,longSide)))
+            let displayWidth=max(2,Int((Double(crop.width)*scale/2).rounded(.down))*2)
+            let displayHeight=max(2,Int((Double(crop.height)*scale/2).rounded(.down))*2)
+            let swapsAxes=abs(transform.b)>0.5 || abs(transform.c)>0.5
+            let width=swapsAxes ? displayHeight:displayWidth
+            let height=swapsAxes ? displayWidth:displayHeight
+            try await encode(asset,to:output,video:track,audio:audio.first,duration:duration,width:width,height:height,transform:transform,bitrate:rate,audioRate:audioRate,codec:codec)
             lastSize=try output.resourceValues(forKeys:[.fileSizeKey]).fileSize ?? 0
             if lastSize>0,Int64(lastSize)<=targetBytes {
                 try await verify(output,duration:duration.seconds,videos:1,audios:audio.isEmpty ? 0:1,width:width,height:height)
-                return "\(codec == .hevc ? "HEVC":"H.264") 하드웨어 압축 · \(width)×\(height) · \(lastSize)바이트 · 목표 이하 검증"
+                return "\(codec == .hevc ? "HEVC":"H.264") 하드웨어 압축 · \(displayWidth)×\(displayHeight) · \(lastSize)바이트 · 목표 이하 검증"
             }
             try FileManager.default.removeItem(at:output)
             if attempt==0 { rate=max(100000,Int(Double(rate)*Double(targetBytes)/Double(max(lastSize,1))*0.90)) }
@@ -68,19 +78,19 @@ enum MediaEngine {
         throw EngineError.quality("하드웨어 인코더 결과 \(lastSize)바이트가 목표 용량을 초과했어요.")
     }
 
-    private static func encode(_ asset:AVAsset,to output:URL,video:AVAssetTrack,audio:AVAssetTrack?,duration:CMTime,width:Int,height:Int,transform:CGAffineTransform,scale:Double,bitrate:Int,audioRate:Int,codec:VideoCodec) async throws {
+    private static func encode(_ asset:AVAsset,to output:URL,video:AVAssetTrack,audio:AVAssetTrack?,duration:CMTime,width:Int,height:Int,transform:CGAffineTransform,bitrate:Int,audioRate:Int,codec:VideoCodec) async throws {
         let reader=try AVAssetReader(asset:asset),writer=try AVAssetWriter(outputURL:output,fileType:.mp4)
         let videoOutput=AVAssetReaderTrackOutput(track:video,outputSettings:[kCVPixelBufferPixelFormatTypeKey as String:kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange])
         videoOutput.alwaysCopiesSampleData=false
         guard reader.canAdd(videoOutput) else { throw EngineError.unsupported("비디오 디코딩 경로를 지원하지 않아요.") };reader.add(videoOutput)
         let settings:[String:Any]=[
             AVVideoCodecKey:codec == .hevc ? AVVideoCodecType.hevc:AVVideoCodecType.h264,
-            AVVideoWidthKey:width,AVVideoHeightKey:height,AVVideoScalingModeKey:AVVideoScalingModeResizeAspect,
+            AVVideoWidthKey:width,AVVideoHeightKey:height,AVVideoScalingModeKey:AVVideoScalingModeResizeAspectFill,
             AVVideoEncoderSpecificationKey:[kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder as String:true],
             AVVideoCompressionPropertiesKey:[AVVideoAverageBitRateKey:bitrate,AVVideoAllowFrameReorderingKey:false,
                 AVVideoMaxKeyFrameIntervalDurationKey:2,kVTCompressionPropertyKey_DataRateLimits as String:[Double(bitrate)/8*1.2,1]]]
         let videoInput=AVAssetWriterInput(mediaType:.video,outputSettings:settings)
-        var adjusted=transform;adjusted.tx*=scale;adjusted.ty*=scale;videoInput.transform=adjusted
+        videoInput.transform=normalizedTransform(transform,width:width,height:height)
         guard writer.canAdd(videoInput) else { throw EngineError.unsupported("하드웨어 비디오 인코딩을 지원하지 않아요.") };writer.add(videoInput)
         var pairs:[(AVAssetReaderOutput,AVAssetWriterInput)]=[(videoOutput,videoInput)]
         if let audio {
@@ -128,6 +138,15 @@ enum MediaEngine {
                 guard writer.status == .completed else { throw writer.error ?? EngineError.io("비디오 마감 실패") }
             } catch { reader.cancelReading();writer.cancelWriting();throw error }
         } catch { reader.cancelReading();writer.cancelWriting();throw error }
+    }
+
+    private static func normalizedTransform(_ source:CGAffineTransform,width:Int,height:Int)->CGAffineTransform {
+        let linear=CGAffineTransform(a:source.a,b:source.b,c:source.c,d:source.d,tx:0,ty:0)
+        let bounds=CGRect(x:0,y:0,width:width,height:height).applying(linear)
+        var result=linear
+        result.tx = -bounds.minX
+        result.ty = -bounds.minY
+        return result
     }
 
     static func verify(_ url:URL,duration:Double,videos:Int,audios:Int,width:Int? = nil,height:Int? = nil) async throws {

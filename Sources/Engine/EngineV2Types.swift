@@ -19,6 +19,85 @@ struct DocumentRenderOptions {
 }
 
 enum VideoCodec { case hevc, h264 }
+enum VideoCropRatio: String, CaseIterable, Hashable {
+    case free = "자유", square = "1:1", fourThree = "4:3", threeFour = "3:4", wide = "16:9", tall = "9:16"
+
+    var cropUnits: (width: Int, height: Int)? {
+        switch self {
+        case .free: return nil
+        case .square: return (1, 1)
+        case .fourThree: return (4, 3)
+        case .threeFour: return (3, 4)
+        case .wide: return (16, 9)
+        case .tall: return (9, 16)
+        }
+    }
+
+    var aspectRatio: Double? {
+        switch self {
+        case .free: return nil
+        case .square: return 1
+        case .fourThree: return 4.0 / 3
+        case .threeFour: return 3.0 / 4
+        case .wide: return 16.0 / 9
+        case .tall: return 9.0 / 16
+        }
+    }
+}
+
+enum VideoCropGeometry {
+    static func centeredSize(width: Double, height: Double, aspectRatio: Double?) -> CGSize {
+        guard width.isFinite, height.isFinite, width > 0, height > 0,
+              let aspectRatio, aspectRatio.isFinite, aspectRatio > 0 else {
+            return CGSize(width: CGFloat(width), height: CGFloat(height))
+        }
+        if width / height > aspectRatio {
+            return CGSize(width: CGFloat(height * aspectRatio), height: CGFloat(height))
+        }
+        return CGSize(width: CGFloat(width), height: CGFloat(width / aspectRatio))
+    }
+
+    static func centeredRect(width: Int, height: Int, ratio: VideoCropRatio) -> CGRect {
+        guard width > 0, height > 0, let units = ratio.cropUnits else {
+            return CGRect(x: 0, y: 0, width: max(1, width), height: max(1, height))
+        }
+        // Integer multiples keep preset crops exact (for example, 16:9) and stable across frames.
+        let scale = min(width / units.width, height / units.height)
+        let cropWidth: Int, cropHeight: Int
+        if scale > 0 {
+            cropWidth=units.width*scale;cropHeight=units.height*scale
+        } else {
+            let size=centeredSize(width:Double(width),height:Double(height),aspectRatio:ratio.aspectRatio)
+            cropWidth=min(width,max(1,Int(size.width.rounded(.down))))
+            cropHeight=min(height,max(1,Int(size.height.rounded(.down))))
+        }
+        return CGRect(x: (width - cropWidth) / 2, y: (height - cropHeight) / 2,
+                      width: cropWidth, height: cropHeight)
+    }
+
+    static func extractionSize(width: Double, height: Double, ratio: VideoCropRatio, maxDimension: Int) -> CGSize {
+        let safeWidth=max(1,width),safeHeight=max(1,height),limit=Double(maxDimension)
+        let crop=centeredSize(width:safeWidth,height:safeHeight,aspectRatio:ratio.aspectRatio)
+        let scale=min(1,limit/max(1,Double(max(crop.width,crop.height))))
+        var outputWidth=safeWidth*scale,outputHeight=safeHeight*scale
+        // Leave a bounded margin for pixels that will be discarded by the crop.
+        let areaLimit=limit*limit*4
+        if outputWidth*outputHeight>areaLimit {
+            let areaScale=sqrt(areaLimit/(outputWidth*outputHeight))
+            outputWidth*=areaScale;outputHeight*=areaScale
+        }
+        let sideLimit=limit*4,sideScale=min(1,sideLimit/max(outputWidth,outputHeight))
+        return CGSize(width:CGFloat(outputWidth*sideScale),height:CGFloat(outputHeight*sideScale))
+    }
+}
+
+struct VideoCompressionOptions {
+    var targetBytes: Int64
+    var codec: VideoCodec
+    var maxDimension: Int? = nil
+    var cropRatio: VideoCropRatio = .free
+}
+
 enum AnimationFormat: String { case gif, webp }
 struct AnimationOptions {
     static let maximumFPS: Double = 60
@@ -29,6 +108,7 @@ struct AnimationOptions {
     var targetBytes: Int64? = nil
     var start: Double = 0
     var duration: Double? = nil
+    var cropRatio: VideoCropRatio = .free
 
     static func frameRateText(_ value: Double) -> String {
         var text = String(format: "%.3f", locale: Locale(identifier: "en_US_POSIX"), value)
@@ -40,7 +120,7 @@ struct AnimationOptions {
 enum VideoOperation {
     /// Passthrough cuts use container/sample boundaries, not arbitrary decoded frames.
     case trim(start: Double, end: Double)
-    case compress(targetBytes: Int64, codec: VideoCodec)
+    case compress(VideoCompressionOptions)
     case animation(AnimationOptions)
     var fileExtension: String {
         switch self {

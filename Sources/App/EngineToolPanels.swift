@@ -442,6 +442,8 @@ private struct VideoToolPanel:View {
     @State private var fps=""
     @State private var sourceFPS: Double?
     @State private var dimension="640"
+    @State private var compressionDimension=""
+    @State private var cropRatio=VideoCropRatio.free
     @State private var target=false
     @State private var player:AVPlayer?
     @State private var isPlaying=false
@@ -563,10 +565,22 @@ private struct VideoToolPanel:View {
             case .compress:
                 PanelRow(label:"원본") { Text(model.file.sizeText).foregroundStyle(.secondary) }
                 PanelRow(label:"목표") { SizeFields(value:$size,unit:$unit) }
+                PanelRow(label:"자르기") { FillSegmented(selection:$cropRatio).accessibilityIdentifier("video.cropRatio") }
+                PanelRow(label:"최대 변") {
+                    HStack(spacing:8) {
+                        TextField("자동",text:$compressionDimension).textFieldStyle(.roundedBorder)
+                            .frame(width:72).accessibilityLabel("비디오 최대 변").accessibilityIdentifier("video.maxDimension")
+                        Text("px · 중앙 기준 자르기").font(.system(size:11)).foregroundStyle(.secondary)
+                        Spacer(minLength:0)
+                    }
+                }
                 PanelRow(label:"코덱") { Picker("코덱",selection:$codec) { Text("HEVC · 고효율/작은 용량").tag("HEVC");Text("H.264 · 범용 호환성").tag("H264") }.labelsHidden() }
 
             case .animation(let format):
                 trimTimelineSection(videoHeight: 160, middlePrefix: "구간")
+                PanelRow(label:"자르기") { FillSegmented(selection:$cropRatio).accessibilityIdentifier("video.cropRatio") }
+                Text("영상 중앙을 기준으로 선택한 비율만 남겨요.")
+                    .font(.system(size:11)).foregroundStyle(.secondary)
                 PanelRow(label:"프레임") {
                     TextField("원본",text:$fps).textFieldStyle(.roundedBorder)
                         .frame(width:72).accessibilityLabel("애니메이션 FPS")
@@ -647,7 +661,11 @@ private struct VideoToolPanel:View {
 
     private func operation() throws -> EngineOperation {
         guard let duration else { throw EngineError.invalid("영상 정보를 읽는 중이에요.") }
-        if case .compress=tool { return .video(.compress(targetBytes:try ToolSettings.bytes(size,unit:unit),codec:codec == "HEVC" ? .hevc:.h264)) }
+        if case .compress=tool {
+            let text=compressionDimension.trimmingCharacters(in:.whitespacesAndNewlines)
+            let maxDimension=text.isEmpty ? nil:try ToolSettings.integer(text,name:"최대 변",range:16...8192)
+            return .video(.compress(.init(targetBytes:try ToolSettings.bytes(size,unit:unit),codec:codec == "HEVC" ? .hevc:.h264,maxDimension:maxDimension,cropRatio:cropRatio)))
+        }
         let from = startVal
         let to = endVal > 0 ? endVal : duration
         guard to > from, to <= duration + 0.001 else { throw EngineError.invalid("종료는 시작보다 늦고 영상 길이 이내여야 해요.") }
@@ -655,7 +673,7 @@ private struct VideoToolPanel:View {
         if case .animation(let format)=tool {
             let frames=try ToolSettings.number(fps,name:"FPS",range:1...AnimationOptions.maximumFPS),limit=try ToolSettings.integer(dimension,name:"최대 변",range:16...1920)
             guard (to-from)*frames<=Double(AnimationOptions.maximumFrames) else { throw EngineError.invalid("선택 구간은 최대 1,800프레임이어야 해요. 구간이나 FPS를 줄여 주세요.") }
-            return .video(.animation(.init(format:format,fps:frames,maxDimension:limit,targetBytes:target ? try ToolSettings.bytes(size,unit:unit):nil,start:from,duration:min(duration,to)-from)))
+            return .video(.animation(.init(format:format,fps:frames,maxDimension:limit,targetBytes:target ? try ToolSettings.bytes(size,unit:unit):nil,start:from,duration:min(duration,to)-from,cropRatio:cropRatio)))
         }
         throw EngineError.invalid("비디오 작업 오류")
     }

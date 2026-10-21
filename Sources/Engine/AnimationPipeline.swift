@@ -69,13 +69,14 @@ private final class AnimationFrameReader {
     let recovery: AVAssetImageGenerator
     let start: Double
     let dimension: Int
+    let cropRatio: VideoCropRatio
     private var size: CGSize?
-    init(asset: AVAsset, start: Double, fps: Double, dimension: Int) {
-        self.start = start; self.dimension = dimension
+    init(asset: AVAsset, start: Double, fps: Double, dimension: Int, maximumSize: CGSize, cropRatio: VideoCropRatio) {
+        self.start = start; self.dimension = dimension; self.cropRatio = cropRatio
         generator = AVAssetImageGenerator(asset: asset)
         recovery = AVAssetImageGenerator(asset: asset)
         generator.appliesPreferredTrackTransform = true
-        generator.maximumSize = CGSize(width: dimension, height: dimension)
+        generator.maximumSize = maximumSize
         recovery.appliesPreferredTrackTransform = true
         recovery.maximumSize = generator.maximumSize
         recovery.requestedTimeToleranceBefore = .zero
@@ -87,11 +88,15 @@ private final class AnimationFrameReader {
     deinit { generator.cancelAllCGImageGeneration(); recovery.cancelAllCGImageGeneration() }
 
     private func fitted(_ image: CGImage) throws -> CGImage {
-        let image = try autoreleasepool { try ImageResampler.fit(image, maxDimension: dimension) }
-        let current = CGSize(width: image.width, height: image.height)
+        let result = try autoreleasepool { () throws -> CGImage in
+            let rect = VideoCropGeometry.centeredRect(width: image.width, height: image.height, ratio: cropRatio)
+            guard let cropped = image.cropping(to: rect) else { throw EngineError.io("비디오 프레임 자르기 실패") }
+            return try ImageResampler.fit(cropped, maxDimension: dimension)
+        }
+        let current = CGSize(width: result.width, height: result.height)
         if let size, size != current { throw EngineError.unsupported("프레임별 해상도가 바뀌는 영상은 변환하지 않아요.") }
         size = current
-        return image
+        return result
     }
 
     func read(_ frames: ArraySlice<AnimationPlan.Frame>) async throws -> [CGImage] {
@@ -205,11 +210,12 @@ enum AnimationPipeline {
         } }
     }
 
-    static func encode(asset: AVAsset, start: Double, fps: Double, dimension: Int,
-                       plan: AnimationPlan, format: AnimationFormat, quality: Int,
+    static func encode(asset: AVAsset, start: Double, fps: Double, dimension: Int, extractionSize:CGSize? = nil,
+                       cropRatio: VideoCropRatio = .free, plan: AnimationPlan, format: AnimationFormat, quality: Int,
                        allowParallelWebP: Bool, progress: (Double) -> Void) async throws -> AnimationEncoding {
         let resources = AnimationResources.shared
-        let reader = AnimationFrameReader(asset: asset, start: start, fps: fps, dimension: dimension)
+        let reader = AnimationFrameReader(asset: asset, start: start, fps: fps, dimension: dimension,
+                                          maximumSize:extractionSize ?? CGSize(width:dimension,height:dimension),cropRatio: cropRatio)
         let initialLimit = format == .gif ? resources.workers : 4
         let initialCount = min(plan.frames.count, min(initialLimit, max(1, resources.frameCapacity(width: dimension, height: dimension, bytesPerPixel: format == .gif ? 12 : 4) / 2)))
         var images = try await reader.read(plan.frames[0..<initialCount])

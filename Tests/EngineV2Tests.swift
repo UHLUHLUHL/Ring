@@ -20,6 +20,7 @@ import CryptoKit
             if all || groups.contains("pdf") { try await pdfs(root) }
             if all || groups.contains("document") { try await documents(root) }
             if all || groups.contains("media") { try await media(root) }
+            if groups.contains("media-h264") { try await media(root,codecs:[.h264]) }
             try require(try FileManager.default.contentsOfDirectory(atPath:root.path).allSatisfy { !$0.hasPrefix(".ring-") },"staging leak")
             print("PASS all requested Engine v2 tests")
         } catch { print("FAIL",error.localizedDescription);exit(1) }
@@ -185,25 +186,34 @@ import CryptoKit
         let output=file(root,"fixture.mov"),export=AVAssetExportSession(asset:composition,presetName:AVAssetExportPresetPassthrough)!
         try await export.export(to:output,as:.mov);return output
     }
-    static func media(_ root:URL) async throws {
+    static func media(_ root:URL,codecs:[VideoCodec]=[.h264,.hevc]) async throws {
         let source=try await videoFixture(root),original=try Data(contentsOf:source)
+        let square=VideoCropGeometry.centeredRect(width:320,height:240,ratio:.square)
+        try require(square.origin.x==40 && square.origin.y==0 && square.width==240 && square.height==240,"centered square video crop")
         let trimmed=try await RingEngine.shared.run(.init(source:source,operation:.video(.trim(start:0.3,end:1.4))))
         let originalSamples=try await compressedSamples(source),trimmedSamples=try await compressedSamples(trimmed.url)
         try require(!trimmedSamples.isEmpty && trimmedSamples.allSatisfy { originalSamples.contains($0) },"passthrough changed encoded video samples")
         print("PASS trim",trimmed.detail)
-        for codec in [VideoCodec.h264,.hevc] {
-            let compressed=try await RingEngine.shared.run(.init(source:source,operation:.video(.compress(targetBytes:80000,codec:codec))))
+        for codec in codecs {
+            let compressed=try await RingEngine.shared.run(.init(source:source,operation:.video(.compress(.init(targetBytes:80000,codec:codec)))))
             try require(try Data(contentsOf:compressed.url).count<=80000,"video target bytes")
             print("PASS video target",compressed.detail)
         }
+        let cropped=try await RingEngine.shared.run(.init(source:source,operation:.video(.compress(.init(targetBytes:240000,codec:.h264,maxDimension:128,cropRatio:.square)))))
+        let croppedAsset=AVURLAsset(url:cropped.url),croppedTrack=try await croppedAsset.loadTracks(withMediaType:.video)[0],croppedSize=try await croppedTrack.load(.naturalSize)
+        try require(croppedSize.width==128 && croppedSize.height==128,"video crop and maximum dimension")
+        print("PASS video crop/resize",cropped.detail)
         for format in [AnimationFormat.gif,.webp] {
-            let animated=try await RingEngine.shared.run(.init(source:source,operation:.video(.animation(.init(format:format,fps:10,maxDimension:160,targetBytes:140000,start:0,duration:1)))))
+            let animated=try await RingEngine.shared.run(.init(source:source,operation:.video(.animation(.init(format:format,fps:10,maxDimension:160,start:0,duration:1,cropRatio:.square)))))
+            let sizeText=animated.detail.components(separatedBy:" · ").dropFirst().first ?? ""
+            let dimensions=sizeText.split(separator:"×").compactMap { Int($0) }
+            try require(dimensions.count==2 && dimensions[0]==dimensions[1] && dimensions[0]<=160,"\(format) video crop ratio/output dimensions")
             print("PASS animation",animated.detail)
         }
         try require(try Data(contentsOf:source)==original,"media source changed")
         let before=Set(try FileManager.default.contentsOfDirectory(atPath:root.path))
         for delay:UInt64 in [0,10_000_000,50_000_000] {
-            let task=Task { try await RingEngine.shared.run(.init(source:source,operation:.video(.compress(targetBytes:100000,codec:.h264)))) }
+            let task=Task { try await RingEngine.shared.run(.init(source:source,operation:.video(.compress(.init(targetBytes:100000,codec:.h264))))) }
             if delay>0 { try await Task.sleep(nanoseconds:delay) };task.cancel()
             do { _=try await task.value;throw EngineError.invalid("TEST: media cancellation ignored") } catch is CancellationError { }
         }
