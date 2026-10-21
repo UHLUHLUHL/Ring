@@ -69,10 +69,10 @@ private final class AnimationFrameReader {
     let recovery: AVAssetImageGenerator
     let start: Double
     let dimension: Int
-    let cropRatio: VideoCropRatio
+    let crop: VideoCrop
     private var size: CGSize?
-    init(asset: AVAsset, start: Double, fps: Double, dimension: Int, maximumSize: CGSize, cropRatio: VideoCropRatio) {
-        self.start = start; self.dimension = dimension; self.cropRatio = cropRatio
+    init(asset: AVAsset, start: Double, fps: Double, dimension: Int, maximumSize: CGSize, crop: VideoCrop) {
+        self.start = start; self.dimension = dimension; self.crop = crop
         generator = AVAssetImageGenerator(asset: asset)
         recovery = AVAssetImageGenerator(asset: asset)
         generator.appliesPreferredTrackTransform = true
@@ -89,7 +89,7 @@ private final class AnimationFrameReader {
 
     private func fitted(_ image: CGImage) throws -> CGImage {
         let result = try autoreleasepool { () throws -> CGImage in
-            let rect = VideoCropGeometry.centeredRect(width: image.width, height: image.height, ratio: cropRatio)
+            let rect = crop.pixelRect(width: image.width, height: image.height)
             guard let cropped = image.cropping(to: rect) else { throw EngineError.io("비디오 프레임 자르기 실패") }
             return try ImageResampler.fit(cropped, maxDimension: dimension)
         }
@@ -211,11 +211,11 @@ enum AnimationPipeline {
     }
 
     static func encode(asset: AVAsset, start: Double, fps: Double, dimension: Int, extractionSize:CGSize? = nil,
-                       cropRatio: VideoCropRatio = .free, plan: AnimationPlan, format: AnimationFormat, quality: Int,
+                       crop: VideoCrop = .full, plan: AnimationPlan, format: AnimationFormat, quality: Int,
                        allowParallelWebP: Bool, progress: (Double) -> Void) async throws -> AnimationEncoding {
         let resources = AnimationResources.shared
         let reader = AnimationFrameReader(asset: asset, start: start, fps: fps, dimension: dimension,
-                                          maximumSize:extractionSize ?? CGSize(width:dimension,height:dimension),cropRatio: cropRatio)
+                                          maximumSize:extractionSize ?? CGSize(width:dimension,height:dimension),crop: crop)
         let initialLimit = format == .gif ? resources.workers : 4
         let initialCount = min(plan.frames.count, min(initialLimit, max(1, resources.frameCapacity(width: dimension, height: dimension, bytesPerPixel: format == .gif ? 12 : 4) / 2)))
         var images = try await reader.read(plan.frames[0..<initialCount])

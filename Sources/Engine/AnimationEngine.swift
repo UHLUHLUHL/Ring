@@ -26,7 +26,7 @@ extension MediaEngine {
         let naturalSize=try await sourceTrack.load(.naturalSize),preferredTransform=try await sourceTrack.load(.preferredTransform)
         let displaySize=naturalSize.applying(preferredTransform)
         func extractionSize(for dimension:Int)->CGSize {
-            VideoCropGeometry.extractionSize(width:abs(Double(displaySize.width)),height:abs(Double(displaySize.height)),ratio:options.cropRatio,maxDimension:dimension)
+            VideoCropGeometry.extractionSize(width:abs(Double(displaySize.width)),height:abs(Double(displaySize.height)),crop:options.crop,maxDimension:dimension)
         }
         let resources = AnimationResources.shared
         resources.enter(); defer { resources.leave() }
@@ -36,7 +36,7 @@ extension MediaEngine {
            target < Int64(initial.frames.count) * Int64(dimension * dimension) * 2 {
             let sample = initial.sample
             let encoded = try await AnimationPipeline.encode(asset: asset, start: options.start, fps: fps, dimension: dimension,
-                extractionSize:extractionSize(for:dimension),cropRatio: options.cropRatio, plan: sample, format: options.format, quality: 90, allowParallelWebP: false) { EngineProgress.report(0.03 + 0.07 * $0) }
+                extractionSize:extractionSize(for:dimension),crop: options.crop, plan: sample, format: options.format, quality: 90, allowParallelWebP: false) { EngineProgress.report(0.03 + 0.07 * $0) }
             let estimate = Double(encoded.bytes.count) * Double(initial.frames.count) / Double(sample.frames.count) * 1.10
             if estimate > Double(target) * 1.10 {
                 let ratio = max(0.4, min(0.95, sqrt(Double(target) / estimate) * 0.95))
@@ -47,7 +47,7 @@ extension MediaEngine {
             try Task.checkCancellation()
             let plan = AnimationPlan(duration: duration, fps: fps, format: options.format)
             let encoded = try await AnimationPipeline.encode(asset: asset, start: options.start, fps: fps, dimension: dimension,
-                extractionSize:extractionSize(for:dimension),cropRatio: options.cropRatio, plan: plan, format: options.format, quality: max(40, 90 - attempt * 10), allowParallelWebP: options.targetBytes == nil) {
+                extractionSize:extractionSize(for:dimension),crop: options.crop, plan: plan, format: options.format, quality: max(40, 90 - attempt * 10), allowParallelWebP: options.targetBytes == nil) {
                     EngineProgress.report(0.10 + 0.80 * $0)
                 }
             EngineProgress.report(0.92)
@@ -59,11 +59,14 @@ extension MediaEngine {
                 try encoded.bytes.write(to: output)
                 return "\(options.format.rawValue.uppercased()) · \(encoded.width)×\(encoded.height) · \(AnimationOptions.frameRateText(fps))fps · \(lastSize)바이트" + (options.format == .gif ? " · 적응형 256색·오차 확산 디더링" : "")
             }
-            let ratio = sqrt(Double(options.targetBytes!) / Double(max(1, lastSize))) * 0.90
-            dimension = max(16, Int(Double(dimension) * max(0.4, min(0.85, ratio))))
-            // Keep the requested motion as long as possible: only the final
-            // attempt gives up frames, after quality and resolution.
-            if attempt == 2 { fps = max(1, fps * 0.8) }
+            let excess = Double(options.targetBytes!) / Double(max(1, lastSize))
+            // Keep the requested motion as long as possible: quality and
+            // resolution go first. Frames go only on the final attempt, or once
+            // frames are so small that per-frame headers and GIF palettes
+            // dominate and shrinking them further saves little.
+            let tiny = encoded.width * encoded.height <= 64 * 64
+            if attempt == 2 || tiny { fps = max(1, fps * max(0.4, min(0.8, excess * 0.9))) }
+            if !tiny { dimension = max(16, Int(Double(dimension) * max(0.4, min(0.85, sqrt(excess) * 0.90)))) }
             EngineProgress.report(0.10)
         }
         throw EngineError.quality("애니메이션 \(lastSize)바이트가 목표를 초과했어요.")

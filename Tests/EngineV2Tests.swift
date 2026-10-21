@@ -216,7 +216,7 @@ import CryptoKit
     }
     static func media(_ root:URL,codecs:[VideoCodec]=[.h264,.hevc]) async throws {
         let source=try await videoFixture(root),original=try Data(contentsOf:source)
-        let square=VideoCropGeometry.centeredRect(width:320,height:240,ratio:.square)
+        let square=VideoCrop(ratio:.square).pixelRect(width:320,height:240)
         try require(square.origin.x==40 && square.origin.y==0 && square.width==240 && square.height==240,"centered square video crop")
         let trimmed=try await RingEngine.shared.run(.init(source:source,operation:.video(.trim(start:0.3,end:1.4))))
         let originalSamples=try await compressedSamples(source),trimmedSamples=try await compressedSamples(trimmed.url)
@@ -227,7 +227,7 @@ import CryptoKit
             try require(try Data(contentsOf:compressed.url).count<=80000,"video target bytes")
             print("PASS video target",compressed.detail)
         }
-        let cropped=try await RingEngine.shared.run(.init(source:source,operation:.video(.compress(.init(targetBytes:240000,codec:.h264,maxDimension:128,cropRatio:.square)))))
+        let cropped=try await RingEngine.shared.run(.init(source:source,operation:.video(.compress(.init(targetBytes:240000,codec:.h264,maxDimension:128,crop:VideoCrop(ratio:.square))))))
         let croppedAsset=AVURLAsset(url:cropped.url),croppedTrack=try await croppedAsset.loadTracks(withMediaType:.video)[0],croppedSize=try await croppedTrack.load(.naturalSize)
         try require(croppedSize.width==128 && croppedSize.height==128,"video crop and maximum dimension")
         print("PASS video crop/resize",cropped.detail)
@@ -235,17 +235,39 @@ import CryptoKit
         let shown=try await sourceTrack.load(.naturalSize).applying(sourceTrack.load(.preferredTransform))
         // The panel's resolution preview must match what the engine writes.
         for (format,ratio,limit) in [(AnimationFormat.gif,VideoCropRatio.square,160),(.webp,.square,160),(.webp,.free,150),(.gif,.wide,97)] {
-            let animated=try await RingEngine.shared.run(.init(source:source,operation:.video(.animation(.init(format:format,fps:10,maxDimension:limit,start:0,duration:1,cropRatio:ratio)))))
+            let animated=try await RingEngine.shared.run(.init(source:source,operation:.video(.animation(.init(format:format,fps:10,maxDimension:limit,start:0,duration:1,crop:VideoCrop(ratio:ratio))))))
             let sizeText=animated.detail.components(separatedBy:" · ").dropFirst().first ?? ""
             let dimensions=sizeText.split(separator:"×").compactMap { Int($0) }
-            let expected=VideoCropGeometry.animationSize(width:abs(shown.width),height:abs(shown.height),ratio:ratio,maxDimension:limit)
+            let expected=VideoCropGeometry.animationSize(width:abs(shown.width),height:abs(shown.height),crop:VideoCrop(ratio:ratio),maxDimension:limit)
             try require(dimensions==[expected.width,expected.height],"\(format) \(ratio) preview \(expected) != \(dimensions)")
             if ratio == .square { try require(dimensions[0]==dimensions[1] && dimensions[0]<=limit,"\(format) video crop ratio/output dimensions") }
             print("PASS animation",animated.detail)
         }
-        let compressedPreview=VideoCropGeometry.compressedSize(width:abs(shown.width),height:abs(shown.height),ratio:.square,maxDimension:128,
+        let compressedPreview=VideoCropGeometry.compressedSize(width:abs(shown.width),height:abs(shown.height),crop:VideoCrop(ratio:.square),maxDimension:128,
             bitrate:Int(min(VideoCropGeometry.videoBitrate(targetBytes:240000,duration:try await AVURLAsset(url:source).load(.duration).seconds,audio:!(try await AVURLAsset(url:source).loadTracks(withMediaType:.audio).isEmpty)),100_000_000)))
         try require(compressedPreview.width==128 && compressedPreview.height==128,"video compress preview")
+        // A placed (non-centred) crop keeps exactly the chosen region: the
+        // fixture's blue channel is x and green is y in frame 0.
+        let corner=VideoCrop(ratio:.free,rect:CGRect(x:0.5,y:0,width:0.5,height:0.5))
+        func sample(_ url:URL,_ x:Int,_ y:Int) async throws -> (Int,Int,Int,Int) {
+            let generator=AVAssetImageGenerator(asset:AVURLAsset(url:url));generator.appliesPreferredTrackTransform=true
+            generator.requestedTimeToleranceBefore = .zero;generator.requestedTimeToleranceAfter = .zero
+            let image:CGImage
+            if url.pathExtension=="webp" { image=CGImageSourceCreateImageAtIndex(CGImageSourceCreateWithURL(url as CFURL,nil)!,0,nil)! }
+            else { image=try await generator.image(at:.zero).image }
+            var px=[UInt8](repeating:0,count:4)
+            let ctx=CGContext(data:&px,width:1,height:1,bitsPerComponent:8,bytesPerRow:4,space:CGColorSpace(name:CGColorSpace.sRGB)!,bitmapInfo:CGImageAlphaInfo.premultipliedLast.rawValue)!
+            ctx.draw(image,in:CGRect(x:-x,y:-(image.height-1-y),width:image.width,height:image.height))
+            return (image.width,image.height,Int(px[2]),Int(px[1]))
+        }
+        let placedVideo=try await RingEngine.shared.run(.init(source:source,operation:.video(.compress(.init(targetBytes:400000,codec:.h264,crop:corner)))))
+        let placedWebP=try await RingEngine.shared.run(.init(source:source,operation:.video(.animation(.init(format:.webp,fps:10,maxDimension:160,start:0,duration:1,crop:corner)))))
+        for url in [placedVideo.url,placedWebP.url] {
+            let (w,h,blue,green)=try await sample(url,50,60)
+            try require(w==160 && h==120,"placed crop size \(w)×\(h) \(url.pathExtension)")
+            try require(abs(blue-210)<=24 && abs(green-60)<=24,"placed crop region blue \(blue) green \(green) \(url.pathExtension)")
+            print("PASS placed crop",url.pathExtension,w,h,blue,green)
+        }
         try require(try Data(contentsOf:source)==original,"media source changed")
         let before=Set(try FileManager.default.contentsOfDirectory(atPath:root.path))
         for delay:UInt64 in [0,10_000_000,50_000_000] {

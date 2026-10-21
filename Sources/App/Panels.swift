@@ -114,6 +114,143 @@ func panelPreview(of url:URL)->NSImage? {
     return NSImage(cgImage:image,size:.zero)
 }
 
+// MARK: - Crop frame (Photos style)
+
+/// Crop frame drawn over media shown in `bounds`, modelled on Photos: the
+/// outside is dimmed, the frame has a thin white border with thick corner
+/// brackets, and a rule-of-thirds grid appears while dragging. Drag inside to
+/// move, drag a corner or edge to resize. `aspect` (pixel width / height)
+/// locks the shape. `crop` is normalized to the media, top-left origin.
+struct CropFrame: View {
+    @Binding var crop: CGRect
+    let bounds: CGRect
+    let pixels: CGSize
+    let aspect: Double?
+    @State private var start: CGRect?
+    private let minimum: CGFloat = 0.08
+
+    private var frame: CGRect {
+        CGRect(x: bounds.minX + crop.minX * bounds.width, y: bounds.minY + crop.minY * bounds.height,
+               width: crop.width * bounds.width, height: crop.height * bounds.height)
+    }
+
+    var body: some View {
+        let f = frame
+        ZStack(alignment: .topLeading) {
+            // One even-odd path, painted once: no doubled translucency.
+            Path { p in p.addRect(bounds); p.addRect(f) }
+                .fill(.black.opacity(0.55), style: FillStyle(eoFill: true))
+                .allowsHitTesting(false)
+            if start != nil {
+                Path { p in
+                    for k in 1...2 {
+                        let x = f.minX + f.width * CGFloat(k) / 3, y = f.minY + f.height * CGFloat(k) / 3
+                        p.move(to: CGPoint(x: x, y: f.minY)); p.addLine(to: CGPoint(x: x, y: f.maxY))
+                        p.move(to: CGPoint(x: f.minX, y: y)); p.addLine(to: CGPoint(x: f.maxX, y: y))
+                    }
+                }
+                .stroke(.white.opacity(0.45), lineWidth: 0.5)
+                .allowsHitTesting(false)
+            }
+            Rectangle().stroke(.white.opacity(0.9), lineWidth: 1)
+                .frame(width: f.width, height: f.height).offset(x: f.minX, y: f.minY)
+                .allowsHitTesting(false)
+            brackets(f).allowsHitTesting(false)
+            Color.clear.contentShape(Rectangle())
+                .frame(width: max(1, f.width - 24), height: max(1, f.height - 24))
+                .offset(x: f.minX + 12, y: f.minY + 12)
+                .gesture(drag(edges: [], move: true))
+            ForEach(Self.grips, id: \.self) { g in
+                Color.clear.contentShape(Rectangle())
+                    .frame(width: g.isCorner ? 26 : (g.ux == 0.5 ? max(1, f.width - 40) : 18),
+                           height: g.isCorner ? 26 : (g.uy == 0.5 ? max(1, f.height - 40) : 18))
+                    .position(x: f.minX + g.ux * f.width, y: f.minY + g.uy * f.height)
+                    .gesture(drag(edges: g.edges, move: false))
+            }
+        }
+        .animation(.easeOut(duration: 0.12), value: start != nil)
+    }
+
+    /// Photos-style L brackets: 3pt white strokes, about 18pt long, outside the border.
+    private func brackets(_ f: CGRect) -> some View {
+        Path { p in
+            let l = min(18, f.width / 3, f.height / 3), o: CGFloat = 1.5
+            for (cx, cy, sx, sy) in [(f.minX, f.minY, 1.0, 1.0), (f.maxX, f.minY, -1.0, 1.0), (f.minX, f.maxY, 1.0, -1.0), (f.maxX, f.maxY, -1.0, -1.0)] {
+                let x = cx - o * sx, y = cy - o * sy
+                p.move(to: CGPoint(x: x + l * sx, y: y)); p.addLine(to: CGPoint(x: x, y: y)); p.addLine(to: CGPoint(x: x, y: y + l * sy))
+            }
+        }
+        .stroke(.white, style: StrokeStyle(lineWidth: 3, lineCap: .butt, lineJoin: .miter))
+        .shadow(color: .black.opacity(0.35), radius: 1.5)
+    }
+
+    struct Grip: Hashable {
+        let ux: CGFloat, uy: CGFloat
+        var isCorner: Bool { ux != 0.5 && uy != 0.5 }
+        var edges: Edge.Set {
+            var e: Edge.Set = []
+            if ux == 0 { e.insert(.leading) }; if ux == 1 { e.insert(.trailing) }
+            if uy == 0 { e.insert(.top) }; if uy == 1 { e.insert(.bottom) }
+            return e
+        }
+    }
+    static let grips: [Grip] = [(0, 0), (0.5, 0), (1, 0), (0, 0.5), (1, 0.5), (0, 1), (0.5, 1), (1, 1)].map { Grip(ux: $0.0, uy: $0.1) }
+
+    private func drag(edges: Edge.Set, move: Bool) -> some Gesture {
+        DragGesture(minimumDistance: 1)
+            .onChanged { v in
+                let s = start ?? crop
+                if start == nil { start = crop }
+                let dx = v.translation.width / max(1, bounds.width), dy = v.translation.height / max(1, bounds.height)
+                if move {
+                    crop.origin = CGPoint(x: min(max(0, s.minX + dx), 1 - s.width), y: min(max(0, s.minY + dy), 1 - s.height))
+                    return
+                }
+                var minX = s.minX, maxX = s.maxX, minY = s.minY, maxY = s.maxY
+                if edges.contains(.leading) { minX = min(max(0, minX + dx), maxX - minimum) }
+                if edges.contains(.trailing) { maxX = max(min(1, maxX + dx), minX + minimum) }
+                if edges.contains(.top) { minY = min(max(0, minY + dy), maxY - minimum) }
+                if edges.contains(.bottom) { maxY = max(min(1, maxY + dy), minY + minimum) }
+                var r = CGRect(x: minX, y: minY, width: maxX - minX, height: maxY - minY)
+                if let aspect { r = Self.locked(r, aspect: aspect, pixels: pixels, edges: edges) }
+                crop = r
+            }
+            .onEnded { _ in start = nil }
+    }
+
+    /// Keeps `aspect` while the dragged edges move; the opposite corner stays put.
+    static func locked(_ r: CGRect, aspect: Double, pixels: CGSize, edges: Edge.Set) -> CGRect {
+        let k = CGFloat(aspect) * pixels.height / max(1, pixels.width) // normalized width / height
+        var w = r.width, h = r.height
+        if edges.contains(.leading) || edges.contains(.trailing) { h = w / k } else { w = h * k }
+        let anchorX = edges.contains(.leading) ? r.maxX : r.minX
+        let anchorY = edges.contains(.top) ? r.maxY : r.minY
+        let roomX = edges.contains(.leading) ? anchorX : 1 - anchorX
+        let roomY = edges.contains(.top) ? anchorY : 1 - anchorY
+        let fit = min(1, roomX / max(w, 0.0001), roomY / max(h, 0.0001))
+        w *= fit; h *= fit
+        let x = edges.contains(.leading) ? anchorX - w : (edges.contains(.trailing) ? anchorX : r.midX - w / 2)
+        let y = edges.contains(.top) ? anchorY - h : (edges.contains(.bottom) ? anchorY : r.midY - h / 2)
+        return CGRect(x: min(max(0, x), 1 - w), y: min(max(0, y), 1 - h), width: w, height: h)
+    }
+
+    /// Largest rectangle of `aspect` centred on `around`, inside the media.
+    static func largest(aspect: Double, pixels: CGSize, around: CGRect) -> CGRect {
+        let k = CGFloat(aspect) * pixels.height / max(1, pixels.width)
+        var w: CGFloat = 1, h = 1 / k
+        if h > 1 { h = 1; w = k }
+        let cx = min(max(around.midX, w / 2), 1 - w / 2), cy = min(max(around.midY, h / 2), 1 - h / 2)
+        return CGRect(x: cx - w / 2, y: cy - h / 2, width: w, height: h)
+    }
+
+    /// Aspect-fit rectangle of `pixels` inside `container`.
+    static func fitted(_ pixels: CGSize, in container: CGSize) -> CGRect {
+        let s = min(container.width / max(1, pixels.width), container.height / max(1, pixels.height))
+        let w = pixels.width * s, h = pixels.height * s
+        return CGRect(x: (container.width - w) / 2, y: (container.height - h) / 2, width: w, height: h)
+    }
+}
+
 // MARK: - Crop
 
 struct CropPanel: View {
@@ -135,7 +272,6 @@ struct CropPanel: View {
     }
 
     @State private var crop = CGRect(x: 0, y: 0, width: 1, height: 1) // normalized to the image
-    @State private var dragStart: CGRect?
     @State private var ratio: Ratio = .free
     @State private var image: NSImage?
     @State private var jpegSampling: JPEGSampling?
@@ -227,10 +363,7 @@ struct CropPanel: View {
                     .offset(x: f.minX, y: f.minY)
                     .shadow(color: .black.opacity(0.18), radius: 6, y: 2)
             }
-            // Dim everything outside the crop rectangle (one even-odd path, painted once).
-            Path { p in p.addRect(f); p.addRect(c) }
-                .fill(.black.opacity(0.5), style: FillStyle(eoFill: true))
-            cropFrame(c)
+            CropFrame(crop: $crop, bounds: f, pixels: pixels, aspect: ratio.value.map(Double.init))
             Text("\(Int(crop.width * pixels.width)) × \(Int(crop.height * pixels.height))")
                 .font(.system(size: 11, weight: .bold)).foregroundStyle(.white)
                 .padding(.horizontal, 8).padding(.vertical, 3)
@@ -239,90 +372,6 @@ struct CropPanel: View {
         }
         .frame(width: area.width, height: area.height)
         .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
-    }
-
-    private func cropFrame(_ c: CGRect) -> some View {
-        ZStack(alignment: .topLeading) {
-            Rectangle().strokeBorder(Color.accentColor, lineWidth: 2)
-                .frame(width: c.width, height: c.height)
-                .overlay {
-                    Path { p in
-                        for k in 1...2 {
-                            let x = c.width * CGFloat(k) / 3, y = c.height * CGFloat(k) / 3
-                            p.move(to: CGPoint(x: x, y: 0)); p.addLine(to: CGPoint(x: x, y: c.height))
-                            p.move(to: CGPoint(x: 0, y: y)); p.addLine(to: CGPoint(x: c.width, y: y))
-                        }
-                    }
-                    .stroke(Color.accentColor.opacity(0.35), lineWidth: 1)
-                }
-                .contentShape(Rectangle())
-                .gesture(drag(edges: [.top, .bottom, .leading, .trailing], move: true))
-                .offset(x: c.minX, y: c.minY)
-            ForEach(Handle.all, id: \.self) { h in
-                handleView(h)
-                    .position(x: c.minX + h.ux * c.width, y: c.minY + h.uy * c.height)
-                    .gesture(drag(edges: h.edges, move: false))
-            }
-        }
-    }
-
-    struct Handle: Hashable {
-        let ux: CGFloat, uy: CGFloat
-        var edges: Edge.Set {
-            var e: Edge.Set = []
-            if ux == 0 { e.insert(.leading) }; if ux == 1 { e.insert(.trailing) }
-            if uy == 0 { e.insert(.top) }; if uy == 1 { e.insert(.bottom) }
-            return e
-        }
-        var isCorner: Bool { ux != 0.5 && uy != 0.5 }
-        static let all: [Handle] = [(0, 0), (0.5, 0), (1, 0), (0, 0.5), (1, 0.5), (0, 1), (0.5, 1), (1, 1)].map { Handle(ux: $0.0, uy: $0.1) }
-    }
-
-    private func handleView(_ h: Handle) -> some View {
-        let size: CGSize = h.isCorner ? CGSize(width: 14, height: 14)
-            : (h.uy == 0.5 ? CGSize(width: 6, height: 28) : CGSize(width: 28, height: 6))
-        return RoundedRectangle(cornerRadius: min(size.width, size.height) / 2)
-            .fill(.white)
-            .overlay(RoundedRectangle(cornerRadius: min(size.width, size.height) / 2).stroke(Color.accentColor, lineWidth: 2))
-            .frame(width: size.width, height: size.height)
-            .shadow(color: .black.opacity(0.2), radius: 2, y: 1)
-            .frame(width: 30, height: 30)
-            .contentShape(Rectangle())
-    }
-
-    private func drag(edges: Edge.Set, move: Bool) -> some Gesture {
-        DragGesture(minimumDistance: 1)
-            .onChanged { v in
-                let start = dragStart ?? crop
-                if dragStart == nil { dragStart = crop }
-                let dx = v.translation.width / fitted.width, dy = v.translation.height / fitted.height
-                var r = start
-                if move {
-                    r.origin.x = min(max(0, start.minX + dx), 1 - start.width)
-                    r.origin.y = min(max(0, start.minY + dy), 1 - start.height)
-                } else {
-                    var minX = start.minX, maxX = start.maxX, minY = start.minY, maxY = start.maxY
-                    if edges.contains(.leading) { minX = min(max(0, minX + dx), maxX - 0.05) }
-                    if edges.contains(.trailing) { maxX = max(min(1, maxX + dx), minX + 0.05) }
-                    if edges.contains(.top) { minY = min(max(0, minY + dy), maxY - 0.05) }
-                    if edges.contains(.bottom) { maxY = max(min(1, maxY + dy), minY + 0.05) }
-                    r = CGRect(x: minX, y: minY, width: maxX - minX, height: maxY - minY)
-                    if let value = ratio.value { r = constrain(r, to: value, anchorTop: edges.contains(.bottom) || !edges.contains(.top)) }
-                }
-                crop = r
-            }
-            .onEnded { _ in dragStart = nil }
-    }
-
-    /// Keeps the pixel aspect ratio by deriving height from width, then fits inside the image.
-    private func constrain(_ r: CGRect, to value: CGFloat, anchorTop: Bool) -> CGRect {
-        var w = r.width
-        var h = w * pixels.width / value / pixels.height
-        if h > 1 { h = 1; w = h * value * pixels.height / pixels.width }
-        var y = anchorTop ? r.minY : r.maxY - h
-        y = min(max(0, y), 1 - h)
-        let x = min(max(0, r.minX), 1 - w)
-        return CGRect(x: x, y: y, width: w, height: h)
     }
 
     private func apply(ratio r: Ratio) {

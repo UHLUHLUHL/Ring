@@ -444,6 +444,9 @@ private struct VideoToolPanel:View {
     @State private var dimension="640"
     @State private var compressionDimension=""
     @State private var cropRatio=VideoCropRatio.free
+    @State private var cropPortrait=false
+    /// Normalized to the upright frame, top-left origin, as the engine expects.
+    @State private var cropRect=CGRect(x:0,y:0,width:1,height:1)
     /// Upright source size and audio presence, for the output-resolution preview.
     @State private var sourceSize:CGSize?
     @State private var sourceHasAudio=false
@@ -509,19 +512,73 @@ private struct VideoToolPanel:View {
         return images
     }
 
+    private var videoCrop:VideoCrop { VideoCrop(ratio:cropRatio,portrait:cropPortrait,rect:cropRect) }
+    private var cropAspect:Double? {
+        guard let sourceSize else { return nil }
+        return videoCrop.aspect(width:sourceSize.width,height:sourceSize.height)
+    }
+    private var cropsVideo:Bool { if case .trim=tool { return false }; return true }
+
+    /// The player and, outside trimming, the Photos-style crop frame over the
+    /// exact rectangle the video occupies.
+    private func videoPreview(height:CGFloat) -> some View {
+        ZStack {
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .fill(Color.black.opacity(0.4))
+            if let player {
+                VideoPlayerView(player: player)
+                    .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+            }
+            if cropsVideo, let sourceSize {
+                GeometryReader { geo in
+                    CropFrame(crop:$cropRect,bounds:CropFrame.fitted(sourceSize,in:geo.size),pixels:sourceSize,aspect:cropAspect)
+                }
+                .accessibilityIdentifier("video.cropFrame")
+            }
+        }
+        .frame(height: height)
+        .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(Color.white.opacity(0.12), lineWidth: 1))
+    }
+
+    /// Photos' aspect list as a menu, the portrait/landscape pair and reset.
+    private var cropControls:some View {
+        PanelRow(label:"자르기") {
+            HStack(spacing:8) {
+                Picker("비율",selection:$cropRatio) {
+                    ForEach(VideoCropRatio.allCases,id:\.self) { Text($0.label(portrait:cropPortrait)).tag($0) }
+                }
+                .labelsHidden().frame(width:110).accessibilityIdentifier("video.cropRatio")
+                if !cropRatio.isSquare && cropRatio != .free {
+                    ForEach([false,true],id:\.self) { portrait in
+                        Button { cropPortrait=portrait } label: {
+                            Image(systemName:portrait ? "rectangle.portrait":"rectangle")
+                        }
+                        .buttonStyle(.glass).tint(cropPortrait==portrait ? .accentColor:nil)
+                        .accessibilityLabel(portrait ? "세로 비율":"가로 비율")
+                    }
+                }
+                Spacer(minLength:4)
+                if let sourceSize {
+                    let r=videoCrop.pixelRect(width:Int(sourceSize.width.rounded()),height:Int(sourceSize.height.rounded()))
+                    Text(verbatim:"\(Int(r.width))×\(Int(r.height))").font(.system(size:11).monospacedDigit()).foregroundStyle(.secondary)
+                }
+                Button("재설정") { withAnimation(.snappy) { cropRatio = .free; cropRect=CGRect(x:0,y:0,width:1,height:1) } }
+                    .buttonStyle(.glass).disabled(videoCrop.isFull)
+            }
+        }
+        .onChange(of:cropRatio) { _,_ in fitCropToRatio() }
+        .onChange(of:cropPortrait) { _,_ in fitCropToRatio() }
+    }
+
+    private func fitCropToRatio() {
+        guard let sourceSize,let aspect=cropAspect else { return }
+        withAnimation(.snappy) { cropRect=CropFrame.largest(aspect:aspect,pixels:sourceSize,around:cropRect) }
+    }
+
     @ViewBuilder
     private func trimTimelineSection(videoHeight: CGFloat, middlePrefix: String) -> some View {
         VStack(spacing: 10) {
-            ZStack {
-                RoundedRectangle(cornerRadius: 12, style: .continuous)
-                    .fill(Color.black.opacity(0.4))
-                if let player {
-                    VideoPlayerView(player: player)
-                        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-                }
-            }
-            .frame(height: videoHeight)
-            .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(Color.white.opacity(0.12), lineWidth: 1))
+            videoPreview(height: videoHeight)
 
             HStack(spacing: 12) {
                 Button(action: togglePlay) {
@@ -566,9 +623,10 @@ private struct VideoToolPanel:View {
                 trimTimelineSection(videoHeight: 190, middlePrefix: "선택 구간")
 
             case .compress:
+                videoPreview(height:190)
+                cropControls
                 PanelRow(label:"원본") { Text(model.file.sizeText).foregroundStyle(.secondary) }
                 PanelRow(label:"목표") { SizeFields(value:$size,unit:$unit) }
-                PanelRow(label:"자르기") { FillSegmented(selection:$cropRatio).accessibilityIdentifier("video.cropRatio") }
                 PanelRow(label:"긴 변") {
                     HStack(spacing:8) {
                         TextField("자동",text:$compressionDimension).textFieldStyle(.roundedBorder)
@@ -583,9 +641,7 @@ private struct VideoToolPanel:View {
 
             case .animation(let format):
                 trimTimelineSection(videoHeight: 160, middlePrefix: "구간")
-                PanelRow(label:"자르기") { FillSegmented(selection:$cropRatio).accessibilityIdentifier("video.cropRatio") }
-                Text("영상 중앙을 기준으로 선택한 비율만 남겨요.")
-                    .font(.system(size:11)).foregroundStyle(.secondary)
+                cropControls
                 PanelRow(label:"프레임") {
                     TextField("원본",text:$fps).textFieldStyle(.roundedBorder)
                         .frame(width:72).accessibilityLabel("애니메이션 FPS")
@@ -636,6 +692,8 @@ private struct VideoToolPanel:View {
                let natural=try? await track.load(.naturalSize),let transform=try? await track.load(.preferredTransform) {
                 let shown=natural.applying(transform)
                 sourceSize=CGSize(width:abs(shown.width),height:abs(shown.height))
+                // Like Photos, presets start in the frame's own orientation.
+                cropPortrait=abs(shown.height)>abs(shown.width)
             }
             sourceHasAudio = !((try? await asset.loadTracks(withMediaType:.audio))?.isEmpty ?? true)
             let total = d.seconds
@@ -676,7 +734,7 @@ private struct VideoToolPanel:View {
     /// Same geometry as the engine, so the shown size is what gets written.
     private var animationResolution:String? {
         guard let sourceSize,let limit=Int(dimension.trimmingCharacters(in:.whitespaces)),(16...1920).contains(limit) else { return nil }
-        let size=VideoCropGeometry.animationSize(width:sourceSize.width,height:sourceSize.height,ratio:cropRatio,maxDimension:limit)
+        let size=VideoCropGeometry.animationSize(width:sourceSize.width,height:sourceSize.height,crop:videoCrop,maxDimension:limit)
         return "결과 \(size.width)×\(size.height)" + (target ? " · 목표 용량을 넘으면 줄어들어요":"")
     }
     private var compressionResolution:String? {
@@ -686,7 +744,7 @@ private struct VideoToolPanel:View {
         guard text.isEmpty || (limit.map { (16...8192).contains($0) } ?? false) else { return nil }
         let rate=VideoCropGeometry.videoBitrate(targetBytes:bytes,duration:duration,audio:sourceHasAudio)
         guard rate>=100000 else { return nil }
-        let size=VideoCropGeometry.compressedSize(width:sourceSize.width,height:sourceSize.height,ratio:cropRatio,maxDimension:limit,bitrate:Int(min(rate,100_000_000)))
+        let size=VideoCropGeometry.compressedSize(width:sourceSize.width,height:sourceSize.height,crop:videoCrop,maxDimension:limit,bitrate:Int(min(rate,100_000_000)))
         // A second attempt can lower the bitrate cap when the first file is too large.
         return "결과 \(size.width)×\(size.height) · 목표 용량을 넘으면 줄어들어요"
     }
@@ -696,7 +754,7 @@ private struct VideoToolPanel:View {
         if case .compress=tool {
             let text=compressionDimension.trimmingCharacters(in:.whitespacesAndNewlines)
             let maxDimension=text.isEmpty ? nil:try ToolSettings.integer(text,name:"긴 변",range:16...8192)
-            return .video(.compress(.init(targetBytes:try ToolSettings.bytes(size,unit:unit),codec:codec == "HEVC" ? .hevc:.h264,maxDimension:maxDimension,cropRatio:cropRatio)))
+            return .video(.compress(.init(targetBytes:try ToolSettings.bytes(size,unit:unit),codec:codec == "HEVC" ? .hevc:.h264,maxDimension:maxDimension,crop:videoCrop)))
         }
         let from = startVal
         let to = endVal > 0 ? endVal : duration
@@ -705,7 +763,7 @@ private struct VideoToolPanel:View {
         if case .animation(let format)=tool {
             let frames=try ToolSettings.number(fps,name:"FPS",range:1...AnimationOptions.maximumFPS),limit=try ToolSettings.integer(dimension,name:"긴 변",range:16...1920)
             guard (to-from)*frames<=Double(AnimationOptions.maximumFrames) else { throw EngineError.invalid("선택 구간은 최대 1,800프레임이어야 해요. 구간이나 FPS를 줄여 주세요.") }
-            return .video(.animation(.init(format:format,fps:frames,maxDimension:limit,targetBytes:target ? try ToolSettings.bytes(size,unit:unit):nil,start:from,duration:min(duration,to)-from,cropRatio:cropRatio)))
+            return .video(.animation(.init(format:format,fps:frames,maxDimension:limit,targetBytes:target ? try ToolSettings.bytes(size,unit:unit):nil,start:from,duration:min(duration,to)-from,crop:videoCrop)))
         }
         throw EngineError.invalid("비디오 작업 오류")
     }
@@ -726,7 +784,7 @@ private struct DimensionPresets:View {
                     .accessibilityIdentifier("\(prefix).maxDimension.auto")
             }
             ForEach(values,id:\.self) { value in
-                Button("\(value)") { text=String(value) }
+                Button(String(value)) { text=String(value) }
                     .buttonStyle(.glass)
                     .tint(Int(text)==value ? .accentColor:nil)
                     .accessibilityLabel("긴 변 \(value)px 프리셋")
