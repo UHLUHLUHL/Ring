@@ -8,7 +8,7 @@ import CryptoKit
     static func require(_ condition: Bool, _ message: String) throws {
         if !condition { throw EngineError.quality("TEST: " + message) }
     }
-    static func fixture(_ root: URL, name: String, kind: Int, rate: CMTime = CMTime(value: 1, timescale: 30), rotated: Bool = false) async throws -> URL {
+    static func fixture(_ root: URL, name: String, kind: Int, rate: CMTime = CMTime(value: 1, timescale: 30), rotated: Bool = false, offset: CMTime = .zero) async throws -> URL {
         let url = root.appendingPathComponent(name + ".mp4"), w = 320, h = 180
         let writer = try AVAssetWriter(outputURL: url, fileType: .mp4)
         let input = AVAssetWriterInput(mediaType: .video, outputSettings: [AVVideoCodecKey: AVVideoCodecType.h264, AVVideoWidthKey: w, AVVideoHeightKey: h, AVVideoCompressionPropertiesKey: [AVVideoAverageBitRateKey: 2_000_000]])
@@ -36,10 +36,10 @@ import CryptoKit
                     if kind == 2 && x >= i * 3 && x < i * 3 + 15 && y < 15 { bytes[p] = 255; bytes[p + 1] = 0 }
                 } }
                 CVPixelBufferUnlockBaseAddress(buffer, [])
-                try require(adaptor.append(buffer, withPresentationTime: CMTimeMultiply(rate, multiplier: Int32(i))), "fixture append")
+                try require(adaptor.append(buffer, withPresentationTime: CMTimeAdd(CMTimeMultiply(rate, multiplier: Int32(i)), offset)), "fixture append")
             }
         }
-        input.markAsFinished(); writer.endSession(atSourceTime: CMTimeMultiply(rate, multiplier: 60))
+        input.markAsFinished(); writer.endSession(atSourceTime: CMTimeAdd(CMTimeMultiply(rate, multiplier: 60), offset))
         await writer.finishWriting()
         try require(writer.status == .completed, "fixture finish")
         return url
@@ -48,6 +48,7 @@ import CryptoKit
         let source = CGImageSourceCreateWithURL(url as CFURL, nil)!
         let count = CGImageSourceGetCount(source)
         if let frames { try require(count == frames, "frame count \(count) != \(frames)") }
+        if url.pathExtension == "gif" { try require(try Data(contentsOf: url).prefix(6) == Data("GIF89a".utf8), "GIF89a header") }
         var duration = 0.0
         for index in 0..<count {
             try autoreleasepool {
@@ -55,6 +56,7 @@ import CryptoKit
                 if let width, let height { try require(image.width == width && image.height == height, "frame dimensions") }
                 let properties = CGImageSourceCopyPropertiesAtIndex(source, index, nil) as! [CFString: Any]
                 let gif = url.pathExtension == "gif"
+                if gif { try require([.none, .noneSkipLast, .noneSkipFirst].contains(image.alphaInfo), "GIF frame \(index) decodes with alpha") }
                 let dict = properties[gif ? kCGImagePropertyGIFDictionary : kCGImagePropertyWebPDictionary] as! [CFString: Any]
                 let delay = dict[gif ? kCGImagePropertyGIFUnclampedDelayTime : kCGImagePropertyWebPUnclampedDelayTime] as! Double
                 try require(delay > 0, "zero delay")
@@ -177,7 +179,9 @@ import CryptoKit
                 // decoded palette a color space that can differ from CGImage's.
                 let memory = NSMutableData()
                 let serial = CGImageDestinationCreateWithData(memory, "com.compuserve.gif" as CFString, 1, nil)!
-                CGImageDestinationAddImage(serial, try AdaptivePalette.indexed(reference), nil)
+                let indexed = try AdaptivePalette.indexed(reference)
+                try require((indexed.colorSpace?.colorTable?.count ?? 768) <= 255 * 3, "palette must leave GIF index 255 unused")
+                CGImageDestinationAddImage(serial, indexed, nil)
                 try require(CGImageDestinationFinalize(serial), "serial GIF reference")
                 let referenceSource = CGImageSourceCreateWithData(memory, nil)!
                 let expected = try AdaptivePalette.sRGB(CGImageSourceCreateImageAtIndex(referenceSource, 0, nil)!)
@@ -185,6 +189,34 @@ import CryptoKit
                 try require(expected == actual, "GIF palette/order changed at \(index)")
             }
             print("PASS adaptive parallel/delta WebP and GIF pixel/order preservation")
+
+            // Phone videos often start a few ms after zero. Each output frame
+            // must be the source frame nearest its time: no repeats, no skips.
+            let shifted = try await fixture(root, name: "shifted", kind: 0, offset: CMTime(value: 12, timescale: 1000))
+            let nearest = try await RingEngine.shared.run(.init(source: shifted, operation: .video(.animation(.init(format: .gif, fps: 30, maxDimension: 160, duration: 1)))))
+            let sampled = CGImageSourceCreateWithURL(nearest.url as CFURL, nil)!
+            let exact = AVAssetImageGenerator(asset: AVURLAsset(url: shifted))
+            exact.maximumSize = CGSize(width: 160, height: 160)
+            exact.requestedTimeToleranceBefore = .zero
+            exact.requestedTimeToleranceAfter = .zero
+            var originals: [Data] = []
+            for k in 0...30 { originals.append(try AdaptivePalette.sRGB(await exact.image(at: CMTime(seconds: Double(k) / 30 + 0.013, preferredTimescale: 60000)).image)) }
+            func distance(_ a: Data, _ b: Data) -> Double {
+                a.withUnsafeBytes { ar in b.withUnsafeBytes { br -> Double in
+                    let x = ar.bindMemory(to: UInt8.self), y = br.bindMemory(to: UInt8.self)
+                    var total = 0.0
+                    for p in stride(from: 0, to: min(x.count, y.count), by: 4) { for c in 0..<3 { total += abs(Double(x[p + c]) - Double(y[p + c])) } }
+                    return total
+                } }
+            }
+            try require(CGImageSourceGetCount(sampled) == 30, "shifted GIF frame count")
+            for index in 0..<30 {
+                let frame = try AdaptivePalette.sRGB(CGImageSourceCreateImageAtIndex(sampled, index, nil)!)
+                let candidates = max(0, index - 1)...min(30, index + 1)
+                let best = candidates.min { distance(frame, originals[$0]) < distance(frame, originals[$1]) }!
+                try require(best == index, "GIF frame \(index) shows source frame \(best)")
+            }
+            print("PASS offset-timestamp source: every GIF frame is the nearest source frame")
 
             let before = Set(try FileManager.default.contentsOfDirectory(atPath: root.path))
             for format in [AnimationFormat.gif, .webp] {

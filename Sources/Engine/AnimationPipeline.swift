@@ -70,9 +70,13 @@ private final class AnimationFrameReader {
     let start: Double
     let dimension: Int
     let crop: VideoCrop
+    let asset: AVAsset
+    let fps: Double
     private var size: CGSize?
+    /// Seconds added to each output time, and the last time that may be asked for.
+    private var timing: (offset: Double, latest: Double)?
     init(asset: AVAsset, start: Double, fps: Double, dimension: Int, maximumSize: CGSize, crop: VideoCrop) {
-        self.start = start; self.dimension = dimension; self.crop = crop
+        self.start = start; self.dimension = dimension; self.crop = crop; self.asset = asset; self.fps = fps
         generator = AVAssetImageGenerator(asset: asset)
         recovery = AVAssetImageGenerator(asset: asset)
         generator.appliesPreferredTrackTransform = true
@@ -81,9 +85,23 @@ private final class AnimationFrameReader {
         recovery.maximumSize = generator.maximumSize
         recovery.requestedTimeToleranceBefore = .zero
         recovery.requestedTimeToleranceAfter = .zero
-        let tolerance = CMTime(seconds: min(0.01, 0.25 / fps), preferredTimescale: 60000)
-        generator.requestedTimeToleranceBefore = tolerance
-        generator.requestedTimeToleranceAfter = tolerance
+    }
+
+    /// Each output frame takes the source frame nearest to its time: we ask
+    /// for the frame shown 0.45 source intervals later. Asking for the frame
+    /// shown exactly at t let real phone footage, whose timestamps sit a few
+    /// milliseconds off the output grid, repeat one frame and skip the next
+    /// every second or so. The tolerance stays inside that frame's interval.
+    private func prepareTiming() async throws -> (offset: Double, latest: Double) {
+        if let timing { return timing }
+        let sourceFPS = try await MediaEngine.sourceFrameRate(asset) ?? fps
+        let interval = 1 / max(1, sourceFPS)
+        let end = try await asset.load(.duration).seconds
+        generator.requestedTimeToleranceBefore = CMTime(seconds: min(0.002, interval * 0.03), preferredTimescale: 60000)
+        generator.requestedTimeToleranceAfter = CMTime(seconds: min(0.01, interval * 0.25), preferredTimescale: 60000)
+        let value = (interval * 0.45, max(0, end - 0.001))
+        timing = value
+        return value
     }
     deinit { generator.cancelAllCGImageGeneration(); recovery.cancelAllCGImageGeneration() }
 
@@ -101,24 +119,32 @@ private final class AnimationFrameReader {
 
     func read(_ frames: ArraySlice<AnimationPlan.Frame>) async throws -> [CGImage] {
         try Task.checkCancellation()
-        let times = frames.map { CMTime(seconds: start + $0.offset, preferredTimescale: 60000) }
-        let indices = Dictionary(uniqueKeysWithValues: times.enumerated().map { ($0.element.value, $0.offset) })
+        let timing = try await prepareTiming()
+        // Near the end the shifted time may pass the last frame; keep t there.
+        let times = frames.map { frame -> CMTime in
+            let t = start + frame.offset
+            return CMTime(seconds: t + timing.offset <= timing.latest ? t + timing.offset : t, preferredTimescale: 60000)
+        }
+        // Slots near the end can share a time; ask for each time once.
+        let slots = Dictionary(grouping: times.indices, by: { times[$0].value })
+        let unique = times.indices.filter { slots[times[$0].value]![0] == $0 }.map { times[$0] }
         // Submit only the bounded window, so AVFoundation cannot prefetch all
         // 1,800 full-sized CGImages behind our bounded processing queue.
         return try await withTaskCancellationHandler {
             var ordered = [CGImage?](repeating: nil, count: times.count)
             var failed: [Int] = []
-            for await result in generator.images(for: times) {
+            for await result in generator.images(for: unique) {
                 try Task.checkCancellation()
                 let requested = CMTimeConvertScale(result.requestedTime, timescale: 60000, method: .roundHalfAwayFromZero).value
-                guard let index = indices[requested], ordered[index] == nil else { throw EngineError.io("애니메이션 프레임 순서 오류") }
+                guard let shared = slots[requested], ordered[shared[0]] == nil else { throw EngineError.io("애니메이션 프레임 순서 오류") }
                 let image: CGImage
                 do { image = try result.image } catch {
                     try Task.checkCancellation()
-                    failed.append(index)
+                    failed.append(contentsOf: shared)
                     continue
                 }
-                ordered[index] = try fitted(image)
+                let frame = try fitted(image)
+                for index in shared { ordered[index] = frame }
             }
             // AVFoundation's batch decoder can reject repeated source frames
             // when upsampling (e.g. 30 -> 60fps). Individual exact-time requests
@@ -325,13 +351,60 @@ enum AnimationPipeline {
         let bytes: Data
         if let gif {
             guard CGImageDestinationFinalize(gif) else { throw EngineError.io("GIF 마감 실패") }
-            bytes = memory as Data
+            bytes = try opaqueGIF(memory as Data)
         } else if let mux {
             if let continuous { try mux.append(continuous.finish(at: plan.ticks), duration: plan.ticks) }
             bytes = try mux.finish()
         } else { throw EngineError.io("애니메이션 인코더 없음") }
         try Task.checkCancellation()
         return AnimationEncoding(bytes: bytes, width: width, height: height, parallelWebP: parallelWebP)
+    }
+
+    /// ImageIO writes a GIF87a header and gives every frame "restore to
+    /// background" disposal with palette index 255 transparent. Our frames are
+    /// full-canvas and opaque (the palette never uses index 255), so rewrite
+    /// those bytes to GIF89a, no transparency and "do not dispose".
+    static func opaqueGIF(_ data: Data) throws -> Data {
+        var data = data
+        try data.withUnsafeMutableBytes { raw in
+            let b = raw.bindMemory(to: UInt8.self), n = b.count
+            guard n >= 13, b[0] == 0x47, b[1] == 0x49, b[2] == 0x46 else { throw EngineError.quality("GIF 헤더 검사 실패") }
+            b[3] = 0x38; b[4] = 0x39; b[5] = 0x61
+            var p = 13
+            if b[10] & 0x80 != 0 { p += 3 << (Int(b[10] & 7) + 1) }
+            func skipSubBlocks() throws {
+                while true {
+                    guard p < n else { throw EngineError.quality("GIF 블록 검사 실패") }
+                    let length = Int(b[p]); p += 1
+                    if length == 0 { return }
+                    p += length
+                }
+            }
+            while p < n {
+                switch b[p] {
+                case 0x21:
+                    guard p + 2 < n else { throw EngineError.quality("GIF 블록 검사 실패") }
+                    // Keep the reserved and user-input bits; disposal 1, no transparency.
+                    if b[p + 1] == 0xF9, b[p + 2] == 4, p + 3 < n { b[p + 3] = b[p + 3] & 0xE2 | 0x04 }
+                    p += 2
+                    try skipSubBlocks()
+                case 0x2C:
+                    guard p + 10 < n else { throw EngineError.quality("GIF 블록 검사 실패") }
+                    guard b[p + 1] == 0, b[p + 2] == 0, b[p + 3] == 0, b[p + 4] == 0, b[p + 5] == b[6], b[p + 6] == b[7], b[p + 7] == b[8], b[p + 8] == b[9] else { throw EngineError.quality("GIF 프레임 영역 검사 실패") }
+                    let flags = b[p + 9]
+                    p += 10
+                    if flags & 0x80 != 0 { p += 3 << (Int(flags & 7) + 1) }
+                    p += 1
+                    try skipSubBlocks()
+                case 0x3B:
+                    return
+                default:
+                    throw EngineError.quality("GIF 블록 검사 실패")
+                }
+            }
+            throw EngineError.quality("GIF 끝 표시 없음")
+        }
+        return data
     }
 
     static func verify(_ encoded: AnimationEncoding, plan: AnimationPlan, format: AnimationFormat) throws {
@@ -346,6 +419,8 @@ enum AnimationPipeline {
             if index == 0 || index == count / 2 || index == count - 1 {
                 try autoreleasepool {
                     guard let image = CGImageSourceCreateImageAtIndex(source, index, nil), image.width == encoded.width, image.height == encoded.height else { throw EngineError.quality("애니메이션 프레임 디코딩 실패") }
+                    // Video frames are opaque; a GIF that decodes with alpha shows holes.
+                    guard format != .gif || [.none, .noneSkipLast, .noneSkipFirst].contains(image.alphaInfo) else { throw EngineError.quality("GIF 투명 픽셀 검사 실패") }
                 }
             }
             guard let properties = CGImageSourceCopyPropertiesAtIndex(source, index, nil) as? [CFString: Any] else { throw EngineError.quality("애니메이션 프레임 속성 검사 실패") }

@@ -57,7 +57,7 @@ extension MediaEngine {
                 try Task.checkCancellation()
                 EngineProgress.report(0.94)
                 try encoded.bytes.write(to: output)
-                return "\(options.format.rawValue.uppercased()) · \(encoded.width)×\(encoded.height) · \(AnimationOptions.frameRateText(fps))fps · \(lastSize)바이트" + (options.format == .gif ? " · 적응형 256색·오차 확산 디더링" : "")
+                return "\(options.format.rawValue.uppercased()) · \(encoded.width)×\(encoded.height) · \(AnimationOptions.frameRateText(fps))fps · \(lastSize)바이트" + (options.format == .gif ? " · 적응형 255색·오차 확산 디더링" : "")
             }
             let excess = Double(options.targetBytes!) / Double(max(1, lastSize))
             // Keep the requested motion as long as possible: quality and
@@ -145,8 +145,10 @@ enum AdaptivePalette {
             return Bucket(colors:colors,channel:channel,score:maxRange*totalCount)
         }
         var buckets=[bucket(colors)]
-        buckets.reserveCapacity(256)
-        while buckets.count<256 {
+        // ImageIO's GIF writer marks index 255 transparent on every frame, so
+        // the palette stops at 255 colors and leaves that index unused.
+        buckets.reserveCapacity(255)
+        while buckets.count<255 {
             var bestIdx = -1, bestScore = -1
             for idx in buckets.indices where buckets[idx].colors.count > 1 {
                 if buckets[idx].score > bestScore { bestScore = buckets[idx].score; bestIdx = idx }
