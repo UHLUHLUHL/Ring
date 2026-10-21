@@ -546,15 +546,14 @@ struct FrostLayer: View {
 }
 
 /// Progress drawn on the hub's rim while the engine works. The engine reports real
-/// checkpoints (start, each PDF page, verification, saved); between them the arc creeps
-/// forward on a fixed curve so a single long step does not look frozen. It never passes 95%
-/// before the engine says the file is saved. Redrawn only while a job runs.
+/// checkpoints (start, each PDF page, verification, saved); the arc eases between reports
+/// and creeps forward on a fixed curve so a single long step does not look frozen. It never
+/// passes 95% before the engine says the file is saved. Redrawn only while a job runs.
 struct HubProgress: View {
     @ObservedObject var model: RingModel
 
     var body: some View {
-        // Paused at 100% so nothing redraws while the finished ring closes.
-        TimelineView(.animation(minimumInterval: nil, paused: model.progress >= 1)) { context in
+        TimelineView(.animation(minimumInterval: nil)) { context in
             let value = shown(at: context.date)
             ZStack {
                 Circle()
@@ -577,13 +576,7 @@ struct HubProgress: View {
     }
 
     private func shown(at date: Date) -> Double {
-        if model.progress >= 1 { return 1 }
-        if model.progress > 0.04 {
-            return min(model.progress, 0.98)
-        }
-        let t = date.timeIntervalSince(model.workStarted)
-        let creep = 0.78 * (1 - exp(-t / 3.5))
-        return min(max(model.progress, creep), 0.95)
+        model.displayedProgress(at: date)
     }
 }
 

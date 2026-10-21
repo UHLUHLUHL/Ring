@@ -26,8 +26,11 @@ final class RingModel: ObservableObject {
     @Published var isWorking = false
     @Published var isCancelling = false
     @Published var isCompleting = false
-    /// Last fraction reported by the engine, and when the job started (for interpolation).
-    @Published var progress: Double = 0
+    /// Latest fraction reported by the engine. HubProgress interpolates between reports.
+    @Published private(set) var progress: Double = 0
+    private(set) var progressFrom: Double = 0
+    private(set) var progressChangedAt = Date()
+    private(set) var progressAnimationDuration: TimeInterval = 0.16
     private(set) var workStarted = Date()
     private var engineTask: Task<Void, Never>?
     private var completionTask: Task<Void, Never>?
@@ -132,21 +135,20 @@ final class RingModel: ObservableObject {
         completionTask?.cancel()
         isCompleting = false
         isCancelling = false
-        progress = 0
-        workStarted = Date()
+        resetProgress()
         // Back on the ring (tool panels hand over here) so the hub can show the progress.
         withAnimation(RingMotion.sCurve(RingMotion.fold)) { screen = .ring; hovered = nil; isWorking = true }
         let job = EngineJob(source: file.url, operation: operation)
         // Retain the model until completion even when the ring is dismissed.
         engineTask = Task {
             let report: @Sendable (Double) -> Void = { [weak self] value in
-                Task { @MainActor in if let self { self.progress = value } }
+                Task { @MainActor in self?.reportProgress(value) }
             }
             do {
                 DebugLog.write("job start \(operation) \(job.source.lastPathComponent)")
                 let output = try await EngineProgress.$handler.withValue(report) { try await RingEngine.shared.run(job) }
                 DebugLog.write("job done \(output.url.lastPathComponent) \(String(format: "%.2f", output.seconds))s")
-                withAnimation(.easeOut(duration: 0.25)) { progress = 1 }
+                reportProgress(1)
                 engineTask = nil
                 // Keep the folded hub in place: completion is a drawn check, not a new screen.
                 withAnimation(.easeOut(duration:0.18)) { isCompleting=true;isCancelling=false }
@@ -156,7 +158,7 @@ final class RingModel: ObservableObject {
                     self?.close()
                 }
             } catch is CancellationError {
-                withAnimation(RingMotion.sCurve(RingMotion.fold)) { isWorking=false;isCancelling=false;progress=0 }
+                withAnimation(RingMotion.sCurve(RingMotion.fold)) { isWorking=false;isCancelling=false;resetProgress() }
                 engineTask=nil
                 showToast("취소했어요 · 결과를 저장하지 않았어요",closeAfter:false)
             } catch {
@@ -170,6 +172,44 @@ final class RingModel: ObservableObject {
                 alert.runModal()
             }
         }
+    }
+
+    private func resetProgress() {
+        let now = Date()
+        progress = 0
+        progressFrom = 0
+        progressChangedAt = now
+        progressAnimationDuration = 0.16
+        workStarted = now
+    }
+
+    private func reportProgress(_ value: Double) {
+        guard value.isFinite else { return }
+        let target = min(1, max(0, value))
+        guard target > progress else { return }
+
+        let now = Date()
+        let interval = now.timeIntervalSince(progressChangedAt)
+        progressFrom = displayedProgress(at: now)
+        progressChangedAt = now
+        // Track the engine's reporting cadence: frequent frame reports stay responsive,
+        // while larger stage jumps get enough time to read as a continuous motion.
+        progressAnimationDuration = min(0.30, max(0.025, interval * 0.9))
+        progress = target
+    }
+
+    func displayedProgress(at date: Date) -> Double {
+        let elapsed = max(0, date.timeIntervalSince(progressChangedAt))
+        let t = min(1, elapsed / max(progressAnimationDuration, 0.001))
+        let eased = t * t * (3 - 2 * t)
+        let reported = progressFrom + (progress - progressFrom) * eased
+
+        // Keep the established slow creep between engine checkpoints, but make reported
+        // checkpoints ease into it instead of snapping the ring and percentage label.
+        guard progress < 1 else { return reported }
+        let workElapsed = max(0, date.timeIntervalSince(workStarted))
+        let creep = 0.78 * (1 - exp(-workElapsed / 3.5))
+        return min(max(reported, creep), 0.95)
     }
 
     var regionTitle: String {
