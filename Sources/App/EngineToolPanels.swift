@@ -533,12 +533,13 @@ private struct VideoToolPanel:View {
     }
 
     private func videoPreview(maxHeight:CGFloat) -> some View {
-        ZStack {
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
+        let radius: CGFloat = cropsVideo ? 0 : 12
+        return ZStack {
+            RoundedRectangle(cornerRadius: radius, style: .continuous)
                 .fill(Color.black.opacity(0.4))
             if let player {
                 VideoPlayerView(player: player)
-                    .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                    .clipShape(RoundedRectangle(cornerRadius: radius, style: .continuous))
             }
             if cropsVideo, let sourceSize {
                 GeometryReader { geo in
@@ -548,7 +549,7 @@ private struct VideoToolPanel:View {
             }
         }
         .frame(width: previewSize(maxHeight: maxHeight).width, height: previewSize(maxHeight: maxHeight).height)
-        .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(Color.white.opacity(0.12), lineWidth: 1))
+        .overlay(RoundedRectangle(cornerRadius: radius, style: .continuous).strokeBorder(Color.white.opacity(0.12), lineWidth: 1))
         .frame(maxWidth: .infinity)
         .animation(.snappy, value: sourceSize)
     }
