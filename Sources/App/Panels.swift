@@ -291,7 +291,14 @@ struct CropPanel: View {
     @State private var jpegSampling: JPEGSampling?
     private let pixels: CGSize
     private let orientation: Int
-    private let area = CGSize(width: 380, height: 300)
+    /// Preview box in the picture's own shape: 380pt wide, as tall as the
+    /// aspect needs up to 460pt (the 720pt window minus the panel's rows).
+    /// A small inset leaves room for the corner brackets.
+    private var area: CGSize {
+        let inset: CGFloat = 12, aspect = pixels.width / max(1, pixels.height)
+        let width = min(380 - inset, (460 - inset) * aspect)
+        return CGSize(width: width + inset, height: width / aspect + inset)
+    }
 
     init(model: RingModel) {
         self.model = model
@@ -311,9 +318,8 @@ struct CropPanel: View {
     }
 
     private var fitted: CGRect {
-        let s = min(area.width / pixels.width, area.height / pixels.height) * 0.92
-        let w = pixels.width * s, h = pixels.height * s
-        return CGRect(x: (area.width - w) / 2, y: (area.height - h) / 2, width: w, height: h)
+        let a = area, inset: CGFloat = 6
+        return CGRect(x: inset, y: inset, width: a.width - inset * 2, height: a.height - inset * 2)
     }
 
     private var cropOnScreen: CGRect {

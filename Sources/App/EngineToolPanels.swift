@@ -521,7 +521,18 @@ private struct VideoToolPanel:View {
 
     /// The player and, outside trimming, the Photos-style crop frame over the
     /// exact rectangle the video occupies.
-    private func videoPreview(height:CGFloat) -> some View {
+    /// The preview box takes the video's own shape (no side letterbox): full
+    /// panel width, as tall as the aspect needs, up to `maxHeight`. A tall
+    /// video beyond that narrows the box instead of padding it.
+    private func previewSize(maxHeight:CGFloat) -> CGSize {
+        // 460pt is the ToolForm content width (500 minus its 20pt margins).
+        let width:CGFloat = 460
+        let aspect = sourceSize.map { max(0.2,min(5,$0.width/max(1,$0.height))) } ?? 16.0/9
+        let height = min(maxHeight, width/aspect)
+        return CGSize(width: min(width, height*aspect), height: height)
+    }
+
+    private func videoPreview(maxHeight:CGFloat) -> some View {
         ZStack {
             RoundedRectangle(cornerRadius: 12, style: .continuous)
                 .fill(Color.black.opacity(0.4))
@@ -536,8 +547,10 @@ private struct VideoToolPanel:View {
                 .accessibilityIdentifier("video.cropFrame")
             }
         }
-        .frame(height: height)
+        .frame(width: previewSize(maxHeight: maxHeight).width, height: previewSize(maxHeight: maxHeight).height)
         .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(Color.white.opacity(0.12), lineWidth: 1))
+        .frame(maxWidth: .infinity)
+        .animation(.snappy, value: sourceSize)
     }
 
     private var cropControls:some View {
@@ -558,9 +571,9 @@ private struct VideoToolPanel:View {
     }
 
     @ViewBuilder
-    private func trimTimelineSection(videoHeight: CGFloat, middlePrefix: String) -> some View {
+    private func trimTimelineSection(videoMaxHeight: CGFloat, middlePrefix: String) -> some View {
         VStack(spacing: 10) {
-            videoPreview(height: videoHeight)
+            videoPreview(maxHeight: videoMaxHeight)
 
             HStack(spacing: 12) {
                 Button(action: togglePlay) {
@@ -602,10 +615,10 @@ private struct VideoToolPanel:View {
         ToolForm(model:model,title:title,width:500,ready:duration != nil,operation:operation) {
             switch tool {
             case .trim:
-                trimTimelineSection(videoHeight: 190, middlePrefix: "선택 구간")
+                trimTimelineSection(videoMaxHeight: 380, middlePrefix: "선택 구간")
 
             case .compress:
-                videoPreview(height:190)
+                videoPreview(maxHeight:340)
                 cropControls
                 PanelRow(label:"원본") { Text(model.file.sizeText).foregroundStyle(.secondary) }
                 PanelRow(label:"목표") { SizeFields(value:$size,unit:$unit) }
@@ -622,7 +635,7 @@ private struct VideoToolPanel:View {
                 PanelRow(label:"코덱") { Picker("코덱",selection:$codec) { Text("HEVC · 고효율/작은 용량").tag("HEVC");Text("H.264 · 범용 호환성").tag("H264") }.labelsHidden() }
 
             case .animation(let format):
-                trimTimelineSection(videoHeight: 160, middlePrefix: "구간")
+                trimTimelineSection(videoMaxHeight: 270, middlePrefix: "구간")
                 cropControls
                 PanelRow(label:"프레임") {
                     TextField("원본",text:$fps).textFieldStyle(.roundedBorder)
