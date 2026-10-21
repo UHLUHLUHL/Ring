@@ -19,9 +19,10 @@ enum PixelCheck {
         }
         let components = space.model == .rgb ? 4 : 2
         var result = PixelMetrics()
-        for y in stride(from: 0, to: a.height, by: 64) {
+        let stripRows = 1024
+        for y in stride(from: 0, to: a.height, by: stripRows) {
             try Task.checkCancellation()
-            let height = min(64, a.height-y)
+            let height = min(stripRows, a.height-y)
             let row = a.width * components * 2
             let info = CGBitmapInfo.byteOrder16Little.rawValue | CGImageAlphaInfo.premultipliedLast.rawValue
             guard let ca = CGContext(data:nil, width:a.width, height:height, bitsPerComponent:16, bytesPerRow:row, space:space, bitmapInfo:info),

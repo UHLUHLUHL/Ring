@@ -12,16 +12,16 @@ struct RootView: View {
                 RingScreen(model: model)
                     .padding(.top, RingWindowLayout.ringCenterY - RingMetrics.canvas / 2)
                     .frame(maxHeight: .infinity, alignment: .top)
-                    .transition(.scale(scale: 0.85).combined(with: .opacity))
+                    .transition(.opacity)
             case .crop:
                 CropPanel(model: model)
-                    .transition(.scale(scale: 0.9).combined(with: .opacity))
+                    .transition(.opacity.combined(with: .scale(scale: 0.96)))
             case .addBackground:
                 AddBackgroundPanel(model: model)
-                    .transition(.scale(scale: 0.9).combined(with: .opacity))
+                    .transition(.opacity.combined(with: .scale(scale: 0.96)))
             case .tool(let tool):
                 EngineToolPanel(model:model,tool:tool)
-                    .transition(.scale(scale:0.9).combined(with:.opacity))
+                    .transition(.opacity.combined(with: .scale(scale: 0.96)))
             }
             if let toast = model.toast {
                 VStack {
@@ -47,20 +47,24 @@ struct RingScreen: View {
     @AppStorage(AppSettings.showShortcutHints) private var showHints = true
 
     var body: some View {
-        VStack(spacing: 8 * RingMetrics.scale) {
-            RingView(model: model)
-            Group {
-                if !model.file.convertActions.isEmpty && !model.file.editActions.isEmpty {
-                    TabPill(model: model)
+        ZStack(alignment: .top) {
+            VStack(spacing: 8 * RingMetrics.scale) {
+                RingView(model: model)
+                Group {
+                    if !model.file.convertActions.isEmpty && !model.file.editActions.isEmpty {
+                        TabPill(model: model)
+                    }
+                    if showHints { ShortcutHints() }
                 }
-                if showHints { ShortcutHints() }
+                .opacity(model.isWorking ? 0 : 1)
+                .allowsHitTesting(!model.isWorking)
             }
-            .opacity(model.isWorking ? 0 : 1)
-            .allowsHitTesting(!model.isWorking)
             if model.isWorking && !model.isCompleting {
                 Button(model.isCancelling ? "취소 중…":"작업 취소") { model.cancelWork() }
                     .buttonStyle(.glass).controlSize(.small).disabled(model.isCancelling)
                     .accessibilityIdentifier("job.cancel")
+                    .padding(.top, RingMetrics.canvas / 2 + RingMetrics.hubDiameter / 2 + 12)
+                    .transition(.opacity.combined(with: .scale(scale: 0.92)))
             }
         }
     }
@@ -574,8 +578,11 @@ struct HubProgress: View {
 
     private func shown(at date: Date) -> Double {
         if model.progress >= 1 { return 1 }
+        if model.progress > 0.04 {
+            return min(model.progress, 0.98)
+        }
         let t = date.timeIntervalSince(model.workStarted)
-        let creep = 0.9 * (1 - exp(-t / 2.0))
+        let creep = 0.78 * (1 - exp(-t / 3.5))
         return min(max(model.progress, creep), 0.95)
     }
 }

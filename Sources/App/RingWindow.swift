@@ -174,11 +174,7 @@ final class RingWindowController {
         f.origin.x = min(max(f.origin.x, vf.minX), vf.maxX - f.width)
         f.origin.y = min(max(f.origin.y, vf.minY), vf.maxY - f.height)
         if f != panel.frame {
-            NSAnimationContext.runAnimationGroup { ctx in
-                ctx.duration = 0.25
-                ctx.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
-                panel.animator().setFrame(f, display: true)
-            }
+            panel.setFrameOrigin(f.origin)
         }
     }
 

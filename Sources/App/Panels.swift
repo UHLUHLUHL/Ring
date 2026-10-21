@@ -137,20 +137,21 @@ struct CropPanel: View {
     @State private var crop = CGRect(x: 0, y: 0, width: 1, height: 1) // normalized to the image
     @State private var dragStart: CGRect?
     @State private var ratio: Ratio = .free
-    private let image: NSImage?
+    @State private var image: NSImage?
+    @State private var jpegSampling: JPEGSampling?
     private let pixels: CGSize
-    private let jpegSampling: JPEGSampling?
     private let orientation: Int
     private let area = CGSize(width: 380, height: 300)
 
     init(model: RingModel) {
         self.model = model
-        image = panelPreview(of:model.file.url)
-        pixels = pixelSize(of: model.file.url)
-        jpegSampling = ["jpg","jpeg"].contains(model.file.url.pathExtension.lowercased()) ? (try? JPEGSampling(Data(contentsOf:model.file.url,options:.mappedIfSafe))) : nil
-        let source = CGImageSourceCreateWithURL(model.file.url as CFURL,nil)
-        let props = source.flatMap { CGImageSourceCopyPropertiesAtIndex($0,0,nil) as? [CFString:Any] }
-        orientation = props?[kCGImagePropertyOrientation] as? Int ?? 1
+        let source = CGImageSourceCreateWithURL(model.file.url as CFURL, nil)
+        let props = source.flatMap { CGImageSourceCopyPropertiesAtIndex($0, 0, nil) as? [CFString: Any] }
+        let w = props?[kCGImagePropertyPixelWidth] as? Int ?? 1000
+        let h = props?[kCGImagePropertyPixelHeight] as? Int ?? 1000
+        let orient = props?[kCGImagePropertyOrientation] as? Int ?? 1
+        orientation = orient
+        pixels = orient >= 5 ? CGSize(width: h, height: w) : CGSize(width: w, height: h)
     }
 
     private var fitted: CGRect {
@@ -174,10 +175,6 @@ struct CropPanel: View {
                     let snapped=ImageEdits.displayRect(sampling.snapped(raw),width:sampling.width,height:sampling.height,orientation:orientation)
                     if abs(snapped.minX-value.minX)>0.0000001 || abs(snapped.minY-value.minY)>0.0000001 || abs(snapped.width-value.width)>0.0000001 || abs(snapped.height-value.height)>0.0000001 { crop=snapped }
                 }
-            if let sampling=jpegSampling,case .crop = model.regionPurpose {
-                Text("JPEG 무손실 · \(sampling.mcuWidth)×\(sampling.mcuHeight)px 격자로 선택")
-                    .font(.system(size:11)).foregroundStyle(.secondary)
-            }
             PanelRow(label: "비율") {
                 FillSegmented(selection: $ratio)
                     .onChange(of: ratio) { _, r in apply(ratio: r) }
@@ -205,6 +202,18 @@ struct CropPanel: View {
                     .keyboardShortcut(.defaultAction)
             }
             .controlSize(.regular)
+        }
+        .task {
+            let url = model.file.url
+            let (previewImg, sampling) = await Task.detached(priority: .userInitiated) {
+                let img = panelPreview(of: url)
+                let samp = ["jpg", "jpeg"].contains(url.pathExtension.lowercased())
+                    ? (try? JPEGSampling(Data(contentsOf: url, options: .mappedIfSafe)))
+                    : nil
+                return (img, samp)
+            }.value
+            image = previewImg
+            jpegSampling = sampling
         }
     }
 

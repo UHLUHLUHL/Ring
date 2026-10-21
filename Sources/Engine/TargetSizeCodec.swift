@@ -58,22 +58,31 @@ enum TargetSizeCodec {
             } else {
                 var best: Data?
                 if format == .webp {
+                    EngineProgress.report(0.30)
                     let overhead = icc.count + exif.count + 64
                     let hint = max(1, min(Int(Int32.max), Int(target) - overhead))
                     let native = try candidate(100, nativeTarget: hint)
                     if native.count <= target { best = native }
                 }
-                var low = 0, high = 100
-                while low <= high {
-                    let mid = (low + high) / 2
-                    let trial = try candidate(mid)
-                    if trial.count <= target { best = trial; low = mid + 1 }
-                    else { high = mid - 1 }
+                if best == nil {
+                    var low = 0, high = 100, stepIdx = 0
+                    while low <= high {
+                        let mid = (low + high) / 2
+                        let trial = try candidate(mid)
+                        stepIdx += 1
+                        EngineProgress.report(min(0.85, 0.15 + Double(stepIdx) * 0.10))
+                        if trial.count <= target { best = trial; low = mid + 1 }
+                        else { high = mid - 1 }
+                    }
                 }
                 guard let best else { throw EngineError.quality("최저 품질에서도 목표 용량을 충족할 수 없어요. 목표 용량이나 크기를 조절해 주세요.") }
                 bytes = best
             }
-        } else { bytes = try candidate(Int((quality * 100).rounded())) }
+        } else {
+            EngineProgress.report(0.35)
+            bytes = try candidate(Int((quality * 100).rounded()))
+        }
+        EngineProgress.report(0.88)
         guard !bytes.isEmpty, target == nil || Int64(bytes.count) <= target! else { throw EngineError.quality("목표 용량 검사 실패") }
         try bytes.write(to: output)
         let written = try ImageInput(output)

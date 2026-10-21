@@ -65,6 +65,7 @@ enum ExternalCodecs {
     }
     static func convert(_ source:URL,to output:URL,format:ImageFormat) throws -> String {
         let prepared=try autoreleasepool { try prepare(source,format:format) }
+        EngineProgress.report(0.35)
         let rgba=prepared.rgba,icc=prepared.icc,exif=prepared.exif,image=prepared.image
         var error=[CChar](repeating:0,count:512)
         let ok=rgba.withUnsafeBytes { pixels in icc.withUnsafeBytes { profile in exif.withUnsafeBytes { metadata in
@@ -75,6 +76,7 @@ enum ExternalCodecs {
             }
         }}}
         guard ok==1 else { throw EngineError.io("\(format.rawValue.uppercased()) 인코딩 실패: \(String(cString:error))") }
+        EngineProgress.report(0.85)
         try ImageCodec.verify(image,properties:prepared.properties,output:output,exact:true)
         return "\(format.rawValue.uppercased()) 무손실 · RGB 4:4:4 · 픽셀·ICC·방향 일치"
     }
@@ -92,20 +94,16 @@ enum ExternalCodecs {
         let rgba=try straightRGBA8(input.image)
         let icc=(input.image.colorSpace!.copyICCData() as Data?) ?? Data()
         let exif=try MetadataEnvelope.exif(source,input:input)
-        guard let provider=CGDataProvider(data:rgba as CFData),
-              let image=CGImage(width:input.image.width,height:input.image.height,bitsPerComponent:8,bitsPerPixel:32,
-                 bytesPerRow:input.image.width*4,space:input.image.colorSpace!,bitmapInfo:CGBitmapInfo(rawValue:CGImageAlphaInfo.last.rawValue),
-                 provider:provider,decode:nil,shouldInterpolate:false,intent:.defaultIntent) else { throw EngineError.io("RGBA 참조 이미지 생성 실패") }
-        guard try PixelCheck.compare(input.image,image).exact else { throw EngineError.quality("코덱 입력 픽셀 보존 검사 실패") }
-        return Prepared(rgba:rgba,icc:icc,exif:exif,image:image,properties:input.properties)
+        return Prepared(rgba:rgba,icc:icc,exif:exif,image:input.image,properties:input.properties)
     }
     static func straightRGBA8(_ image:CGImage) throws -> Data {
         let width=image.width,height=image.height,space=image.colorSpace!
         var data=Data(count:width*height*4)
         // A 16-bit premultiplied strip avoids introducing an 8-bit premultiply round trip.
-        for y in stride(from:0,to:height,by:64) {
+        let stripRows=1024
+        for y in stride(from:0,to:height,by:stripRows) {
             try Task.checkCancellation()
-            let rows=min(64,height-y),context=try PDFEngine.bitmap(width:width,height:rows,space:space,depth:16)
+            let rows=min(stripRows,height-y),context=try PDFEngine.bitmap(width:width,height:rows,space:space,depth:16)
             context.setBlendMode(.copy);context.draw(image,in:CGRect(x:0,y:y+rows-height,width:width,height:height))
             let values=context.data!.bindMemory(to:UInt16.self,capacity:width*rows*4)
             data.withUnsafeMutableBytes { bytes in

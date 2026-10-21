@@ -68,14 +68,22 @@ final class RingModel: ObservableObject {
         }
     }
 
+    private static let panelTransition = Animation.easeOut(duration: 0.16)
+
     func activate(_ index: Int) {
         guard !isWorking, items.indices.contains(index) else { return }
         let action = items[index]
         switch action.kind {
         case .convert(let format):
-            if file.kind == .video,let format=AnimationFormat(rawValue:format.lowercased()) { screen = .tool(.animation(format));return }
+            if file.kind == .video, let format = AnimationFormat(rawValue: format.lowercased()) {
+                withAnimation(Self.panelTransition) { screen = .tool(.animation(format)) }
+                return
+            }
             if let target = ImageFormat(rawValue: format.lowercased()) {
-                if file.kind == .document { screen = .tool(.document(target));return }
+                if file.kind == .document {
+                    withAnimation(Self.panelTransition) { screen = .tool(.document(target)) }
+                    return
+                }
                 if target == .docx && file.kind == .pdf {
                     let alert=NSAlert();alert.messageText="PDF를 Word 문서로 변환"
                     alert.informativeText="페이지 보기와 편집용 텍스트를 함께 저장합니다. 페이지 보기는 300dpi 이미지로 만들어지며, Word에서 원본 벡터·배치를 그대로 편집할 수는 없습니다. 스캔 문서의 OCR에는 인식 오류가 있을 수 있습니다."
@@ -86,38 +94,34 @@ final class RingModel: ObservableObject {
             }
         case .crop:
             regionPurpose = .crop
-            withAnimation(.spring(response: 0.45, dampingFraction: 0.85)) { screen = .crop }
+            withAnimation(Self.panelTransition) { screen = .crop }
         case .addBackground:
-            withAnimation(.spring(response: 0.45, dampingFraction: 0.85)) { screen = .addBackground }
+            withAnimation(Self.panelTransition) { screen = .addBackground }
         case .tool:
-            if action.id == "compress" {
-                switch file.kind {
-                case .image:screen = .tool(.imageCompression)
-                case .pdf:screen = .tool(.pdfCompression)
-                case .video:screen = .tool(.videoCompression)
-                default:break
+            withAnimation(Self.panelTransition) {
+                if action.id == "compress" {
+                    switch file.kind {
+                    case .image: screen = .tool(.imageCompression)
+                    case .pdf: screen = .tool(.pdfCompression)
+                    case .video: screen = .tool(.videoCompression)
+                    default: break
+                    }
+                } else if file.kind == .video && action.id == "trim" {
+                    screen = .tool(.videoTrim)
+                } else if file.kind == .pdf && action.id == "merge" {
+                    screen = .tool(.pdfMerge)
+                } else if file.kind == .pdf && action.id == "pages" {
+                    screen = .tool(.pdfPages)
+                } else if file.kind == .pdf && action.id == "split" {
+                    screen = .tool(.pdfSplit)
+                } else if file.kind == .image && action.id == "resize" {
+                    screen = .tool(.imageResize)
+                } else if action.id == "metadata" {
+                    screen = .tool(.imageMetadata)
+                } else {
+                    showToast("\(action.title) — 준비 중이에요", closeAfter: false)
                 }
-            } else if file.kind == .video && action.id == "trim" {
-                screen = .tool(.videoTrim)
-            } else if file.kind == .pdf && action.id == "merge" {
-                screen = .tool(.pdfMerge)
-            } else if file.kind == .pdf && action.id == "pages" {
-                screen = .tool(.pdfPages)
-            } else if file.kind == .pdf && action.id == "split" {
-                screen = .tool(.pdfSplit)
-            } else if file.kind == .image && action.id == "resize" {
-                screen = .tool(.imageResize)
-            } else if file.kind == .image && action.id == "redact" {
-                regionPurpose = .redact; screen = .crop
-            } else if file.kind == .image && action.id == "annotate" {
-                ImageToolUI.annotation(model:self)
-            } else if file.kind == .image && action.id == "adjust" {
-                ImageToolUI.adjust(model:self)
-            } else if file.kind == .pdf && (action.id == "metadata" || action.id == "annotate" || action.id == "redact") {
-                PDFToolUI.present(action.id,model:self)
-            } else if action.id == "metadata" {
-                screen = .tool(.imageMetadata)
-            } else { showToast("\(action.title) — 엔진 연결 중이에요", closeAfter: false) }
+            }
         }
     }
 
@@ -136,7 +140,7 @@ final class RingModel: ObservableObject {
         // Retain the model until completion even when the ring is dismissed.
         engineTask = Task {
             let report: @Sendable (Double) -> Void = { [weak self] value in
-                Task { @MainActor in if let self, value > self.progress { self.progress = value } }
+                Task { @MainActor in if let self { self.progress = value } }
             }
             do {
                 DebugLog.write("job start \(operation) \(job.source.lastPathComponent)")
@@ -181,7 +185,7 @@ final class RingModel: ObservableObject {
     func cancelWork() { guard isWorking,!isCompleting,!isCancelling else { return };isCancelling=true;engineTask?.cancel() }
 
     func backToRing() {
-        withAnimation(.spring(response: 0.45, dampingFraction: 0.85)) { screen = .ring }
+        withAnimation(Self.panelTransition) { screen = .ring }
     }
 
     func showToast(_ text: String, closeAfter: Bool) {

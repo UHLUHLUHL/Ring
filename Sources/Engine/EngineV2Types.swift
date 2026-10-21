@@ -21,12 +21,21 @@ struct DocumentRenderOptions {
 enum VideoCodec { case hevc, h264 }
 enum AnimationFormat: String { case gif, webp }
 struct AnimationOptions {
+    static let maximumFPS: Double = 60
+    static let maximumFrames = 1800
     var format: AnimationFormat = .gif
-    var fps: Double = 15
+    var fps: Double = 30
     var maxDimension: Int = 640
     var targetBytes: Int64? = nil
     var start: Double = 0
     var duration: Double? = nil
+
+    static func frameRateText(_ value: Double) -> String {
+        var text = String(format: "%.3f", locale: Locale(identifier: "en_US_POSIX"), value)
+        while text.last == "0" { text.removeLast() }
+        if text.last == "." { text.removeLast() }
+        return text
+    }
 }
 enum VideoOperation {
     /// Passthrough cuts use container/sample boundaries, not arbitrary decoded frames.
