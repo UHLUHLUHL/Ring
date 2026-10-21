@@ -9,14 +9,18 @@ struct ImageInput {
     let type: String
     let orientation: Int
     init(_ url: URL) throws {
-        guard let source = CGImageSourceCreateWithURL(url as CFURL, [kCGImageSourceShouldCache:false] as CFDictionary),
-              CGImageSourceGetCount(source) == 1,
-              let type = CGImageSourceGetType(source),
+        guard let source = CGImageSourceCreateWithURL(url as CFURL, [kCGImageSourceShouldCache:false] as CFDictionary) else {
+            throw EngineError.unsupported("이미지를 읽을 수 없어요. 파일이 손상되었거나 지원하지 않는 형식이에요.")
+        }
+        guard CGImageSourceGetCount(source) == 1 else {
+            throw EngineError.unsupported("여러 프레임이 포함된 이미지예요. 움짤 전용 편집 메뉴를 이용해 주세요.")
+        }
+        guard let type = CGImageSourceGetType(source),
               let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString:Any],
               let w = properties[kCGImagePropertyPixelWidth] as? Int,
               let h = properties[kCGImagePropertyPixelHeight] as? Int, w > 0, h > 0,
               w <= 65535, h <= 65535, Int64(w)*Int64(h) <= 52_000_000 else {
-            throw EngineError.unsupported("손상·다중 프레임 이미지 또는 52MP 초과 이미지는 처리하지 않아요.")
+            throw EngineError.unsupported("이미지 크기를 읽을 수 없거나 52MP 한도를 초과했어요.")
         }
         for kind in [kCGImageAuxiliaryDataTypeHDRGainMap, kCGImageAuxiliaryDataTypeISOGainMap, kCGImageAuxiliaryDataTypeDepth, kCGImageAuxiliaryDataTypeDisparity] {
             if CGImageSourceCopyAuxiliaryDataInfoAtIndex(source, 0, kind) != nil {

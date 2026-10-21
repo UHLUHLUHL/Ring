@@ -9,6 +9,7 @@ final class RingModel: ObservableObject {
         case imageCompression, imageResize, imageMetadata
         case pdfCompression, pdfMerge, pdfPages, pdfSplit
         case document(ImageFormat), videoTrim, videoCompression, animation(AnimationFormat)
+        case animatedImage(AnimatedImageTool)
     }
     enum Screen: Equatable { case ring, crop, addBackground, tool(Tool) }
 
@@ -78,6 +79,10 @@ final class RingModel: ObservableObject {
         let action = items[index]
         switch action.kind {
         case .convert(let format):
+            if file.kind == .animatedImage {
+                withAnimation(Self.panelTransition) { screen = .tool(.animatedImage(.webp)) }
+                return
+            }
             if file.kind == .video, let format = AnimationFormat(rawValue: format.lowercased()) {
                 withAnimation(Self.panelTransition) { screen = .tool(.animation(format)) }
                 return
@@ -97,12 +102,18 @@ final class RingModel: ObservableObject {
             }
         case .crop:
             regionPurpose = .crop
+            if file.kind == .animatedImage {
+                withAnimation(Self.panelTransition) { screen = .tool(.animatedImage(.crop)) }
+                return
+            }
             withAnimation(Self.panelTransition) { screen = .crop }
         case .addBackground:
             withAnimation(Self.panelTransition) { screen = .addBackground }
         case .tool:
             withAnimation(Self.panelTransition) {
-                if action.id == "compress" {
+                if file.kind == .animatedImage {
+                    screen = .tool(.animatedImage(action.id == "frame" ? .frame : .resize))
+                } else if action.id == "compress" {
                     switch file.kind {
                     case .image: screen = .tool(.imageCompression)
                     case .pdf: screen = .tool(.pdfCompression)

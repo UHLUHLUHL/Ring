@@ -7,6 +7,7 @@
 #include <jpeglib.h>
 #include <webp/encode.h>
 #include <webp/mux.h>
+#include <webp/demux.h>
 #include <zlib.h>
 
 void ring_buffer_free(void *buffer) { free(buffer); }
@@ -193,6 +194,68 @@ int ring_webp_mux_append(void *opaque,const uint8_t *bytes,size_t size,int durat
         WebPDataClear(&frame.bitstream);
     }
     WebPMuxDelete(part);return ok && total==duration_ms;
+}
+struct RingWebPDecoder { WebPData data;WebPAnimDecoder *decoder; };
+void ring_webp_image_decoder_destroy(void *opaque) {
+    struct RingWebPDecoder *value=opaque;
+    if(value) { if(value->decoder) WebPAnimDecoderDelete(value->decoder);WebPDataClear(&value->data);free(value); }
+}
+void *ring_webp_image_decoder_create(const uint8_t *bytes,size_t size,int threads,int *width,int *height,int *frames,int *loops) {
+    if(!bytes || !size || !width || !height || !frames || !loops) return NULL;
+    struct RingWebPDecoder *value=calloc(1,sizeof(*value));
+    if(!value) return NULL;
+    WebPData data={bytes,size};WebPAnimDecoderOptions options;WebPAnimInfo info;
+    if(!WebPDataCopy(&data,&value->data) || !WebPAnimDecoderOptionsInit(&options)) goto error;
+    options.color_mode=MODE_RGBA;options.use_threads=threads>1;
+    value->decoder=WebPAnimDecoderNew(&value->data,&options);
+    if(!value->decoder || !WebPAnimDecoderGetInfo(value->decoder,&info) || info.canvas_width>16383 || info.canvas_height>16383 || info.frame_count>10000) goto error;
+    *width=(int)info.canvas_width;*height=(int)info.canvas_height;*frames=(int)info.frame_count;*loops=(int)info.loop_count;
+    return value;
+error:
+    ring_webp_image_decoder_destroy(value);return NULL;
+}
+int ring_webp_image_decoder_next(void *opaque,const uint8_t **pixels) {
+    struct RingWebPDecoder *value=opaque;uint8_t *frame=NULL;int timestamp;
+    if(!value || !pixels || !WebPAnimDecoderGetNext(value->decoder,&frame,&timestamp)) return 0;
+    *pixels=frame;return 1;
+}
+void ring_webp_image_decoder_reset(void *opaque) {
+    struct RingWebPDecoder *value=opaque;
+    if(value) WebPAnimDecoderReset(value->decoder);
+}
+
+// Animated image edits use full composited frames, with no palette quantization
+// or lossy generation. The video encoder above retains its existing settings.
+void *ring_webp_lossless_mux_create(int width,int height,int loop_count,const uint8_t *icc,size_t icc_size) {
+    if(width<1 || height<1 || width>16383 || height>16383 || loop_count<0 || loop_count>65535) return NULL;
+    WebPMux *mux=WebPMuxNew();
+    WebPMuxAnimParams params={0,loop_count};
+    if(!mux) return NULL;
+    int ok=WebPMuxSetCanvasSize(mux,width,height)==WEBP_MUX_OK &&
+        WebPMuxSetAnimationParams(mux,&params)==WEBP_MUX_OK;
+    if(ok && icc_size) { WebPData profile={icc,icc_size};ok=icc && WebPMuxSetChunk(mux,"ICCP",&profile,1)==WEBP_MUX_OK; }
+    if(!ok) { WebPMuxDelete(mux);return NULL; }
+    return mux;
+}
+int ring_webp_lossless_mux_add(void *opaque,const uint8_t *rgba,int width,int height,int duration_ms,int threads,size_t *encoded_size) {
+    if(!opaque || !rgba || !encoded_size || width<1 || height<1 || width>16383 || height>16383 || duration_ms<1 || duration_ms>0xffffff) return 0;
+    int w,h;
+    if(WebPMuxGetCanvasSize(opaque,&w,&h)!=WEBP_MUX_OK || w!=width || h!=height) return 0;
+    WebPConfig config;WebPPicture picture;WebPMemoryWriter writer;
+    if(!WebPConfigInit(&config) || !WebPConfigLosslessPreset(&config,4) || !WebPPictureInit(&picture)) return 0;
+    config.exact=1;config.low_memory=1;config.thread_level=threads>1;
+    picture.width=width;picture.height=height;picture.use_argb=1;
+    WebPMemoryWriterInit(&writer);picture.writer=WebPMemoryWrite;picture.custom_ptr=&writer;
+    int ok=WebPValidateConfig(&config) && WebPPictureImportRGBA(&picture,rgba,width*4) && WebPEncode(&config,&picture);
+    if(ok) {
+        WebPMuxFrameInfo frame={0};
+        frame.bitstream.bytes=writer.mem;frame.bitstream.size=writer.size;
+        frame.id=WEBP_CHUNK_ANMF;frame.duration=duration_ms;
+        frame.dispose_method=WEBP_MUX_DISPOSE_NONE;frame.blend_method=WEBP_MUX_NO_BLEND;
+        ok=WebPMuxPushFrame(opaque,&frame,1)==WEBP_MUX_OK;
+        if(ok) *encoded_size=writer.size;
+    }
+    WebPMemoryWriterClear(&writer);WebPPictureFree(&picture);return ok;
 }
 int ring_webp_mux_finish(void *opaque,uint8_t **output,size_t *size) {
     if(!output || !size) return 0;

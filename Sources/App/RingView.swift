@@ -48,16 +48,24 @@ struct RingScreen: View {
 
     var body: some View {
         ZStack(alignment: .top) {
-            VStack(spacing: 8 * RingMetrics.scale) {
-                RingView(model: model)
-                Group {
-                    if !model.file.convertActions.isEmpty && !model.file.editActions.isEmpty {
-                        TabPill(model: model)
+            // These surfaces share a visibility lifetime. Keep the always-visible hub
+            // and the wedge labels outside so refraction and folding stay independent.
+            GlassEffectContainer(spacing: 0) {
+                VStack(spacing: 8 * RingMetrics.scale) {
+                    RingView(model: model, layer: .surface)
+                    Group {
+                        if !model.file.convertActions.isEmpty && !model.file.editActions.isEmpty {
+                            TabPill(model: model)
+                        }
+                        if showHints { ShortcutHints() }
                     }
-                    if showHints { ShortcutHints() }
+                    .allowsHitTesting(!model.isWorking)
                 }
-                .opacity(model.isWorking ? 0 : 1)
-                .allowsHitTesting(!model.isWorking)
+            }
+            // Fade the container itself: harvested glass ignores a child's opacity.
+            .opacity(model.isWorking ? 0 : 1)
+            .overlay(alignment: .top) {
+                RingView(model: model, layer: .content)
             }
             if model.isWorking && !model.isCompleting {
                 Button(model.isCancelling ? "취소 중…":"작업 취소") { model.cancelWork() }
@@ -71,7 +79,9 @@ struct RingScreen: View {
 }
 
 struct RingView: View {
+    enum Layer { case surface, content }
     @ObservedObject var model: RingModel
+    let layer: Layer
 
     private let side = RingMetrics.canvas
     private var center: CGPoint { CGPoint(x: side / 2, y: side / 2) }
@@ -84,53 +94,54 @@ struct RingView: View {
         let g = model.appeared ? 1 : RingMetrics.closedGrow
         let hub = RingMetrics.hubDiameter * g
         ZStack {
-            // Clear glass needs a darker backdrop to stay legible (Apple's guidance for the
-            // clear variant). The glass refracts this soft shadow together with the desktop.
-            // While a job runs it folds in with the wedges and fades out, otherwise it was left
-            // as a soft round halo around the lone hub.
-            let backdrop = model.isWorking ? RingMetrics.hubDiameter : RingMetrics.outer * 2 + 10
-            Circle()
-                .fill(.black.opacity(0.18))
-                .frame(width: backdrop * g, height: backdrop * g)
-                .blur(radius: 22)
-                .opacity(model.isWorking ? 0 : 1)
-                .allowsHitTesting(false)
-            // While a job runs the wedges fold into the hub and fade; only the hub stays.
-            RingWedges(progress: model.tabProgress, grow: g * (model.isWorking ? 0.62 : 1),
-                       convert: model.file.convertActions, edit: model.file.editActions,
-                       lifts: LiftVector((0..<max(model.file.convertActions.count, model.file.editActions.count)).map { settled && $0 == model.hovered ? 1 : 0 }), side: side)
-                .opacity(model.isWorking ? 0 : 1)
-            FrostLayer()
-                .frame(width: hub, height: hub)
-                .clipShape(Circle())
-            Color.clear
-                .frame(width: hub, height: hub)
-                .glassEffect(RingMetrics.glass.interactive(), in: Circle())
-            HubContent(model: model)
-                .scaleEffect(g)
-                .opacity(model.isCompleting ? 0 : 1)
-                .accessibilityHidden(model.isCompleting)
-                .allowsHitTesting(false)
-            // Hit-testable veil over the glass (see hitTestableGlass): without it every click on
-            // a wedge went through to Finder behind the ring.
-            Circle()
-                .fill(Color.white.opacity(0.01))
-                .frame(width: (model.isWorking ? RingMetrics.hubDiameter : RingMetrics.outer * 2) * g,
-                       height: (model.isWorking ? RingMetrics.hubDiameter : RingMetrics.outer * 2) * g)
-            if model.isWorking {
-                HubProgress(model: model)
+            if layer == .surface {
+                // Clear glass needs a darker backdrop to stay legible (Apple's guidance for the
+                // clear variant). The glass refracts this soft shadow together with the desktop.
+                // While a job runs it folds in with the wedges and fades out, otherwise it was left
+                // as a soft round halo around the lone hub.
+                let backdrop = model.isWorking ? RingMetrics.hubDiameter : RingMetrics.outer * 2 + 10
+                Circle()
+                    .fill(.black.opacity(0.18))
+                    .frame(width: backdrop * g, height: backdrop * g)
+                    .blur(radius: 22)
+                    .allowsHitTesting(false)
+                // While a job runs the wedges fold into the hub and fade; only the hub stays.
+                wedges(grow: g, settled: settled, labelsOnly: false)
+            } else {
+                wedges(grow: g, settled: settled, labelsOnly: true)
+                    .opacity(model.isWorking ? 0 : 1)
+                FrostLayer()
                     .frame(width: hub, height: hub)
+                    .clipShape(Circle())
+                Color.clear
+                    .frame(width: hub, height: hub)
+                    .glassEffect(RingMetrics.glass.interactive(), in: Circle())
+                HubContent(model: model)
+                    .scaleEffect(g)
                     .opacity(model.isCompleting ? 0 : 1)
                     .accessibilityHidden(model.isCompleting)
                     .allowsHitTesting(false)
-                    .transition(.opacity)
-            }
-            if model.isCompleting {
-                HubSuccess()
-                    .frame(width: 60 * RingMetrics.scale, height: 52 * RingMetrics.scale)
-                    .scaleEffect(g)
-                    .allowsHitTesting(false)
-                    .transition(.opacity)
+                // Hit-testable veil over the glass (see hitTestableGlass): without it every click on
+                // a wedge went through to Finder behind the ring.
+                Circle()
+                    .fill(Color.white.opacity(0.01))
+                    .frame(width: (model.isWorking ? RingMetrics.hubDiameter : RingMetrics.outer * 2) * g,
+                           height: (model.isWorking ? RingMetrics.hubDiameter : RingMetrics.outer * 2) * g)
+                if model.isWorking {
+                    HubProgress(model: model)
+                        .frame(width: hub, height: hub)
+                        .opacity(model.isCompleting ? 0 : 1)
+                        .accessibilityHidden(model.isCompleting)
+                        .allowsHitTesting(false)
+                        .transition(.opacity)
+                }
+                if model.isCompleting {
+                    HubSuccess()
+                        .frame(width: 60 * RingMetrics.scale, height: 52 * RingMetrics.scale)
+                        .scaleEffect(g)
+                        .allowsHitTesting(false)
+                        .transition(.opacity)
+                }
             }
         }
         .frame(width: side, height: side)
@@ -151,6 +162,14 @@ struct RingView: View {
             guard settled, !model.isWorking, let i = RingSlot.hit(p, center: center, count: items.count) else { return }
             model.activate(i)
         }
+        .allowsHitTesting(layer == .content)
+    }
+
+    private func wedges(grow: CGFloat, settled: Bool, labelsOnly: Bool) -> RingWedges {
+        RingWedges(progress: model.tabProgress, grow: grow * (model.isWorking ? 0.62 : 1),
+                   convert: model.file.convertActions, edit: model.file.editActions,
+                   lifts: LiftVector((0..<max(model.file.convertActions.count, model.file.editActions.count)).map { settled && $0 == model.hovered ? 1 : 0 }),
+                   side: side, labelsOnly: labelsOnly)
     }
 }
 
@@ -169,6 +188,7 @@ struct RingWedges: View, Animatable {
     let edit: [RingAction]
     var lifts: LiftVector
     let side: CGFloat
+    let labelsOnly: Bool
 
     var animatableData: AnimatablePair<AnimatablePair<Double, CGFloat>, LiftVector> {
         get { AnimatablePair(AnimatablePair(progress, grow), lifts) }
@@ -219,25 +239,28 @@ struct RingWedges: View, Animatable {
         // Every wedge stays in the ONE glass shape, the selected one just shifted outward by its
         // lift. Selecting used to move a wedge into a separate glass view, which cannot animate
         // (it appears and disappears), so the selection jumped from wedge to wedge.
-        let all = SectorSet(sectors: wedges.map { ($0.start, $0.end, $0.outer, shift($0)) }, grow: grow)
         ZStack {
-            // A faint, light frosted layer under the glass: clear glass alone looked too bare.
-            // The glass still refracts it, so the lensing stays visible.
-            FrostLayer().frame(width: side, height: side).clipShape(all)
-            // The selection colour, under the glass so the glass refracts it like a tint;
-            // it fades with the lift instead of switching on and off.
-            ForEach(wedges.filter { lift($0.index) > 0.001 }, id: \.index) { w in
-                SectorShape(start: w.start, end: w.end, outer: w.outer, grow: grow, shift: shift(w))
-                    .fill(Color.accentColor.opacity(0.9 * min(Double(lift(w.index)), 1)))
+            if !labelsOnly {
+                let all = SectorSet(sectors: wedges.map { ($0.start, $0.end, $0.outer, shift($0)) }, grow: grow)
+                // A faint, light frosted layer under the glass: clear glass alone looked too bare.
+                // The glass still refracts it, so the lensing stays visible.
+                FrostLayer().frame(width: side, height: side).clipShape(all)
+                // The selection colour, under the glass so the glass refracts it like a tint;
+                // it fades with the lift instead of switching on and off.
+                ForEach(wedges.filter { lift($0.index) > 0.001 }, id: \.index) { w in
+                    SectorShape(start: w.start, end: w.end, outer: w.outer, grow: grow, shift: shift(w))
+                        .fill(Color.accentColor.opacity(0.9 * min(Double(lift(w.index)), 1)))
+                        .frame(width: side, height: side)
+                }
+                // One glass surface for all wedges (a multi-part shape): the glass is computed once
+                // per frame instead of once per wedge — that kept the morph at 50–60 fps.
+                Color.clear
                     .frame(width: side, height: side)
-            }
-            // One glass surface for all wedges (a multi-part shape): the glass is computed once
-            // per frame instead of once per wedge — that kept the morph at 50–60 fps.
-            Color.clear
-                .frame(width: side, height: side)
-                .glassEffect(RingMetrics.glass.interactive(), in: all)
-            ForEach(wedges, id: \.index) { w in
-                labels(w)
+                    .glassEffect(RingMetrics.glass.interactive(), in: all)
+            } else {
+                ForEach(wedges, id: \.index) { w in
+                    labels(w)
+                }
             }
         }
         .frame(width: side, height: side)
@@ -359,7 +382,7 @@ struct HubContent: View {
                 Text(action.map(resultName) ?? model.file.name)
                     .font(.system(size: 11, weight: .semibold))
                     .lineLimit(1).truncationMode(.middle)
-                Text(model.items.isEmpty ? "지원하지 않는 형식" : "\(model.file.ext) · \(model.file.sizeText)")
+                Text(model.items.isEmpty ? "지원하지 않는 형식" : model.file.summary)
                     .font(.system(size: 10)).foregroundStyle(.secondary)
                     .opacity(action == nil ? 1 : 0)
                     .frame(height: action == nil ? nil : 0)
@@ -418,7 +441,7 @@ struct HubContent: View {
         let base = model.file.baseName
         switch action.kind {
         case .convert(let f): return "\(base).\(f.lowercased())"
-        case .crop: return "\(base) 자름.\(model.file.url.pathExtension)"
+        case .crop: return "\(base) 자름.\(model.file.animation == nil ? model.file.url.pathExtension : "webp")"
         case .addBackground: return "\(base) 배경.png"
         case .tool: return model.file.name
         }

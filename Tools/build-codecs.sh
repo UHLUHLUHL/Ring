@@ -27,7 +27,7 @@ for ARCH in arm64 x86_64; do
   configure_build webp "$ROOT/Vendor/build/source/webp/libwebp-1.6.0" \
     -DWEBP_BUILD_ANIM_UTILS=OFF -DWEBP_BUILD_CWEBP=OFF -DWEBP_BUILD_DWEBP=OFF -DWEBP_BUILD_GIF2WEBP=OFF \
     -DWEBP_BUILD_IMG2WEBP=OFF -DWEBP_BUILD_VWEBP=OFF -DWEBP_BUILD_WEBPINFO=OFF -DWEBP_BUILD_WEBPMUX=OFF \
-    -DWEBP_BUILD_LIBWEBPMUX=ON -DWEBP_BUILD_EXTRAS=OFF -DWEBP_ENABLE_SIMD=ON
+    -DWEBP_BUILD_LIBWEBPMUX=ON -DWEBP_BUILD_LIBWEBPDEMUX=ON -DWEBP_BUILD_EXTRAS=OFF -DWEBP_ENABLE_SIMD=ON
   configure_build aom "$ROOT/Vendor/build/source/aom" \
     -DAOM_TARGET_CPU=$ARCH -DENABLE_TESTS=OFF -DENABLE_DOCS=OFF -DENABLE_TOOLS=OFF -DENABLE_EXAMPLES=OFF \
     -DCONFIG_AV1_DECODER=0 -DCONFIG_AV1_ENCODER=1 -DCONFIG_AV1_HIGHBITDEPTH=1 -DCONFIG_RUNTIME_CPU_DETECT=1
@@ -39,6 +39,6 @@ for ARCH in arm64 x86_64; do
     -DENABLE_SHARED=OFF -DENABLE_STATIC=ON -DWITH_TURBOJPEG=ON -DWITH_SIMD=ON
  done
 mkdir -p Vendor/build/universal
-for LIB in webp webpmux sharpyuv aom avif turbojpeg jpeg; do
+for LIB in webp webpmux webpdemux sharpyuv aom avif turbojpeg jpeg; do
   lipo -create "Vendor/build/arm64/install/lib/lib$LIB.a" "Vendor/build/x86_64/install/lib/lib$LIB.a" -output "Vendor/build/universal/lib$LIB.a"
 done

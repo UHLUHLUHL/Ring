@@ -22,6 +22,7 @@ struct EngineToolPanel: View {
             case .videoTrim:VideoToolPanel(model:model,tool:.trim)
             case .videoCompression:VideoToolPanel(model:model,tool:.compress)
             case .animation(let format):VideoToolPanel(model:model,tool:.animation(format))
+            case .animatedImage(let tool):AnimatedImagePanel(model:model,tool:tool)
             }
         }
         .id(tool)

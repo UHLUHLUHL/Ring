@@ -16,7 +16,7 @@ struct RingAction: Identifiable, Equatable {
 }
 
 struct FileInfo {
-    enum Kind { case pdf, image, document, video, other }
+    enum Kind { case pdf, image, animatedImage, document, video, other }
 
     let url: URL
     let name: String
@@ -24,6 +24,7 @@ struct FileInfo {
     let kind: Kind
     let sizeText: String
     let selection: [URL]
+    let animation: AnimatedImageInfo?
 
     init(url: URL, selection: [URL] = []) {
         self.url = url
@@ -31,7 +32,10 @@ struct FileInfo {
         name = url.lastPathComponent
         ext = url.pathExtension.uppercased()
         let type = UTType(filenameExtension: url.pathExtension)
-        if type?.conforms(to: .pdf) == true {
+        animation = AnimatedImageInfo.inspect(url)
+        if animation != nil {
+            kind = .animatedImage
+        } else if type?.conforms(to: .pdf) == true {
             kind = .pdf
         } else if DocumentSource.extensions.contains(url.pathExtension.lowercased()) {
             kind = .document
@@ -47,6 +51,10 @@ struct FileInfo {
     }
 
     var baseName: String { url.deletingPathExtension().lastPathComponent }
+    var summary: String {
+        if let animation { return String(format: "%@ 움짤 · %.2f초", animation.format, animation.duration) }
+        return "\(ext) · \(sizeText)"
+    }
 
     var convertActions: [RingAction] {
         switch kind {
@@ -60,6 +68,9 @@ struct FileInfo {
             return ["PDF","PNG","JPG","WEBP"].map { RingAction(id:$0,title:$0,symbol:nil,kind:.convert($0)) }
         case .video:
             return ["GIF","WEBP"].map { RingAction(id:$0,title:$0,symbol:nil,kind:.convert($0)) }
+        case .animatedImage:
+            return [RingAction(id: "WEBP", title: "WEBP", symbol: nil, kind: .convert("WEBP")),
+                    RingAction(id: "frame", title: "한 장 저장", symbol: "photo", kind: .tool)]
         case .other:
             return []
         }
@@ -105,6 +116,9 @@ struct FileInfo {
                 RingAction(id: "trim", title: "자르기", symbol: "scissors", kind: .tool),
                 RingAction(id: "compress", title: "용량 줄이기", symbol: "arrow.down.right.and.arrow.up.left", kind: .tool),
             ]
+        case .animatedImage:
+            return [RingAction(id: "crop", title: "자르기", symbol: "crop", kind: .crop),
+                    RingAction(id: "resize", title: "크기 조절", symbol: "arrow.up.left.and.arrow.down.right", kind: .tool)]
         case .other, .document:
             return []
         }

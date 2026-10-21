@@ -21,6 +21,12 @@ int ring_webp_animation_add(void *animation,const uint8_t *rgba,int width,int he
 int ring_webp_animation_finish(void *animation,int timestamp,uint8_t **output,size_t *size);
 void ring_webp_animation_destroy(void *animation);
 void *ring_webp_mux_create(int width,int height);
+void *ring_webp_lossless_mux_create(int width,int height,int loop_count,const uint8_t *icc,size_t icc_size);
+int ring_webp_lossless_mux_add(void *mux,const uint8_t *rgba,int width,int height,int duration_ms,int threads,size_t *encoded_size);
+void *ring_webp_image_decoder_create(const uint8_t *bytes,size_t size,int threads,int *width,int *height,int *frames,int *loops);
+int ring_webp_image_decoder_next(void *decoder,const uint8_t **pixels);
+void ring_webp_image_decoder_reset(void *decoder);
+void ring_webp_image_decoder_destroy(void *decoder);
 int ring_webp_mux_append(void *mux,const uint8_t *bytes,size_t size,int duration_ms);
 int ring_webp_mux_finish(void *mux,uint8_t **output,size_t *size);
 void ring_webp_mux_destroy(void *mux);

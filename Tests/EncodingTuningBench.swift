@@ -18,6 +18,9 @@ import ImageIO
         generator.maximumSize=CGSize(width:1280,height:1280)
         generator.requestedTimeToleranceBefore = .zero;generator.requestedTimeToleranceAfter = .zero
         guard let decoded=CGImageSourceCreateWithURL(output as CFURL,nil) else { throw EngineError.io("benchmark decode") }
+        // ImageIO random WebP seeks can return incompletely composited frames.
+        // Reuse the native animation decoder and its bounded sequential seek.
+        let animation = AnimatedImageInfo.inspect(output) == nil ? nil : try AnimatedImageDecoder(output)
         var starts:[Double]=[],end=0.0
         for i in 0..<CGImageSourceGetCount(decoded) {
             starts.append(end)
@@ -31,7 +34,7 @@ import ImageIO
             let time=Double(frame)/15
             let index=output.pathExtension == "gif" ? frame:starts.lastIndex(where:{$0<=time+0.00001})!
             let reference=try ImageResampler.fit(await generator.image(at:CMTime(seconds:time,preferredTimescale:60000)).image,maxDimension:640)
-            let actual=CGImageSourceCreateImageAtIndex(decoded,index,nil)!
+            let actual=try animation?.frame(index) ?? CGImageSourceCreateImageAtIndex(decoded,index,nil)!
             guard actual.width==reference.width,actual.height==reference.height else { throw EngineError.quality("benchmark frame dimensions") }
             let a=try AdaptivePalette.sRGB(reference),b=try AdaptivePalette.sRGB(actual),w=reference.width,h=reference.height
             a.withUnsafeBytes { ar in b.withUnsafeBytes { br in

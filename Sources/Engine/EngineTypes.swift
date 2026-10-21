@@ -38,6 +38,7 @@ enum EngineOperation {
     case pdfSmartCompress(PDFCompressionOptions)
     case renderDocument(format:ImageFormat,options:DocumentRenderOptions)
     case video(VideoOperation)
+    case animatedImage(AnimatedImageEdit)
     case removeLocation
     case pdfMetadata(PDFMetadata)
     case pdfNote(PDFNote)
@@ -93,6 +94,7 @@ actor RingEngine {
         case .pdfMerge,.pdfPages,.pdfSplit,.pdfSmartCompress: ext="pdf"
         case .renderDocument(let format,_): ext=format.rawValue
         case .video(let operation): ext=operation.fileExtension
+        case .animatedImage(let edit): ext=edit.fileExtension
         case .removeLocation,.compress: ext=job.source.pathExtension.lowercased()
         case .pdfMetadata,.pdfNote,.pdfRedact: ext="pdf"
         case .edit(.adjust(let e,let c,let s)) where e == 0 && c == 1 && s == 1: ext=job.source.pathExtension.lowercased()
@@ -127,6 +129,7 @@ actor RingEngine {
     private static func synchronous(_ job:EngineJob,to output:URL) throws -> String {
         switch job.operation {
         case .video,.renderDocument:throw EngineError.invalid("비동기 엔진 경로 오류")
+        case .animatedImage(let edit):return try AnimatedImageEngine.run(job.source,to:output,edit:edit)
         case .encodeImage(let format,let intent):return try TargetSizeCodec.encode(job.source,to:output,format:format,intent:intent)
         case .cleanMetadata:return try MetadataEngine.clean(job.source,to:output)
         case .pdfMerge(let sources,let width):return try PDFEngine.merge(sources,to:output,uniformWidth:width)

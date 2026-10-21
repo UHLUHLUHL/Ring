@@ -11,7 +11,7 @@ SWIFTC=(xcrun swiftc -swift-version 5 -O -module-cache-path "$ROOT/.work/module-
 rm -rf $BUILD
 mkdir -p $APP/Contents/{MacOS,Resources} $EXT/Contents/{MacOS,Resources}
 
-if [[ ! -f "$ROOT/Vendor/build/universal/libavif.a" ]]; then
+if [[ ! -f "$ROOT/Vendor/build/universal/libavif.a" || ! -f "$ROOT/Vendor/build/universal/libwebpdemux.a" ]]; then
   "$ROOT/Tools/build-codecs.sh"
 fi
 if [[ ! -f "$ROOT/Vendor/build/universal/libqpdf.a" ]]; then

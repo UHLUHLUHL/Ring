@@ -1,6 +1,6 @@
 # Sourced by build/test scripts. ROOT is an absolute checkout path.
 ENGINE_LIBS=()
-for LIB in qpdf webpmux webp sharpyuv avif aom turbojpeg jpeg; do
+for LIB in qpdf webpdemux webpmux webp sharpyuv avif aom turbojpeg jpeg; do
   ENGINE_LIBS+=("$ROOT/Vendor/build/universal/lib$LIB.a")
 done
 ENGINE_LIBS+=(-lc++ -lz)

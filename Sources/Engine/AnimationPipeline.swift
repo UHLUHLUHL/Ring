@@ -75,6 +75,8 @@ private final class AnimationFrameReader {
     private var size: CGSize?
     /// Seconds added to each output time, and the last time that may be asked for.
     private var timing: (offset: Double, latest: Double)?
+    private var sampleTrack: AVAssetTrack?
+    private var sampleMapping: CMTimeMapping?
     init(asset: AVAsset, start: Double, fps: Double, dimension: Int, maximumSize: CGSize, crop: VideoCrop) {
         self.start = start; self.dimension = dimension; self.crop = crop; self.asset = asset; self.fps = fps
         generator = AVAssetImageGenerator(asset: asset)
@@ -87,13 +89,29 @@ private final class AnimationFrameReader {
         recovery.requestedTimeToleranceAfter = .zero
     }
 
-    /// Each output frame takes the source frame nearest to its time: we ask
-    /// for the frame shown 0.45 source intervals later. Asking for the frame
-    /// shown exactly at t let real phone footage, whose timestamps sit a few
-    /// milliseconds off the output grid, repeat one frame and skip the next
-    /// every second or so. The tolerance stays inside that frame's interval.
+    /// Indexed files expose actual presentation timestamps without decoding
+    /// their frames. A nominal-FPS offset cannot choose nearest frames in VFR
+    /// clips with irregular intervals or long gaps. Keep the older bounded
+    /// offset only for assets that cannot provide precise sample cursors.
     private func prepareTiming() async throws -> (offset: Double, latest: Double) {
         if let timing { return timing }
+        if try await asset.load(.providesPreciseDurationAndTiming),
+           let track = try await asset.loadTracks(withMediaType: .video).first,
+           try await track.load(.canProvideSampleCursors) {
+            let segments = try await track.load(.segments).filter { !$0.isEmpty }
+            // Cursor timestamps belong to the media timeline. Container edits
+            // (including B-frame lead-in) map it onto the displayed timeline.
+            // Keep the previous path for compound/multi-edit timelines.
+            if segments.count == 1 {
+                sampleTrack = track
+                sampleMapping = segments[0].timeMapping
+                generator.requestedTimeToleranceBefore = .zero
+                generator.requestedTimeToleranceAfter = .zero
+                let value = (0.0, 0.0)
+                timing = value
+                return value
+            }
+        }
         let sourceFPS = try await MediaEngine.sourceFrameRate(asset) ?? fps
         let interval = 1 / max(1, sourceFPS)
         let end = try await asset.load(.duration).seconds
@@ -102,6 +120,26 @@ private final class AnimationFrameReader {
         let value = (interval * 0.45, max(0, end - 0.001))
         timing = value
         return value
+    }
+
+    private func nearestSample(to time: CMTime, track: AVAssetTrack) throws -> CMTime {
+        guard let mapping = sampleMapping else { throw EngineError.io("영상 시각 매핑이 없어요.") }
+        let mediaTime = CMTimeMapTimeFromRangeToRange(time, fromRange: mapping.target, toRange: mapping.source)
+        guard let cursor = track.makeSampleCursor(presentationTimeStamp: mediaTime) else {
+            throw EngineError.io("영상 프레임의 시각을 읽을 수 없어요.")
+        }
+        let before = cursor.presentationTimeStamp
+        var selected = before
+        if CMTimeCompare(before, mediaTime) <= 0, cursor.stepInPresentationOrder(byCount: 1) == 1 {
+            let after = cursor.presentationTimeStamp
+            if CMTimeCompare(after, CMTimeRangeGetEnd(mapping.source)) < 0,
+               abs(CMTimeSubtract(after, mediaTime).seconds) < abs(CMTimeSubtract(mediaTime, before).seconds) { selected = after }
+        }
+        selected = CMTimeMaximum(mapping.target.start, CMTimeMapTimeFromRangeToRange(selected, fromRange: mapping.source, toRange: mapping.target))
+        guard selected.isNumeric else { throw EngineError.io("영상 프레임 시각이 올바르지 않아요.") }
+        // Round into this sample, never a fraction before it. One common scale
+        // also lets duplicate source-frame requests share a single decode.
+        return CMTimeConvertScale(selected, timescale: 600_000_000, method: .roundTowardPositiveInfinity)
     }
     deinit { generator.cancelAllCGImageGeneration(); recovery.cancelAllCGImageGeneration() }
 
@@ -121,9 +159,10 @@ private final class AnimationFrameReader {
         try Task.checkCancellation()
         let timing = try await prepareTiming()
         // Near the end the shifted time may pass the last frame; keep t there.
-        let times = frames.map { frame -> CMTime in
+        let times = try frames.map { frame -> CMTime in
             let t = start + frame.offset
-            return CMTime(seconds: t + timing.offset <= timing.latest ? t + timing.offset : t, preferredTimescale: 60000)
+            if let sampleTrack { return try nearestSample(to: CMTime(seconds: t, preferredTimescale: 600_000_000), track: sampleTrack) }
+            return CMTime(seconds: t + timing.offset <= timing.latest ? t + timing.offset : t, preferredTimescale: 600_000_000)
         }
         // Slots near the end can share a time; ask for each time once.
         let slots = Dictionary(grouping: times.indices, by: { times[$0].value })
@@ -135,7 +174,7 @@ private final class AnimationFrameReader {
             var failed: [Int] = []
             for await result in generator.images(for: unique) {
                 try Task.checkCancellation()
-                let requested = CMTimeConvertScale(result.requestedTime, timescale: 60000, method: .roundHalfAwayFromZero).value
+                let requested = CMTimeConvertScale(result.requestedTime, timescale: 600_000_000, method: .roundHalfAwayFromZero).value
                 guard let shared = slots[requested], ordered[shared[0]] == nil else { throw EngineError.io("애니메이션 프레임 순서 오류") }
                 let image: CGImage
                 do { image = try result.image } catch {

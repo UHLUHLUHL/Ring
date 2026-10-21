@@ -13,7 +13,8 @@ extension MediaEngine {
     }
 
     static func animate(_ source: URL, to output: URL, options: AnimationOptions) async throws -> String {
-        let asset = AVURLAsset(url: source), assetDuration = try await asset.load(.duration)
+        let asset = AVURLAsset(url: source, options: [AVURLAssetPreferPreciseDurationAndTimingKey: true])
+        let assetDuration = try await asset.load(.duration)
         let duration = options.duration ?? (assetDuration.seconds - options.start)
         guard options.start.isFinite, duration.isFinite, options.start >= 0, duration > 0,
               options.start + duration <= assetDuration.seconds + 0.001,
