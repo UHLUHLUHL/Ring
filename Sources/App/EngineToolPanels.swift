@@ -540,30 +540,12 @@ private struct VideoToolPanel:View {
         .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(Color.white.opacity(0.12), lineWidth: 1))
     }
 
-    /// Photos' aspect list as a menu, the portrait/landscape pair and reset.
     private var cropControls:some View {
         PanelRow(label:"자르기") {
-            HStack(spacing:8) {
-                Picker("비율",selection:$cropRatio) {
-                    ForEach(VideoCropRatio.allCases,id:\.self) { Text($0.label(portrait:cropPortrait)).tag($0) }
-                }
-                .labelsHidden().frame(width:110).accessibilityIdentifier("video.cropRatio")
-                if !cropRatio.isSquare && cropRatio != .free {
-                    ForEach([false,true],id:\.self) { portrait in
-                        Button { cropPortrait=portrait } label: {
-                            Image(systemName:portrait ? "rectangle.portrait":"rectangle")
-                        }
-                        .buttonStyle(.glass).tint(cropPortrait==portrait ? .accentColor:nil)
-                        .accessibilityLabel(portrait ? "세로 비율":"가로 비율")
-                    }
-                }
-                Spacer(minLength:4)
-                if let sourceSize {
-                    let r=videoCrop.pixelRect(width:Int(sourceSize.width.rounded()),height:Int(sourceSize.height.rounded()))
-                    Text(verbatim:"\(Int(r.width))×\(Int(r.height))").font(.system(size:11).monospacedDigit()).foregroundStyle(.secondary)
-                }
-                Button("재설정") { withAnimation(.snappy) { cropRatio = .free; cropRect=CGRect(x:0,y:0,width:1,height:1) } }
-                    .buttonStyle(.glass).disabled(videoCrop.isFull)
+            CropRatioControls(ratio:$cropRatio,portrait:$cropPortrait,
+                              size:sourceSize.map { let r=videoCrop.pixelRect(width:Int($0.width.rounded()),height:Int($0.height.rounded())); return "\(Int(r.width))×\(Int(r.height))" },
+                              canReset:!videoCrop.isFull) {
+                withAnimation(.snappy) { cropRatio = .free; cropRect=CGRect(x:0,y:0,width:1,height:1) }
             }
         }
         .onChange(of:cropRatio) { _,_ in fitCropToRatio() }

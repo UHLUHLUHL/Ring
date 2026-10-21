@@ -251,28 +251,42 @@ struct CropFrame: View {
     }
 }
 
+/// Photos' aspect list as a menu, the landscape/portrait pair, the kept
+/// size and reset. Shared by the photo and video crop panels.
+struct CropRatioControls: View {
+    @Binding var ratio: VideoCropRatio
+    @Binding var portrait: Bool
+    let size: String?
+    let canReset: Bool
+    let reset: () -> Void
+    var body: some View {
+        HStack(spacing: 8) {
+            Picker("비율", selection: $ratio) {
+                ForEach(VideoCropRatio.allCases, id: \.self) { Text($0.label(portrait: portrait)).tag($0) }
+            }
+            .labelsHidden().frame(width: 110).accessibilityIdentifier("crop.ratio")
+            if !ratio.isSquare && ratio != .free {
+                ForEach([false, true], id: \.self) { value in
+                    Button { portrait = value } label: { Image(systemName: value ? "rectangle.portrait" : "rectangle") }
+                        .buttonStyle(.glass).tint(portrait == value ? .accentColor : nil)
+                        .accessibilityLabel(value ? "세로 비율" : "가로 비율")
+                }
+            }
+            Spacer(minLength: 4)
+            if let size { Text(verbatim: size).font(.system(size: 11).monospacedDigit()).foregroundStyle(.secondary) }
+            Button("재설정", action: reset).buttonStyle(.glass).disabled(!canReset)
+        }
+    }
+}
+
 // MARK: - Crop
 
 struct CropPanel: View {
     @ObservedObject var model: RingModel
 
-    enum Ratio: String, CaseIterable, Identifiable {
-        case free = "자유", square = "1:1", fourThree = "4:3", threeFour = "3:4", wide = "16:9", tall = "9:16"
-        var id: String { rawValue }
-        var value: CGFloat? {
-            switch self {
-            case .free: return nil
-            case .square: return 1
-            case .fourThree: return 4.0 / 3
-            case .threeFour: return 3.0 / 4
-            case .wide: return 16.0 / 9
-            case .tall: return 9.0 / 16
-            }
-        }
-    }
-
     @State private var crop = CGRect(x: 0, y: 0, width: 1, height: 1) // normalized to the image
-    @State private var ratio: Ratio = .free
+    @State private var ratio: VideoCropRatio = .free
+    @State private var portrait = false
     @State private var image: NSImage?
     @State private var jpegSampling: JPEGSampling?
     private let pixels: CGSize
@@ -288,6 +302,12 @@ struct CropPanel: View {
         let orient = props?[kCGImagePropertyOrientation] as? Int ?? 1
         orientation = orient
         pixels = orient >= 5 ? CGSize(width: h, height: w) : CGSize(width: w, height: h)
+        // Like Photos, presets start in the picture's own orientation.
+        _portrait = State(initialValue: pixels.height > pixels.width)
+    }
+
+    private var aspect: Double? {
+        VideoCrop(ratio: ratio, portrait: portrait).aspect(width: pixels.width, height: pixels.height)
     }
 
     private var fitted: CGRect {
@@ -312,8 +332,12 @@ struct CropPanel: View {
                     if abs(snapped.minX-value.minX)>0.0000001 || abs(snapped.minY-value.minY)>0.0000001 || abs(snapped.width-value.width)>0.0000001 || abs(snapped.height-value.height)>0.0000001 { crop=snapped }
                 }
             PanelRow(label: "비율") {
-                FillSegmented(selection: $ratio)
-                    .onChange(of: ratio) { _, r in apply(ratio: r) }
+                CropRatioControls(ratio: $ratio, portrait: $portrait, size: nil,
+                                  canReset: crop != CGRect(x: 0, y: 0, width: 1, height: 1) || ratio != .free) {
+                    withAnimation(.snappy) { crop = CGRect(x: 0, y: 0, width: 1, height: 1); ratio = .free }
+                }
+                .onChange(of: ratio) { _, _ in applyAspect() }
+                .onChange(of: portrait) { _, _ in applyAspect() }
             }
             PanelRow(label: "크기") {
                 HStack(spacing: 8) {
@@ -328,8 +352,6 @@ struct CropPanel: View {
                 }
             }
             HStack(spacing: 8) {
-                Button("초기화") { withAnimation(.snappy) { crop = CGRect(x: 0, y: 0, width: 1, height: 1); ratio = .free } }
-                    .buttonStyle(.glass)
                 Spacer()
                 Button("취소", action: model.backToRing).buttonStyle(.glass)
                 Button("적용") { model.applyRegion(crop) }
@@ -363,8 +385,8 @@ struct CropPanel: View {
                     .offset(x: f.minX, y: f.minY)
                     .shadow(color: .black.opacity(0.18), radius: 6, y: 2)
             }
-            CropFrame(crop: $crop, bounds: f, pixels: pixels, aspect: ratio.value.map(Double.init))
-            Text("\(Int(crop.width * pixels.width)) × \(Int(crop.height * pixels.height))")
+            CropFrame(crop: $crop, bounds: f, pixels: pixels, aspect: aspect)
+            Text(verbatim: "\(Int(crop.width * pixels.width)) × \(Int(crop.height * pixels.height))")
                 .font(.system(size: 11, weight: .bold)).foregroundStyle(.white)
                 .padding(.horizontal, 8).padding(.vertical, 3)
                 .background(Capsule().fill(Color.accentColor))
@@ -374,14 +396,9 @@ struct CropPanel: View {
         .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
     }
 
-    private func apply(ratio r: Ratio) {
-        guard let value = r.value else { return }
-        // Largest rectangle of this ratio, centred on the current crop.
-        var w: CGFloat = 1
-        var h = w * pixels.width / value / pixels.height
-        if h > 1 { h = 1; w = h * value * pixels.height / pixels.width }
-        let cx = min(max(crop.midX, w / 2), 1 - w / 2), cy = min(max(crop.midY, h / 2), 1 - h / 2)
-        withAnimation(.snappy) { crop = CGRect(x: cx - w / 2, y: cy - h / 2, width: w, height: h) }
+    private func applyAspect() {
+        guard let aspect else { return }
+        withAnimation(.snappy) { crop = CropFrame.largest(aspect: aspect, pixels: pixels, around: crop) }
     }
 
     private func pixelBinding(_ key: KeyPath<CGSize, CGFloat>) -> Binding<Int> {
