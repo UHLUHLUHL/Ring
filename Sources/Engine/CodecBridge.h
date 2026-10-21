@@ -6,6 +6,8 @@
 extern "C" {
 #endif
 uint32_t ring_crc32(uint32_t crc,const uint8_t *data,size_t size);
+uint64_t ring_compare_pixels16(const uint16_t *a,const uint16_t *b,size_t count,int quantize8,uint16_t *max_difference);
+void ring_rgba16_to_rgba8(const uint16_t *source,uint8_t *output,size_t pixels);
 int ring_pdf_add_info(const char *source,const char *output);
 int ring_pdf_replace_page(const char *source,const char *page,int page_number,int page_count,const char *output);
 int ring_webp_encode(const uint8_t *rgba,int width,int height,int stride,const uint8_t *icc,size_t icc_size,const uint8_t *exif,size_t exif_size,int threads,const char *path,char *error,size_t error_size);

@@ -10,6 +10,36 @@
 #include <zlib.h>
 
 void ring_buffer_free(void *buffer) { free(buffer); }
+void ring_rgba16_to_rgba8(const uint16_t * restrict source,uint8_t * restrict output,size_t pixels) {
+    for(size_t i=0;i<pixels;i++) {
+        const uint16_t *s=source+i*4;uint8_t *d=output+i*4;uint32_t a=s[3];
+        if(a==65535) {
+            d[0]=(s[0]+128u)/257;d[1]=(s[1]+128u)/257;d[2]=(s[2]+128u)/257;
+        } else if(a==0) { d[0]=d[1]=d[2]=0; }
+        else {
+            for(int c=0;c<3;c++) { uint32_t value=(s[c]*255u+a/2)/a;d[c]=(uint8_t)(value>255 ? 255:value); }
+        }
+        d[3]=(a+128)/257;
+    }
+}
+// Integer reductions preserve the Swift verifier's rounding exactly while
+// allowing Clang to vectorize for both NEON and x86_64. No pixel is skipped.
+uint64_t ring_compare_pixels16(const uint16_t * restrict a,const uint16_t * restrict b,size_t count,int quantize8,uint16_t *max_difference) {
+    uint64_t squared=0;uint32_t largest=0;
+    if(quantize8) {
+        for(size_t i=0;i<count;i++) {
+            int x=((uint32_t)a[i]+128)/257*257,y=((uint32_t)b[i]+128)/257*257;
+            uint32_t d=(uint32_t)(x>y ? x-y:y-x);
+            squared+=(uint64_t)d*d;if(d>largest) largest=d;
+        }
+    } else {
+        for(size_t i=0;i<count;i++) {
+            int x=a[i],y=b[i];uint32_t d=(uint32_t)(x>y ? x-y:y-x);
+            squared+=(uint64_t)d*d;if(d>largest) largest=d;
+        }
+    }
+    *max_difference=(uint16_t)largest;return squared;
+}
 static int message(char *error,size_t n,const char *text) {
     if(n) snprintf(error,n,"%s",text);
     return 0;
@@ -111,7 +141,7 @@ int ring_webp_animation_add(void *animation,const uint8_t *rgba,int width,int he
     WebPPicture picture;WebPConfig config;
     if(!animation || !WebPPictureInit(&picture)||!WebPConfigInit(&config)) return 0;
     picture.width=width;picture.height=height;picture.use_argb=1;
-    config.quality=quality;config.method=2;config.thread_level=threads>1;config.use_sharp_yuv=0;
+    config.quality=quality;config.method=4;config.thread_level=threads>1;config.use_sharp_yuv=1;
     int ok=WebPPictureImportRGBA(&picture,rgba,width*4) && WebPAnimEncoderAdd(animation,&picture,timestamp,&config);
     WebPPictureFree(&picture);return ok;
 }

@@ -75,18 +75,42 @@ enum VideoCropGeometry {
                       width: cropWidth, height: cropHeight)
     }
 
+    /// Video bitrate left after the AAC track, for a whole-file byte target.
+    static func videoBitrate(targetBytes:Int64,duration:Double,audio:Bool) -> Double {
+        Double(targetBytes)*0.94*8/duration-Double(audio ? 96000:0)
+    }
+    /// Displayed (upright) size of the first compression attempt. The short
+    /// side is capped by bitrate; both sides are even for the encoder.
+    static func compressedSize(width:Double,height:Double,ratio:VideoCropRatio,maxDimension:Int?,bitrate:Int) -> (width:Int,height:Int) {
+        let cap=bitrate<400000 ? 480:bitrate<900000 ? 720:1080
+        let crop=centeredSize(width:width,height:height,aspectRatio:ratio.aspectRatio)
+        let longSide=Double(max(crop.width,crop.height)),shortSide=Double(min(crop.width,crop.height))
+        let scale=min(1,min(Double(cap)/max(1,shortSide),Double(maxDimension ?? Int.max)/max(1,longSide)))
+        return (max(2,Int((Double(crop.width)*scale/2).rounded(.down))*2),max(2,Int((Double(crop.height)*scale/2).rounded(.down))*2))
+    }
+    /// GIF/WebP frame size: the generator fills `extractionSize`, the crop is
+    /// taken from that frame, and vImage fits it to the long side.
+    static func animationSize(width:Double,height:Double,ratio:VideoCropRatio,maxDimension:Int) -> (width:Int,height:Int) {
+        let safeWidth=max(1,width),safeHeight=max(1,height)
+        let extraction=extractionSize(width:safeWidth,height:safeHeight,ratio:ratio,maxDimension:maxDimension)
+        let scale=min(1,Double(extraction.width)/safeWidth,Double(extraction.height)/safeHeight)
+        let frame=centeredRect(width:max(1,Int((safeWidth*scale).rounded())),height:max(1,Int((safeHeight*scale).rounded())),ratio:ratio)
+        let factor=min(1,Double(maxDimension)/Double(max(frame.width,frame.height)))
+        return (max(1,Int((Double(frame.width)*factor).rounded())),max(1,Int((Double(frame.height)*factor).rounded())))
+    }
+
     static func extractionSize(width: Double, height: Double, ratio: VideoCropRatio, maxDimension: Int) -> CGSize {
-        let safeWidth=max(1,width),safeHeight=max(1,height),limit=Double(maxDimension)
+        let safeWidth=max(1,width),safeHeight=max(1,height),limit=Double(maxDimension)*2
         let crop=centeredSize(width:safeWidth,height:safeHeight,aspectRatio:ratio.aspectRatio)
         let scale=min(1,limit/max(1,Double(max(crop.width,crop.height))))
         var outputWidth=safeWidth*scale,outputHeight=safeHeight*scale
         // Leave a bounded margin for pixels that will be discarded by the crop.
-        let areaLimit=limit*limit*4
+        let areaLimit=Double(maxDimension)*Double(maxDimension)*4
         if outputWidth*outputHeight>areaLimit {
             let areaScale=sqrt(areaLimit/(outputWidth*outputHeight))
             outputWidth*=areaScale;outputHeight*=areaScale
         }
-        let sideLimit=limit*4,sideScale=min(1,sideLimit/max(outputWidth,outputHeight))
+        let sideLimit=Double(maxDimension)*4,sideScale=min(1,sideLimit/max(outputWidth,outputHeight))
         return CGSize(width:CGFloat(outputWidth*sideScale),height:CGFloat(outputHeight*sideScale))
     }
 }

@@ -36,7 +36,7 @@ extension MediaEngine {
            target < Int64(initial.frames.count) * Int64(dimension * dimension) * 2 {
             let sample = initial.sample
             let encoded = try await AnimationPipeline.encode(asset: asset, start: options.start, fps: fps, dimension: dimension,
-                extractionSize:extractionSize(for:dimension),cropRatio: options.cropRatio, plan: sample, format: options.format, quality: 85, allowParallelWebP: false) { EngineProgress.report(0.03 + 0.07 * $0) }
+                extractionSize:extractionSize(for:dimension),cropRatio: options.cropRatio, plan: sample, format: options.format, quality: 90, allowParallelWebP: false) { EngineProgress.report(0.03 + 0.07 * $0) }
             let estimate = Double(encoded.bytes.count) * Double(initial.frames.count) / Double(sample.frames.count) * 1.10
             if estimate > Double(target) * 1.10 {
                 let ratio = max(0.4, min(0.95, sqrt(Double(target) / estimate) * 0.95))
@@ -47,7 +47,7 @@ extension MediaEngine {
             try Task.checkCancellation()
             let plan = AnimationPlan(duration: duration, fps: fps, format: options.format)
             let encoded = try await AnimationPipeline.encode(asset: asset, start: options.start, fps: fps, dimension: dimension,
-                extractionSize:extractionSize(for:dimension),cropRatio: options.cropRatio, plan: plan, format: options.format, quality: max(40, 85 - attempt * 10), allowParallelWebP: options.targetBytes == nil) {
+                extractionSize:extractionSize(for:dimension),cropRatio: options.cropRatio, plan: plan, format: options.format, quality: max(40, 90 - attempt * 10), allowParallelWebP: options.targetBytes == nil) {
                     EngineProgress.report(0.10 + 0.80 * $0)
                 }
             EngineProgress.report(0.92)
@@ -61,7 +61,9 @@ extension MediaEngine {
             }
             let ratio = sqrt(Double(options.targetBytes!) / Double(max(1, lastSize))) * 0.90
             dimension = max(16, Int(Double(dimension) * max(0.4, min(0.85, ratio))))
-            fps = max(1, fps * 0.8)
+            // Keep the requested motion as long as possible: only the final
+            // attempt gives up frames, after quality and resolution.
+            if attempt == 2 { fps = max(1, fps * 0.8) }
             EngineProgress.report(0.10)
         }
         throw EngineError.quality("애니메이션 \(lastSize)바이트가 목표를 초과했어요.")

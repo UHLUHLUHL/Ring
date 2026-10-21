@@ -51,18 +51,14 @@ enum MediaEngine {
                [kCVImageBufferTransferFunction_ITU_R_2100_HLG as String,kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ as String].contains(transfer) { throw EngineError.unsupported("HDR 비디오는 톤 매핑을 명시하기 전까지 압축하지 않아요.") }
         }
         let audioRate=audio.isEmpty ? 0:96000
-        let budget=Double(targetBytes)*0.94*8/duration.seconds-Double(audioRate)
+        let budget=VideoCropGeometry.videoBitrate(targetBytes:targetBytes,duration:duration.seconds,audio:!audio.isEmpty)
         guard budget>=100000,budget<=Double(Int.max),natural.width.isFinite,natural.height.isFinite,natural.width>=2,natural.height>=2 else { throw EngineError.quality("이 길이의 비디오에는 목표 용량이 너무 작아요.") }
         var rate=Int(min(budget,100_000_000)),lastSize=0
         for attempt in 0..<2 {
             try Task.checkCancellation()
-            let cap=rate<400000 ? 480:rate<900000 ? 720:1080
             let display=natural.applying(transform)
-            let crop=VideoCropGeometry.centeredSize(width:abs(Double(display.width)),height:abs(Double(display.height)),aspectRatio:options.cropRatio.aspectRatio)
-            let longSide=Double(max(crop.width,crop.height)),shortSide=Double(min(crop.width,crop.height))
-            let scale=min(1,min(Double(cap)/max(1,shortSide),Double(options.maxDimension ?? Int.max)/max(1,longSide)))
-            let displayWidth=max(2,Int((Double(crop.width)*scale/2).rounded(.down))*2)
-            let displayHeight=max(2,Int((Double(crop.height)*scale/2).rounded(.down))*2)
+            let shown=VideoCropGeometry.compressedSize(width:abs(Double(display.width)),height:abs(Double(display.height)),ratio:options.cropRatio,maxDimension:options.maxDimension,bitrate:rate)
+            let displayWidth=shown.width,displayHeight=shown.height
             let swapsAxes=abs(transform.b)>0.5 || abs(transform.c)>0.5
             let width=swapsAxes ? displayHeight:displayWidth
             let height=swapsAxes ? displayWidth:displayHeight

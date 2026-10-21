@@ -215,14 +215,13 @@ enum PDFEngine {
         return "메타데이터 저장 · 페이지 렌더·텍스트 일치"
     }
     static func annotate(_ source:URL,to output:URL,note:PDFNote) throws -> String {
-        if !Thread.isMainThread {
-            return try DispatchQueue.main.sync { try autoreleasepool { try annotate(source,to:output,note:note) } }
-        }
+        // Runs on the engine's thread: a main-thread hop would freeze the ring UI
+        // for the whole write and validation. CTFont is toll-free bridged to NSFont.
         let doc = try open(source)
         guard note.page >= 0, let page = doc.page(at:note.page), !note.text.isEmpty,
               page.bounds(for:.cropBox).contains(note.rect), note.rect.width > 0,note.rect.height > 0 else { throw EngineError.invalid("주석의 페이지·영역·내용을 확인해 주세요.") }
         let annotation = PDFAnnotation(bounds:note.rect,forType:.freeText,withProperties:nil)
-        annotation.contents = note.text; annotation.font = NSFont.systemFont(ofSize:14)
+        annotation.contents = note.text; annotation.font = CTFontCreateWithName("Helvetica" as CFString,14,nil) as NSFont
         annotation.fontColor = .systemBlue; annotation.color = .clear
         page.addAnnotation(annotation)
         guard doc.write(to:output) else { throw EngineError.io("PDF 주석 쓰기 실패") }

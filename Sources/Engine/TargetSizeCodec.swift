@@ -25,63 +25,73 @@ enum TargetSizeCodec {
         guard input.image.bitsPerComponent <= 8 || format == .png else { throw EngineError.unsupported("손실 압축의 16비트 입력은 먼저 명시적으로 8비트로 변환해 주세요.") }
         let hasAlpha = [.first, .last, .premultipliedFirst, .premultipliedLast].contains(input.image.alphaInfo)
         let image = format == .jpg && hasAlpha ? try ImageCodec.flattenWhite(input.image) : input.image
-        let rgba: Data
-        if [.jpg, .webp].contains(format) {
-            guard image.colorSpace?.model == .rgb else { throw EngineError.unsupported("JPEG/WebP 압축은 RGB 입력을 사용해 주세요.") }
-            guard format != .webp || max(image.width, image.height) <= 16383 else { throw EngineError.unsupported("WebP 최대 크기는 16,383px예요.") }
-            rgba = try ExternalCodecs.straightRGBA8(image)
-        } else { rgba = Data() }
-        let icc = image.colorSpace?.copyICCData() as Data? ?? Data()
-        let exif = [.jpg, .webp].contains(format) ? try MetadataEnvelope.exif(source, input: input) : Data()
-        func candidate(_ q: Int, nativeTarget: Int = 0) throws -> Data {
-            try Task.checkCancellation()
-            if format == .jpg || format == .webp {
-                return try memoryEncode(rgba, width: image.width, height: image.height, icc: icc, exif: exif,
-                                        webp: format == .webp, quality: q, target: nativeTarget)
-            }
-            let memory = NSMutableData()
-            guard let dest = CGImageDestinationCreateWithData(memory, format.uti as CFString, 1, nil) else { throw EngineError.unsupported("이 OS에서 인코딩을 지원하지 않아요.") }
-            var properties = input.properties
-            properties[kCGImageDestinationLossyCompressionQuality] = Double(q) / 100
-            properties[kCGImageDestinationEmbedThumbnail] = false
-            CGImageDestinationAddImage(dest, image, properties as CFDictionary)
-            guard CGImageDestinationFinalize(dest) else { throw EngineError.io("메모리 인코딩 실패") }
-            return memory as Data
-        }
-        let bytes: Data
-        if let target {
-            if format == .png {
-                // PNG keeps all pixels; an impossible target must never silently lower precision.
-                let lossless = try candidate(100)
-                guard lossless.count <= target else { throw EngineError.quality("PNG 무손실 결과가 목표 용량보다 커요. JPEG/WebP/HEIC를 선택해 주세요.") }
-                bytes = lossless
-            } else {
-                var best: Data?
-                if format == .webp {
-                    EngineProgress.report(0.30)
-                    let overhead = icc.count + exif.count + 64
-                    let hint = max(1, min(Int(Int32.max), Int(target) - overhead))
-                    let native = try candidate(100, nativeTarget: hint)
-                    if native.count <= target { best = native }
+        // Scope the 8-bit RGBA copy to the search so it is released before
+        // the written file is decoded again for verification.
+        let bytes: Data = try { () throws -> Data in
+            let rgba: Data
+            if [.jpg, .webp].contains(format) {
+                guard image.colorSpace?.model == .rgb else { throw EngineError.unsupported("JPEG/WebP 압축은 RGB 입력을 사용해 주세요.") }
+                guard format != .webp || max(image.width, image.height) <= 16383 else { throw EngineError.unsupported("WebP 최대 크기는 16,383px예요.") }
+                rgba = try ExternalCodecs.straightRGBA8(image)
+            } else { rgba = Data() }
+            let icc = image.colorSpace?.copyICCData() as Data? ?? Data()
+            let exif = [.jpg, .webp].contains(format) ? try MetadataEnvelope.exif(source, input: input) : Data()
+            func candidate(_ q: Int, nativeTarget: Int = 0) throws -> Data {
+                try Task.checkCancellation()
+                if format == .jpg || format == .webp {
+                    return try memoryEncode(rgba, width: image.width, height: image.height, icc: icc, exif: exif,
+                                            webp: format == .webp, quality: q, target: nativeTarget)
                 }
-                if best == nil {
-                    var low = 0, high = 100, stepIdx = 0
-                    while low <= high {
-                        let mid = (low + high) / 2
-                        let trial = try candidate(mid)
-                        stepIdx += 1
-                        EngineProgress.report(min(0.85, 0.15 + Double(stepIdx) * 0.10))
-                        if trial.count <= target { best = trial; low = mid + 1 }
-                        else { high = mid - 1 }
+                let memory = NSMutableData()
+                guard let dest = CGImageDestinationCreateWithData(memory, format.uti as CFString, 1, nil) else { throw EngineError.unsupported("이 OS에서 인코딩을 지원하지 않아요.") }
+                var properties = input.properties
+                properties[kCGImageDestinationLossyCompressionQuality] = Double(q) / 100
+                properties[kCGImageDestinationEmbedThumbnail] = false
+                CGImageDestinationAddImage(dest, image, properties as CFDictionary)
+                guard CGImageDestinationFinalize(dest) else { throw EngineError.io("메모리 인코딩 실패") }
+                return memory as Data
+            }
+            var bytes = Data()
+            if let target {
+                if format == .png {
+                    // PNG keeps all pixels; an impossible target must never silently lower precision.
+                    let lossless = try candidate(100)
+                    guard lossless.count <= target else { throw EngineError.quality("PNG 무손실 결과가 목표 용량보다 커요. JPEG/WebP/HEIC를 선택해 주세요.") }
+                    bytes = lossless
+                } else {
+                    var best: Data?
+                    if format == .webp {
+                        EngineProgress.report(0.30)
+                        let overhead = icc.count + exif.count + 64
+                        let hint = max(1, min(Int(Int32.max), Int(target) - overhead))
+                        let native = try candidate(100, nativeTarget: hint)
+                        if native.count <= target { best = native }
                     }
+                    if best == nil {
+                        // The lowest quality is the cheapest encode: an impossible
+                        // target fails after one trial instead of seven.
+                        let floor = try candidate(0)
+                        guard floor.count <= target else { throw EngineError.quality("최저 품질에서도 목표 용량을 충족할 수 없어요. 목표 용량이나 크기를 조절해 주세요.") }
+                        best = floor
+                        var low = 1, high = 100, stepIdx = 0
+                        while low <= high {
+                            let mid = (low + high) / 2
+                            let trial = try candidate(mid)
+                            stepIdx += 1
+                            EngineProgress.report(min(0.85, 0.15 + Double(stepIdx) * 0.10))
+                            if trial.count <= target { best = trial; low = mid + 1 }
+                            else { high = mid - 1 }
+                        }
+                    }
+                    guard let best else { throw EngineError.quality("최저 품질에서도 목표 용량을 충족할 수 없어요. 목표 용량이나 크기를 조절해 주세요.") }
+                    bytes = best
                 }
-                guard let best else { throw EngineError.quality("최저 품질에서도 목표 용량을 충족할 수 없어요. 목표 용량이나 크기를 조절해 주세요.") }
-                bytes = best
+            } else {
+                EngineProgress.report(0.35)
+                bytes = try candidate(Int((quality * 100).rounded()))
             }
-        } else {
-            EngineProgress.report(0.35)
-            bytes = try candidate(Int((quality * 100).rounded()))
-        }
+            return bytes
+        }()
         EngineProgress.report(0.88)
         guard !bytes.isEmpty, target == nil || Int64(bytes.count) <= target! else { throw EngineError.quality("목표 용량 검사 실패") }
         try bytes.write(to: output)

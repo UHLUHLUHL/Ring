@@ -10,15 +10,18 @@ enum MetadataEngine {
         let bytes: Data
         switch input.type {
         case ImageFormat.jpg.uti:
-            bytes = try jpeg(original)
+            // Orientation is display geometry, not private data. Dropping it
+            // would show a portrait photo sideways.
+            let cleaned = try jpeg(original)
+            bytes = input.orientation == 1 ? cleaned : try JPEGStructure.replacingExif(cleaned, exif: orientationTIFF(input.orientation))
             var error = [CChar](repeating: 0, count: 512)
             let equal = original.withUnsafeBytes { a in bytes.withUnsafeBytes { b in
                 ring_jpeg_coefficients_equal(a.bindMemory(to: UInt8.self).baseAddress!, original.count,
                     b.bindMemory(to: UInt8.self).baseAddress!, bytes.count, 0, 0, &error, error.count)
             } }
             guard equal == 1 else { throw EngineError.quality("JPEG DCT 계수 검증 실패") }
-        case ImageFormat.png.uti: bytes = try png(original)
-        case ImageFormat.webp.uti: bytes = try webp(original)
+        case ImageFormat.png.uti: bytes = try png(original, orientation: input.orientation)
+        case ImageFormat.webp.uti: bytes = try webp(original, orientation: input.orientation)
         case ImageFormat.heic.uti, ImageFormat.avif.uti: bytes = try stripISOBMFFMetadata(data: original)
         default: throw EngineError.unsupported("전체 메타데이터 소거는 JPEG/PNG/WebP/HEIC/AVIF를 지원해요.")
         }
@@ -27,9 +30,16 @@ enum MetadataEngine {
         guard result.image.width == input.image.width, result.image.height == input.image.height,
               result.image.colorSpace?.copyICCData() == input.image.colorSpace?.copyICCData(),
               result.properties[kCGImagePropertyGPSDictionary] == nil,
-              result.properties[kCGImagePropertyExifDictionary] == nil else { throw EngineError.quality("메타데이터 소거·ICC 검증 실패") }
+              (result.properties[kCGImagePropertyExifDictionary] as? [CFString: Any] ?? [:]).isEmpty else { throw EngineError.quality("메타데이터 소거·ICC 검증 실패") }
+        guard result.orientation == input.orientation else { throw EngineError.quality("메타데이터 소거 후 사진 방향이 바뀌었어요.") }
         guard try PixelCheck.compare(input.image, result.image).exact else { throw EngineError.quality("메타데이터 소거 후 픽셀 불일치") }
-        return "전체 개인정보 소거 · 픽셀 재인코딩 없음 · ICC·압축 페이로드 검증" + (input.orientation == result.orientation ? "" : " · EXIF 방향 태그 제거")
+        return "전체 개인정보 소거 · 픽셀 재인코딩 없음 · ICC·압축 페이로드 검증" + (input.orientation == 1 ? "" : " · 방향 태그만 유지")
+    }
+
+    /// Little-endian TIFF with a single IFD0 entry: Orientation (0x0112).
+    static func orientationTIFF(_ orientation: Int) throws -> Data {
+        guard (1...8).contains(orientation) else { throw EngineError.invalid("EXIF 방향 값 오류") }
+        return Data([0x49,0x49,0x2a,0,8,0,0,0, 1,0, 0x12,0x01,3,0,1,0,0,0,UInt8(orientation),0,0,0, 0,0,0,0])
     }
 
     static func jpeg(_ data: Data) throws -> Data {
@@ -67,7 +77,7 @@ enum MetadataEngine {
         return out // Discard trailer bytes, which can contain previews or private data.
     }
 
-    static func png(_ data: Data) throws -> Data {
+    static func png(_ data: Data, orientation: Int = 1) throws -> Data {
         guard data.starts(with: [137,80,78,71,13,10,26,10]) else { throw EngineError.invalid("PNG 헤더 오류") }
         var result = Data(data.prefix(8)), p = 8, originalIDAT = Data(), outputIDAT = Data(), ended = false
         while p + 12 <= data.count {
@@ -77,6 +87,11 @@ enum MetadataEngine {
             let chunk = Data(data[(p + 4)..<(p + 8 + n)])
             guard DOCXArchive.checksum(0, chunk) == PNGMetadata.read32(data, p + 8 + n) else { throw EngineError.invalid("PNG CRC 오류") }
             if name == "IDAT" { originalIDAT.append(data[(p + 8)..<(p + 8 + n)]) }
+            if name == "IDAT", originalIDAT.count == n, orientation != 1 {
+                // eXIf must precede IDAT.
+                let chunk = Data("eXIf".utf8) + (try orientationTIFF(orientation))
+                result.append(MetadataEngine.big(chunk.count - 4, 4) + chunk + MetadataEngine.big(Int(DOCXArchive.checksum(0, chunk)), 4))
+            }
             if !["eXIf", "iTXt", "tEXt", "zTXt", "tIME"].contains(name) {
                 result.append(data[p..<(p + n + 12)])
                 if name == "IDAT" { outputIDAT.append(data[(p + 8)..<(p + 8 + n)]) }
@@ -88,7 +103,7 @@ enum MetadataEngine {
         return result
     }
 
-    static func webp(_ data:Data) throws -> Data {
+    static func webp(_ data:Data, orientation:Int = 1) throws -> Data {
         guard data.count>=12,data.prefix(4)==Data("RIFF".utf8),data[8..<12]==Data("WEBP".utf8) else { throw EngineError.invalid("WebP RIFF 헤더 오류") }
         func little(_ p:Int)->Int { (0..<4).reduce(0) { $0 | Int(data[p+$1]) << ($1*8) } }
         let end=little(4)+8
@@ -105,6 +120,7 @@ enum MetadataEngine {
                 if kind=="VP8X" {
                     guard n==10 else { throw EngineError.invalid("WebP VP8X 길이 오류") }
                     raw[8] &= ~UInt8(0x0c)
+                    if orientation != 1 { raw[8] |= 0x08 }
                 }
                 chunks.append(raw)
                 if ["VP8 ","VP8L","ALPH"].contains(kind) { after.append(payload) }
@@ -112,6 +128,11 @@ enum MetadataEngine {
             p+=8+n+(n&1)
         }
         guard p==end,!before.isEmpty,SHA256.hash(data:before)==SHA256.hash(data:after) else { throw EngineError.quality("WebP 압축 페이로드 검증 실패") }
+        if orientation != 1 {
+            // Only an extended (VP8X) file can carry EXIF, so its flag was set above.
+            let tiff=try orientationTIFF(orientation)
+            chunks.append(Data("EXIF".utf8)+Data((0..<4).map { UInt8((tiff.count >> ($0*8))&255) })+tiff)
+        }
         let size=UInt32(chunks.count+4)
         let header=Data("RIFF".utf8)+Data((0..<4).map { UInt8((size >> ($0*8))&255) })+Data("WEBP".utf8)
         return header+chunks

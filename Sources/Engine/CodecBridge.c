@@ -46,7 +46,7 @@ static int write_file(const char *path,const uint8_t *data,size_t n) {
 int ring_webp_encode(const uint8_t *rgba,int width,int height,int stride,const uint8_t *icc,size_t icc_size,const uint8_t *exif,size_t exif_size,int threads,const char *path,char *error,size_t error_size) {
  WebPConfig config;WebPPicture picture;WebPMemoryWriter writer;WebPMux *mux=NULL;WebPData assembled={0};int ok=0;
  if(!WebPConfigInit(&config)||!WebPPictureInit(&picture))return fail(error,error_size,"WebP initialization failed");
- config.lossless=1;config.quality=75;config.method=2;config.exact=1;config.thread_level=threads>1;config.low_memory=0;
+ config.lossless=1;config.quality=100;config.method=4;config.exact=1;config.thread_level=threads>1;config.low_memory=1;
  picture.width=width;picture.height=height;picture.use_argb=1;
  WebPMemoryWriterInit(&writer);picture.writer=WebPMemoryWrite;picture.custom_ptr=&writer;
  if(!WebPPictureImportRGBA(&picture,rgba,stride)||!WebPValidateConfig(&config)||!WebPEncode(&config,&picture)) { fail(error,error_size,"WebP lossless encoding failed");goto done; }

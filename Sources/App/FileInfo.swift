@@ -65,6 +65,25 @@ struct FileInfo {
         }
     }
 
+    /// Implemented and tested engine paths that the ring does not show.
+    /// Kept here, unrouted, so they can return without rebuilding the engine:
+    /// add an entry to `convertActions`/`editActions` and route its id in
+    /// `RingModel.activate`. Not listed means not visible; nothing is deleted.
+    static let hiddenActions: [Kind: [RingAction]] = [
+        .image: ["TIFF", "AVIF", "BMP", "DOCX"].map { RingAction(id: $0, title: $0, symbol: nil, kind: .convert($0)) } + [
+            RingAction(id: "adjust", title: "보정", symbol: "slider.horizontal.3", kind: .tool),
+            RingAction(id: "annotate", title: "주석", symbol: "pencil.tip", kind: .tool),
+            RingAction(id: "background", title: "배경 추가", symbol: "photo.on.rectangle", kind: .addBackground),
+            RingAction(id: "redact", title: "가리기", symbol: "eye.slash", kind: .tool),
+        ],
+        .pdf: [
+            RingAction(id: "TXT", title: "TXT", symbol: nil, kind: .convert("TXT")),
+            RingAction(id: "metadata", title: "메타데이터", symbol: "tag", kind: .tool),
+            RingAction(id: "annotate", title: "주석", symbol: "pencil.tip", kind: .tool),
+            RingAction(id: "redact", title: "가리기", symbol: "eye.slash", kind: .tool),
+        ],
+    ]
+
     var editActions: [RingAction] {
         switch kind {
         case .image:

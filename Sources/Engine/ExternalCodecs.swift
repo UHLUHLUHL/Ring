@@ -5,19 +5,9 @@ import ImageIO
 struct JPEGSampling {
     let width:Int,height:Int,mcuWidth:Int,mcuHeight:Int
     init(_ data:Data) throws {
-        var index=2
-        while index+4 <= data.count {
-            let marker=data[index+1],n=Int(data[index+2])*256+Int(data[index+3])
-            guard n>=2,index+n+2<=data.count else { break }
-            if [0xc0,0xc1,0xc2].contains(marker) {
-                let count=Int(data[index+9]);guard n>=8+count*3 else { break }
-                var maxH=1,maxV=1
-                for i in 0..<count { let sample=Int(data[index+11+i*3]);maxH=max(maxH,sample>>4);maxV=max(maxV,sample&15) }
-                width=Int(data[index+7])*256+Int(data[index+8]);height=Int(data[index+5])*256+Int(data[index+6]);mcuWidth=maxH*8;mcuHeight=maxV*8;return
-            }
-            index+=n+2
-        }
-        throw EngineError.unsupported("지원하지 않는 JPEG 구조예요.")
+        let frame=try JPEGStructure.frame(data)
+        width=frame.width;height=frame.height
+        mcuWidth=(frame.sampling.map { $0.0 }.max() ?? 1)*8;mcuHeight=(frame.sampling.map { $0.1 }.max() ?? 1)*8
     }
     func snapped(_ rect:CGRect)->CGRect {
         let x=floor(rect.minX/CGFloat(mcuWidth))*CGFloat(mcuWidth),y=floor(rect.minY/CGFloat(mcuHeight))*CGFloat(mcuHeight)
@@ -64,20 +54,25 @@ enum ExternalCodecs {
         ThermalPolicy.threads
     }
     static func convert(_ source:URL,to output:URL,format:ImageFormat) throws -> String {
-        let prepared=try autoreleasepool { try prepare(source,format:format) }
-        EngineProgress.report(0.35)
-        let rgba=prepared.rgba,icc=prepared.icc,exif=prepared.exif,image=prepared.image
-        var error=[CChar](repeating:0,count:512)
-        let ok=rgba.withUnsafeBytes { pixels in icc.withUnsafeBytes { profile in exif.withUnsafeBytes { metadata in
-            output.path.withCString { path in
-                let args=(pixels.bindMemory(to:UInt8.self).baseAddress!,Int32(image.width),Int32(image.height),Int32(image.width*4),profile.bindMemory(to:UInt8.self).baseAddress,icc.count,metadata.bindMemory(to:UInt8.self).baseAddress,exif.count,Int32(threads),path)
-                if format == .webp { return ring_webp_encode(args.0,args.1,args.2,args.3,args.4,args.5,args.6,args.7,args.8,args.9,&error,error.count) }
-                return ring_avif_encode(args.0,args.1,args.2,args.3,args.4,args.5,args.6,args.7,args.8,args.9,&error,error.count)
-            }
-        }}}
-        guard ok==1 else { throw EngineError.io("\(format.rawValue.uppercased()) 인코딩 실패: \(String(cString:error))") }
+        // The RGBA copy lives only inside this closure; verification decodes
+        // the written file without it (about 48MB less at 12MP).
+        let (image,properties)=try { () throws -> (CGImage,[CFString:Any]) in
+            let prepared=try autoreleasepool { try prepare(source,format:format) }
+            EngineProgress.report(0.35)
+            let rgba=prepared.rgba,icc=prepared.icc,exif=prepared.exif,image=prepared.image
+            var error=[CChar](repeating:0,count:512)
+            let ok=rgba.withUnsafeBytes { pixels in icc.withUnsafeBytes { profile in exif.withUnsafeBytes { metadata in
+                output.path.withCString { path in
+                    let args=(pixels.bindMemory(to:UInt8.self).baseAddress!,Int32(image.width),Int32(image.height),Int32(image.width*4),profile.bindMemory(to:UInt8.self).baseAddress,icc.count,metadata.bindMemory(to:UInt8.self).baseAddress,exif.count,Int32(threads),path)
+                    if format == .webp { return ring_webp_encode(args.0,args.1,args.2,args.3,args.4,args.5,args.6,args.7,args.8,args.9,&error,error.count) }
+                    return ring_avif_encode(args.0,args.1,args.2,args.3,args.4,args.5,args.6,args.7,args.8,args.9,&error,error.count)
+                }
+            }}}
+            guard ok==1 else { throw EngineError.io("\(format.rawValue.uppercased()) 인코딩 실패: \(String(cString:error))") }
+            return (image,prepared.properties)
+        }()
         EngineProgress.report(0.85)
-        try ImageCodec.verify(image,properties:prepared.properties,output:output,exact:true)
+        try ImageCodec.verify(image,properties:properties,output:output,exact:true)
         return "\(format.rawValue.uppercased()) 무손실 · RGB 4:4:4 · 픽셀·ICC·방향 일치"
     }
     private struct Prepared {
@@ -100,7 +95,7 @@ enum ExternalCodecs {
         let width=image.width,height=image.height,space=image.colorSpace!
         var data=Data(count:width*height*4)
         // A 16-bit premultiplied strip avoids introducing an 8-bit premultiply round trip.
-        let stripRows=1024
+        let stripRows=min(1024,max(1,(32*1024*1024)/(width*8)))
         for y in stride(from:0,to:height,by:stripRows) {
             try Task.checkCancellation()
             let rows=min(stripRows,height-y),context=try PDFEngine.bitmap(width:width,height:rows,space:space,depth:16)
@@ -108,12 +103,8 @@ enum ExternalCodecs {
             let values=context.data!.bindMemory(to:UInt16.self,capacity:width*rows*4)
             data.withUnsafeMutableBytes { bytes in
                 let output=bytes.bindMemory(to:UInt8.self)
-                // CGContext strip y is bottom-based; CGImage data is top-down after draw.
-                for pixel in 0..<(width*rows) {
-                    let alpha=Int(values[pixel*4+3]),offset=(y*width+pixel)*4
-                    for c in 0..<3 { output[offset+c]=alpha == 0 ? 0:UInt8(min(255,(Int(values[pixel*4+c])*255+alpha/2)/alpha)) }
-                    output[offset+3]=UInt8((alpha+128)/257)
-                }
+                // Preserve the existing integer unpremultiply and row order.
+                ring_rgba16_to_rgba8(values,output.baseAddress!.advanced(by:y*width*4),width*rows)
             }
         }
         return data

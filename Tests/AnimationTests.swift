@@ -112,12 +112,27 @@ import CryptoKit
             try inspect(frozen.url, expectedDuration: 1)
             let single = try await RingEngine.shared.run(.init(source: still, operation: .video(.animation(.init(format: .webp, fps: 1, maxDimension: 160, duration: 0.2)))))
             try inspect(single.url, expectedDuration: 0.2)
+            // The default animation must retain the q90/method4/sharp-YUV
+            // still-frame reference, including the 2x + vImage resize path.
+            let qualityReference=AVAssetImageGenerator(asset:AVURLAsset(url:still))
+            qualityReference.appliesPreferredTrackTransform=true
+            qualityReference.maximumSize=CGSize(width:320,height:320)
+            let full=try await qualityReference.image(at:.zero).image
+            let fitted=try ImageResampler.fit(full,maxDimension:160)
+            let rgba=try AdaptivePalette.sRGB(fitted)
+            let expectedBytes=try TargetSizeCodec.memoryEncode(rgba,width:160,height:90,webp:true,quality:90)
+            let expectedSource=CGImageSourceCreateWithData(expectedBytes as CFData,nil)!
+            let actualSource=CGImageSourceCreateWithURL(single.url as CFURL,nil)!
+            let expectedPixels=try AdaptivePalette.sRGB(CGImageSourceCreateImageAtIndex(expectedSource,0,nil)!)
+            let actualPixels=try AdaptivePalette.sRGB(CGImageSourceCreateImageAtIndex(actualSource,0,nil)!)
+            try require(expectedPixels==actualPixels,"default animation quality/resize differs from q90 sharp-YUV reference")
+            print("PASS default WebP decoded pixels match q90/method4/sharp-YUV + vImage reference")
             print("PASS still WebP and single sampled frame retain animation duration")
 
             // Exercise adaptive choice and inspect every decoded frame after mux.
             for (source, expectedMotion) in [(moving, true), (subtle, false)] {
                 let plan = AnimationPlan(duration: 2, fps: 30, format: .webp)
-                let encoded = try await AnimationPipeline.encode(asset: AVURLAsset(url: source), start: 0, fps: 30, dimension: 160, plan: plan, format: .webp, quality: 85, allowParallelWebP: true) { _ in }
+                let encoded = try await AnimationPipeline.encode(asset: AVURLAsset(url: source), start: 0, fps: 30, dimension: 160, plan: plan, format: .webp, quality: 90, allowParallelWebP: true) { _ in }
                 if AnimationResources.shared.workers > 1 { try require(encoded.parallelWebP == expectedMotion, "adaptive motion path") }
                 try AnimationPipeline.verify(encoded, plan: plan, format: .webp)
                 let url = root.appendingPathComponent(expectedMotion ? "parallel.webp" : "delta.webp")
@@ -152,12 +167,12 @@ import CryptoKit
             let ordered = try await RingEngine.shared.run(.init(source: moving, operation: .video(.animation(.init(format: .gif, fps: 30, maxDimension: 160, duration: 1)))))
             let output = CGImageSourceCreateWithURL(ordered.url as CFURL, nil)!
             let generator = AVAssetImageGenerator(asset: AVURLAsset(url: moving))
-            generator.maximumSize = CGSize(width: 160, height: 160)
+            generator.maximumSize = CGSize(width: 320, height: 320)
             generator.appliesPreferredTrackTransform = true
             generator.requestedTimeToleranceBefore = CMTime(seconds: 0.008, preferredTimescale: 60000)
             generator.requestedTimeToleranceAfter = generator.requestedTimeToleranceBefore
             for index in [0, 14, 29] {
-                let reference = try await generator.image(at: CMTime(seconds: Double(index) / 30, preferredTimescale: 60000)).image
+                let reference = try ImageResampler.fit(await generator.image(at: CMTime(seconds: Double(index) / 30, preferredTimescale: 60000)).image,maxDimension:160)
                 // Compare after the same GIF round trip: ImageIO assigns the
                 // decoded palette a color space that can differ from CGImage's.
                 let memory = NSMutableData()

@@ -19,7 +19,7 @@ enum PixelCheck {
         }
         let components = space.model == .rgb ? 4 : 2
         var result = PixelMetrics()
-        let stripRows = 1024
+        let stripRows = min(1024,max(1,(32*1024*1024)/(a.width*components*2)))
         for y in stride(from: 0, to: a.height, by: stripRows) {
             try Task.checkCancellation()
             let height = min(stripRows, a.height-y)
@@ -37,13 +37,10 @@ enum PixelCheck {
             let count = row * height / 2
             let pa = ca.data!.bindMemory(to:UInt16.self, capacity:count)
             let pb = cb.data!.bindMemory(to:UInt16.self, capacity:count)
-            for i in 0..<count {
-                let left = a.bitsPerComponent <= 8 ? (Int(pa[i])+128)/257*257 : Int(pa[i])
-                let right = a.bitsPerComponent <= 8 ? (Int(pb[i])+128)/257*257 : Int(pb[i])
-                let diff = abs(left-right)
-                result.maxDifference = max(result.maxDifference, UInt16(diff))
-                result.squaredError += Double(diff) * Double(diff)
-            }
+            var largest:UInt16=0
+            let squared=ring_compare_pixels16(pa,pb,count,a.bitsPerComponent <= 8 ? 1:0,&largest)
+            result.maxDifference=max(result.maxDifference,largest)
+            result.squaredError+=Double(squared)
             result.sampleCount += count
         }
         return result

@@ -58,7 +58,7 @@ final class AnimationResources: @unchecked Sendable {
     func enter() { lock.lock(); active += 1; lock.unlock() }
     func leave() { lock.lock(); active -= 1; lock.unlock() }
     private var jobs: Int { lock.lock(); defer { lock.unlock() }; return max(1, active) }
-    var workers: Int { max(1, ThermalPolicy.threads / jobs) }
+    var workers: Int { max(1,ThermalPolicy.threads/jobs) }
     func frameCapacity(width: Int, height: Int, bytesPerPixel: Int = 4) -> Int {
         max(1, (128 * 1024 * 1024 / jobs) / max(1, width * height * bytesPerPixel))
     }
@@ -238,11 +238,11 @@ enum AnimationPipeline {
             try Task.checkCancellation()
             let capacity = max(1, resources.frameCapacity(width: width, height: height, bytesPerPixel: format == .gif ? 12 : 4) / 2)
             let workers = min(resources.workers, capacity)
-            let chunkSize = max(1, min(8, capacity / workers))
+            let chunkSize = 1
             // Decode ahead within the byte budget. Tiny extraction requests
             // repeatedly restart AVFoundation's batch decoder and lose most of
             // the parallel encoder's gain, especially on low-motion clips.
-            let desired = gif != nil ? min(workers * 4, capacity) : (parallelWebP ? workers * chunkSize : min(32, capacity))
+            let desired = gif != nil ? min(workers * 4, capacity) : (parallelWebP ? min(workers * 8,capacity) : min(32, capacity))
             let count = min(plan.frames.count - position, max(images.count, desired))
             if images.count < count {
                 images += try await reader.read(plan.frames[(position + images.count)..<(position + count)])

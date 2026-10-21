@@ -6,6 +6,44 @@ import ImageIO
   do { try await run() } catch { print("FAIL",error.localizedDescription);exit(1) }
  }
  static func run() async throws {
+  // Compare the native reduction with the former Swift arithmetic, including
+  // unaligned vector tails, transparent values, and the full 16-bit range.
+  var state:UInt64=17
+  for count in [0,1,17,4099,65536] {
+   var a=[UInt16](),b=[UInt16]()
+   for _ in 0..<count {
+    state=state &* 6364136223846793005 &+ 1;a.append(UInt16(truncatingIfNeeded:state>>16))
+    state=state &* 6364136223846793005 &+ 1;b.append(UInt16(truncatingIfNeeded:state>>16))
+   }
+   for quantize in [false,true] {
+    var expected:UInt64=0,largest:UInt16=0
+    for i in 0..<count {
+     let x=quantize ? (Int(a[i])+128)/257*257:Int(a[i])
+     let y=quantize ? (Int(b[i])+128)/257*257:Int(b[i])
+     let d=abs(x-y);expected+=UInt64(d*d);largest=max(largest,UInt16(d))
+    }
+    var actualMax:UInt16=0
+    let actual=a.withUnsafeBufferPointer { aa in b.withUnsafeBufferPointer { bb in
+     ring_compare_pixels16(aa.baseAddress,bb.baseAddress,count,quantize ? 1:0,&actualMax)
+    } }
+    guard actual==expected,actualMax==largest else { throw EngineError.quality("native pixel verification reduction changed") }
+   }
+  }
+  print("PASS native 8/16-bit pixel metrics and vector tails")
+  var rgba=[UInt16](repeating:0,count:4099*4),expected=[UInt8](repeating:0,count:4099*4),actual=expected
+  for p in 0..<4099 {
+   let alpha=p%3==0 ? 0:p%3==1 ? 65535:12345
+   rgba[p*4+3]=UInt16(alpha)
+   for c in 0..<3 {
+    state=state &* 6364136223846793005 &+ 1
+    let value=Int(UInt16(truncatingIfNeeded:state>>16));rgba[p*4+c]=UInt16(value)
+    expected[p*4+c]=alpha==0 ? 0:UInt8(min(255,(value*255+alpha/2)/alpha))
+   }
+   expected[p*4+3]=UInt8((alpha+128)/257)
+  }
+  rgba.withUnsafeBufferPointer { a in actual.withUnsafeMutableBufferPointer { b in ring_rgba16_to_rgba8(a.baseAddress,b.baseAddress,4099) } }
+  guard actual==expected else { throw EngineError.quality("native RGBA unpremultiply changed pixels") }
+  print("PASS native RGBA unpremultiply opaque/transparent/partial alpha")
   if CommandLine.arguments.contains("--avif-bench") {
    let r=try await RingEngine.shared.run(EngineJob(source:URL(fileURLWithPath:".work/stage1-final2/12mp.png"),operation:.convert(.avif)))
    print("BENCH AVIF grid",r.seconds,r.detail);return

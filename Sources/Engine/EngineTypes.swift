@@ -95,9 +95,8 @@ actor RingEngine {
         case .video(let operation): ext=operation.fileExtension
         case .removeLocation,.compress: ext=job.source.pathExtension.lowercased()
         case .pdfMetadata,.pdfNote,.pdfRedact: ext="pdf"
-        case .edit(.crop) where ["jpg","jpeg"].contains(job.source.pathExtension.lowercased()): ext="jpg"
         case .edit(.adjust(let e,let c,let s)) where e == 0 && c == 1 && s == 1: ext=job.source.pathExtension.lowercased()
-        case .edit: ext="png"
+        case .edit(let edit): ext=ImageEdits.outputFormat(job.source,edit:edit).rawValue
         }
         let transaction=try OutputTransaction(source:job.source,extension:ext)
         defer { transaction.cleanup() }

@@ -29,8 +29,36 @@ enum ImageEdit {
 }
 
 enum ImageEdits {
+    /// Resizing an 8-bit opaque JPEG/HEIC keeps its format: one lossy encode
+    /// at quality 1.0 with the 45 dB gate, instead of a PNG many times larger.
+    /// Other edits and sources stay lossless PNG.
+    static func outputFormat(_ source:URL,edit:ImageEdit) -> ImageFormat {
+        let ext=source.pathExtension.lowercased()
+        let jpeg=["jpg","jpeg"].contains(ext)
+        switch edit {
+        case .crop where jpeg: return .jpg
+        case .cropAspect where jpeg: return .jpg
+        case .resize,.resizeScale:
+            guard jpeg || ext == "heic",let header=CGImageSourceCreateWithURL(source as CFURL,nil),
+                  let p=CGImageSourceCopyPropertiesAtIndex(header,0,nil) as? [CFString:Any],
+                  (p[kCGImagePropertyDepth] as? Int ?? 8) <= 8,!(p[kCGImagePropertyHasAlpha] as? Bool ?? false) else { return .png }
+            return jpeg ? .jpg:.heic
+        default: return .png
+        }
+    }
     static func run(_ source:URL,to output:URL,edit:ImageEdit) throws -> String {
-        if case .crop(let region) = edit,["jpg","jpeg"].contains(source.pathExtension.lowercased()) {
+        let format=outputFormat(source,edit:edit)
+        if case .crop(let region) = edit,format == .jpg {
+            return try ExternalCodecs.jpeg(source,to:output,crop:region)
+        }
+        if case .cropAspect(let width,let height) = edit,format == .jpg {
+            // Lossless DCT crop; the MCU-aligned edge can differ from the exact ratio by under one MCU.
+            guard width.isFinite,height.isFinite,width>0,height>0 else { throw EngineError.invalid("자르기 종횡비 오류") }
+            let input=try ImageInput(source)
+            let swaps=input.orientation >= 5
+            let shown=Double(swaps ? input.image.height:input.image.width)/Double(swaps ? input.image.width:input.image.height)
+            let ratio=width/height
+            let region=ratio<shown ? CGRect(x:(1-ratio/shown)/2,y:0,width:ratio/shown,height:1) : CGRect(x:0,y:(1-shown/ratio)/2,width:1,height:shown/ratio)
             return try ExternalCodecs.jpeg(source,to:output,crop:region)
         }
         if case .adjust(let exposure,let contrast,let saturation) = edit,exposure == 0,contrast == 1,saturation == 1 {
@@ -39,9 +67,14 @@ enum ImageEdits {
         }
         // Drop source decoder and transient GPU resources before encoding/validating the result.
         let (result,properties,detail) = try autoreleasepool { try prepare(source,edit:edit) }
-        try ImageCodec.write(result,properties:properties,format:.png,to:output)
-        try ImageCodec.verify(result,properties:properties,output:output,exact:true)
-        return detail + " · 저장 픽셀 일치"
+        try ImageCodec.write(result,properties:properties,format:format,to:output)
+        if format == .jpg { try JPEGStructure.require444(output) }
+        if format == .png {
+            try ImageCodec.verify(result,properties:properties,output:output,exact:true)
+            return detail + " · 저장 픽셀 일치"
+        }
+        let metrics=try ImageCodec.verify(result,properties:properties,output:output,exact:false)
+        return detail.replacingOccurrences(of:"PNG 무손실 저장",with:format.rawValue.uppercased()) + String(format:" · %@ 손실 인코딩 1회 · PSNR %.2f dB",format.rawValue.uppercased(),metrics.psnr)
     }
     private static func prepare(_ source:URL,edit:ImageEdit) throws -> (CGImage,[CFString:Any],String) {
         let input = try ImageInput(source)

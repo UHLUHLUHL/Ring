@@ -65,6 +65,17 @@ import CryptoKit
             if [.heic,.avif].contains(format) { try require(written.count==Data(contentsOf:url).count,"HEIF offsets moved") }
             print("PASS metadata",format,r.detail)
         }
+        // A portrait photo must not turn sideways after private metadata is removed.
+        let rotated=try image(root,name:"rotated.png",width:96,height:64,orientation:6)
+        let rotatedJPEG=try await RingEngine.shared.run(.init(source:rotated,operation:.encodeImage(format:.jpg,intent:.quality(0.9)))).url
+        for url in [rotated,rotatedJPEG] {
+            try require(try ImageInput(url).orientation==6,"rotated fixture orientation")
+            let r=try await RingEngine.shared.run(.init(source:url,operation:.cleanMetadata))
+            let written=try Data(contentsOf:r.url)
+            try require(try ImageInput(r.url).orientation==6,"metadata clean dropped orientation \(url.pathExtension)")
+            try require(written.range(of:Data("RingPrivate".utf8))==nil,"rotated private metadata remains")
+            print("PASS metadata orientation",url.pathExtension,r.detail)
+        }
         for operation in [ImageEdit.resize(width:320,height:240),.resizeScale(0.25),.cropAspect(width:1,height:1),.cropAspect(width:16,height:9)] {
             let r=try await RingEngine.shared.run(.init(source:source,operation:.edit(operation)))
             print("PASS resize/crop",r.detail)
@@ -72,6 +83,23 @@ import CryptoKit
         let jpg=try await RingEngine.shared.run(.init(source:source,operation:.encodeImage(format:.jpg,intent:.quality(0.95)))).url
         let crop=try await RingEngine.shared.run(.init(source:jpg,operation:.edit(.crop(CGRect(x:0.1,y:0.1,width:0.5,height:0.5)))))
         print("PASS MCU",crop.detail)
+        // T.81 allows 0xFF fill bytes before any marker. Pad the quantization
+        // table: ImageIO itself drops the ICC profile when APP0 is padded.
+        var padded=try Data(contentsOf:jpg)
+        let firstSegment=try JPEGStructure.segments(padded).first { $0.marker==0xdb }!.start
+        padded.insert(contentsOf:[0xff,0xff,0xff],at:firstSegment)
+        let paddedURL=file(root,"padded.jpg");try padded.write(to:paddedURL)
+        let paddedFrame=try JPEGStructure.frame(padded),plainFrame=try JPEGStructure.frame(Data(contentsOf:jpg))
+        try require(paddedFrame.width==plainFrame.width && paddedFrame.height==plainFrame.height,"fill-byte SOF parse")
+        _=try JPEGSampling(padded);try JPEGStructure.require444(paddedURL);_=try JPEGStructure.codingBytes(padded)
+        let paddedCrop=try await RingEngine.shared.run(.init(source:paddedURL,operation:.edit(.crop(CGRect(x:0.1,y:0.1,width:0.5,height:0.5)))))
+        print("PASS JPEG fill bytes",paddedCrop.detail)
+        for operation in [ImageEdit.resize(width:320,height:240),.cropAspect(width:1,height:1)] {
+            let r=try await RingEngine.shared.run(.init(source:jpg,operation:.edit(operation)))
+            try require(r.url.pathExtension=="jpg","JPEG edit must stay JPEG")
+            try require(try Data(contentsOf:r.url).count<Data(contentsOf:jpg).count*2,"JPEG edit output grew")
+            print("PASS JPEG edit keeps format",r.detail)
+        }
         let before=Set(try FileManager.default.contentsOfDirectory(atPath:root.path))
         do { _=try await RingEngine.shared.run(.init(source:source,operation:.encodeImage(format:.jpg,intent:.targetBytes(1))));throw EngineError.invalid("TEST: impossible target accepted") }
         catch EngineError.quality { }
@@ -203,13 +231,21 @@ import CryptoKit
         let croppedAsset=AVURLAsset(url:cropped.url),croppedTrack=try await croppedAsset.loadTracks(withMediaType:.video)[0],croppedSize=try await croppedTrack.load(.naturalSize)
         try require(croppedSize.width==128 && croppedSize.height==128,"video crop and maximum dimension")
         print("PASS video crop/resize",cropped.detail)
-        for format in [AnimationFormat.gif,.webp] {
-            let animated=try await RingEngine.shared.run(.init(source:source,operation:.video(.animation(.init(format:format,fps:10,maxDimension:160,start:0,duration:1,cropRatio:.square)))))
+        let sourceTrack=try await AVURLAsset(url:source).loadTracks(withMediaType:.video)[0]
+        let shown=try await sourceTrack.load(.naturalSize).applying(sourceTrack.load(.preferredTransform))
+        // The panel's resolution preview must match what the engine writes.
+        for (format,ratio,limit) in [(AnimationFormat.gif,VideoCropRatio.square,160),(.webp,.square,160),(.webp,.free,150),(.gif,.wide,97)] {
+            let animated=try await RingEngine.shared.run(.init(source:source,operation:.video(.animation(.init(format:format,fps:10,maxDimension:limit,start:0,duration:1,cropRatio:ratio)))))
             let sizeText=animated.detail.components(separatedBy:" · ").dropFirst().first ?? ""
             let dimensions=sizeText.split(separator:"×").compactMap { Int($0) }
-            try require(dimensions.count==2 && dimensions[0]==dimensions[1] && dimensions[0]<=160,"\(format) video crop ratio/output dimensions")
+            let expected=VideoCropGeometry.animationSize(width:abs(shown.width),height:abs(shown.height),ratio:ratio,maxDimension:limit)
+            try require(dimensions==[expected.width,expected.height],"\(format) \(ratio) preview \(expected) != \(dimensions)")
+            if ratio == .square { try require(dimensions[0]==dimensions[1] && dimensions[0]<=limit,"\(format) video crop ratio/output dimensions") }
             print("PASS animation",animated.detail)
         }
+        let compressedPreview=VideoCropGeometry.compressedSize(width:abs(shown.width),height:abs(shown.height),ratio:.square,maxDimension:128,
+            bitrate:Int(min(VideoCropGeometry.videoBitrate(targetBytes:240000,duration:try await AVURLAsset(url:source).load(.duration).seconds,audio:!(try await AVURLAsset(url:source).loadTracks(withMediaType:.audio).isEmpty)),100_000_000)))
+        try require(compressedPreview.width==128 && compressedPreview.height==128,"video compress preview")
         try require(try Data(contentsOf:source)==original,"media source changed")
         let before=Set(try FileManager.default.contentsOfDirectory(atPath:root.path))
         for delay:UInt64 in [0,10_000_000,50_000_000] {
