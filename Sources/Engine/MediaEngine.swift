@@ -8,6 +8,7 @@ import ImageIO
 enum MediaEngine {
     static func run(_ source:URL,to output:URL,operation:VideoOperation) async throws -> String {
         switch operation {
+        case .convert(let options): return try await convertVideo(source,to:output,options:options)
         case .trim(let start,let end): return try await trim(source,to:output,start:start,end:end)
         case .compress(let options): return try await compress(source,to:output,options:options)
         case .animation(let options): return try await animate(source,to:output,options:options)
@@ -78,8 +79,9 @@ enum MediaEngine {
         throw EngineError.quality("하드웨어 인코더 결과 \(lastSize)바이트가 목표 용량을 초과했어요.")
     }
 
-    private static func encode(_ asset:AVAsset,to output:URL,video:AVAssetTrack,audio:AVAssetTrack?,duration:CMTime,width:Int,height:Int,transform:CGAffineTransform,natural:CGSize,crop:CGRect?,bitrate:Int,audioRate:Int,codec:VideoCodec) async throws {
-        let reader=try AVAssetReader(asset:asset),writer=try AVAssetWriter(outputURL:output,fileType:.mp4)
+    static func encode(_ asset:AVAsset,to output:URL,video:AVAssetTrack,audio:AVAssetTrack?,duration:CMTime,width:Int,height:Int,transform:CGAffineTransform,natural:CGSize,crop:CGRect?,bitrate:Int,audioRate:Int,codec:VideoCodec,
+                       fileType:AVFileType = .mp4,colorProperties:[String:Any] = [:],copyAudio:Bool = false) async throws {
+        let reader=try AVAssetReader(asset:asset),writer=try AVAssetWriter(outputURL:output,fileType:fileType)
         let pixels=[kCVPixelBufferPixelFormatTypeKey as String:kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange]
         let videoOutput:AVAssetReaderOutput
         if let crop {
@@ -104,22 +106,25 @@ enum MediaEngine {
             videoOutput=direct
         }
         guard reader.canAdd(videoOutput) else { throw EngineError.unsupported("비디오 디코딩 경로를 지원하지 않아요.") };reader.add(videoOutput)
-        let settings:[String:Any]=[
+        var settings:[String:Any]=[
             AVVideoCodecKey:codec == .hevc ? AVVideoCodecType.hevc:AVVideoCodecType.h264,
             AVVideoWidthKey:width,AVVideoHeightKey:height,AVVideoScalingModeKey:AVVideoScalingModeResizeAspectFill,
             AVVideoEncoderSpecificationKey:[kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder as String:true],
             AVVideoCompressionPropertiesKey:[AVVideoAverageBitRateKey:bitrate,AVVideoAllowFrameReorderingKey:false,
                 AVVideoMaxKeyFrameIntervalDurationKey:2,kVTCompressionPropertyKey_DataRateLimits as String:[Double(bitrate)/8*1.2,1]]]
+        if !colorProperties.isEmpty { settings[AVVideoColorPropertiesKey]=colorProperties }
+        guard writer.canApply(outputSettings:settings,forMediaType:.video) else { throw EngineError.unsupported("선택한 출력 설정을 지원하지 않아요.") }
         let videoInput=AVAssetWriterInput(mediaType:.video,outputSettings:settings)
+        videoInput.mediaTimeScale=try await video.load(.naturalTimeScale)
         videoInput.transform=crop == nil ? normalizedTransform(transform,width:width,height:height):.identity
         guard writer.canAdd(videoInput) else { throw EngineError.unsupported("하드웨어 비디오 인코딩을 지원하지 않아요.") };writer.add(videoInput)
         var pairs:[(AVAssetReaderOutput,AVAssetWriterInput)]=[(videoOutput,videoInput)]
         if let audio {
-            let out=AVAssetReaderTrackOutput(track:audio,outputSettings:[AVFormatIDKey:kAudioFormatLinearPCM,AVLinearPCMBitDepthKey:16,AVLinearPCMIsFloatKey:false,AVLinearPCMIsBigEndianKey:false,AVLinearPCMIsNonInterleaved:false])
+            let out=AVAssetReaderTrackOutput(track:audio,outputSettings:copyAudio ? nil : [AVFormatIDKey:kAudioFormatLinearPCM,AVLinearPCMBitDepthKey:16,AVLinearPCMIsFloatKey:false,AVLinearPCMIsBigEndianKey:false,AVLinearPCMIsNonInterleaved:false])
             out.alwaysCopiesSampleData=false
             let descriptions=try await audio.load(.formatDescriptions)
-            guard let description=descriptions.first,let stream=CMAudioFormatDescriptionGetStreamBasicDescription(description),stream.pointee.mChannelsPerFrame<=2 else { throw EngineError.unsupported("모노·스테레오 오디오만 압축해요.") }
-            let input=AVAssetWriterInput(mediaType:.audio,outputSettings:[AVFormatIDKey:kAudioFormatMPEG4AAC,AVEncoderBitRateKey:audioRate,AVSampleRateKey:stream.pointee.mSampleRate,AVNumberOfChannelsKey:stream.pointee.mChannelsPerFrame])
+            guard let description=descriptions.first,let stream=CMAudioFormatDescriptionGetStreamBasicDescription(description),copyAudio || stream.pointee.mChannelsPerFrame<=2 else { throw EngineError.unsupported("모노·스테레오 오디오만 압축해요.") }
+            let input=AVAssetWriterInput(mediaType:.audio,outputSettings:copyAudio ? nil : [AVFormatIDKey:kAudioFormatMPEG4AAC,AVEncoderBitRateKey:audioRate,AVSampleRateKey:stream.pointee.mSampleRate,AVNumberOfChannelsKey:stream.pointee.mChannelsPerFrame],sourceFormatHint:copyAudio ? description : nil)
             guard reader.canAdd(out),writer.canAdd(input) else { throw EngineError.unsupported("AAC 오디오 경로를 지원하지 않아요.") }
             reader.add(out);writer.add(input);pairs.append((out,input))
         }
@@ -143,7 +148,8 @@ enum MediaEngine {
                                 let hasSample:Bool=try autoreleasepool {
                                     guard let sample=out.copyNextSampleBuffer() else { return false }
                                     guard input.append(sample) else { throw writer.error ?? EngineError.io("비디오 샘플 쓰기 실패") }
-                                    if input.mediaType == .video { EngineProgress.report(0.05+0.8*CMSampleBufferGetPresentationTimeStamp(sample).seconds/duration.seconds) }
+                                    let time=CMSampleBufferGetOutputPresentationTimeStamp(sample).seconds
+                                    if input.mediaType == .video,time.isFinite { EngineProgress.report(0.05+0.8*time/duration.seconds) }
                                     return true
                                 }
                                 if !hasSample { input.markAsFinished();break }
@@ -161,7 +167,7 @@ enum MediaEngine {
         } catch { reader.cancelReading();writer.cancelWriting();throw error }
     }
 
-    private static func normalizedTransform(_ source:CGAffineTransform,width:Int,height:Int)->CGAffineTransform {
+    static func normalizedTransform(_ source:CGAffineTransform,width:Int,height:Int)->CGAffineTransform {
         let linear=CGAffineTransform(a:source.a,b:source.b,c:source.c,d:source.d,tx:0,ty:0)
         let bounds=CGRect(x:0,y:0,width:width,height:height).applying(linear)
         var result=linear

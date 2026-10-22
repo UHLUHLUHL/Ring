@@ -22,11 +22,22 @@ final class RingModel: ObservableObject {
     @Published private(set) var menuFolded = false
     @Published private(set) var isNavigating = false
     private var navigationTask: Task<Void, Never>?
+    enum VideoStage { case format, codec, quality }
+    @Published private(set) var videoStage = VideoStage.format
+    @Published private(set) var videoSource: VideoSourceInfo?
+    @Published private(set) var videoError: String?
+    @Published private(set) var videoContainer: VideoContainer?
+    @Published private(set) var videoCodec: VideoConversionCodec?
+    @Published private(set) var videoQuality: VideoQuality?
+    private var videoInspectionTask: Task<Void, Never>?
     var frameFormatItems: [RingAction] {
         ["PNG", "JPG", "WEBP"].map { RingAction(id: "frame-" + $0, title: $0, symbol: nil, kind: .convert($0)) }
     }
-    var convertItems: [RingAction] { choosingFrameFormat ? frameFormatItems : file.convertActions }
-    var editItems: [RingAction] { choosingFrameFormat ? convertItems : file.editActions }
+    var convertItems: [RingAction] {
+        if file.kind == .video, videoStage != .format { return videoMenuItems }
+        return choosingFrameFormat ? frameFormatItems : file.convertActions
+    }
+    var editItems: [RingAction] { isSubmenu ? convertItems : file.editActions }
 
     @Published var screen: Screen = .ring { didSet { if screen != oldValue { screenChanged(screen) } } }
     @Published var toast: String?
@@ -56,7 +67,10 @@ final class RingModel: ObservableObject {
         tabProgress = (tab == .edit) ? 1 : 0
         if file.kind == .pdf,file.selection.count>1 { tab = .edit;tabProgress = 1 }
         loadThumbnail()
+        if file.kind == .video { inspectVideo() }
     }
+
+    deinit { videoInspectionTask?.cancel(); navigationTask?.cancel() }
 
     var items: [RingAction] { tab == .convert ? convertItems : editItems }
 
@@ -66,7 +80,7 @@ final class RingModel: ObservableObject {
     }
 
     func switchTab() {
-        guard !choosingFrameFormat, !isNavigating, !file.convertActions.isEmpty, !file.editActions.isEmpty else { return }
+        guard !isSubmenu, !isNavigating, !file.convertActions.isEmpty, !file.editActions.isEmpty else { return }
         tab = (tab == .convert) ? .edit : .convert
         // Apple-style spring with a little bounce; the morph handles the slight overshoot.
         withAnimation(.spring(response: 0.5, dampingFraction: 0.74)) {
@@ -87,6 +101,7 @@ final class RingModel: ObservableObject {
     func activate(_ index: Int) {
         guard !isWorking, !isNavigating, items.indices.contains(index) else { return }
         let action = items[index]
+        if file.kind == .video, activateVideo(action) { return }
         if choosingFrameFormat, case .convert(let name) = action.kind, let format = ImageFormat(rawValue: name.lowercased()) {
             withAnimation(Self.panelTransition) { screen = .tool(.animatedImage(.frame(format))) }
             return
@@ -159,6 +174,10 @@ final class RingModel: ObservableObject {
     }
 
     func navigateFrameFormats(_ show: Bool) {
+        transitionMenu { self.choosingFrameFormat = show }
+    }
+
+    private func transitionMenu(_ update: @escaping @MainActor () -> Void) {
         guard !isNavigating, !isWorking else { return }
         isNavigating = true
         let reduced = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
@@ -170,7 +189,7 @@ final class RingModel: ObservableObject {
                 try await Task.sleep(for: .seconds(fold))
                 guard let self, self.screen == .ring else { return }
                 withAnimation(RingMotion.menuExpansion) {
-                    self.choosingFrameFormat = show
+                    update()
                     self.menuFolded = false
                 }
                 try await Task.sleep(for: .seconds(reduced ? 0.18 : 0.38))
@@ -298,7 +317,7 @@ final class RingModel: ObservableObject {
         if isCompleting { completionTask?.cancel();close();return }
         if isWorking { cancelWork();return }
         if isNavigating { return }
-        if screen == .ring, choosingFrameFormat { navigateFrameFormats(false) }
+        if screen == .ring, isSubmenu { backMenu() }
         else if screen == .ring { close() } else { backToRing() }
     }
 
@@ -311,6 +330,10 @@ final class RingModel: ObservableObject {
         // Everything else belongs to the panels' own controls once a tool is open.
         guard screen == .ring,!isWorking else { return false }
         if isNavigating { return true }
+        if file.kind == .video, event.keyCode == 36 || event.keyCode == 76,
+           event.modifierFlags.contains(.command) {
+            startVideoConversion(); return true
+        }
         switch event.keyCode {
         case 48 where event.modifierFlags.contains(.shift):
             // ⇧tab: start at the top slot, then step clockwise.
@@ -325,6 +348,7 @@ final class RingModel: ObservableObject {
             moveHover(1)
         case 36, 76: // return, enter
             if let i = hovered { activate(i) }
+            else if videoReady { startVideoConversion() }
         default:
             return false
         }
@@ -341,6 +365,134 @@ final class RingModel: ObservableObject {
                 self?.thumbnail = image ?? NSWorkspace.shared.icon(forFile: self?.file.url.path ?? "")
             }
         }
+    }
+}
+
+extension RingModel {
+    var isSubmenu: Bool { choosingFrameFormat || (file.kind == .video && videoStage != .format) }
+    var backTitle: String {
+        if file.kind == .video { return videoStage == .quality ? "코덱" : "포맷" }
+        return "뒤로"
+    }
+    func backMenu() {
+        if file.kind == .video, videoStage != .format {
+            transitionMenu { self.videoStage = self.videoStage == .quality ? .codec : .format }
+        } else { navigateFrameFormats(false) }
+    }
+    var videoMenuItems: [RingAction] {
+        switch videoStage {
+        case .format: return file.convertActions
+        case .codec:
+            return (videoContainer.flatMap { videoSource?.codecs[$0] } ?? []).map {
+                RingAction(id: "video-codec-" + $0.rawValue, title: $0.title, symbol: $0 == .passthrough ? "arrow.right.arrow.left" : nil, kind: .tool)
+            }
+        case .quality:
+            return VideoQuality.allCases.map { RingAction(id: "video-quality-" + $0.rawValue, title: $0.title, symbol: nil, kind: .tool) }
+        }
+    }
+    var highlightedIndex: Int? {
+        if let hovered { return hovered }
+        guard file.kind == .video, tab == .convert else { return nil }
+        let id: String?
+        switch videoStage {
+        case .format: id = videoContainer?.title
+        case .codec: id = videoCodec.map { "video-codec-" + $0.rawValue }
+        case .quality: id = videoQuality.map { "video-quality-" + $0.rawValue }
+        }
+        return id.flatMap { id in items.firstIndex { $0.id == id } }
+    }
+    var showsVideoHub: Bool {
+        guard file.kind == .video, tab == .convert else { return false }
+        if videoStage == .format, let action = hoveredAction, ["GIF", "WEBP"].contains(action.id) { return false }
+        return true
+    }
+    private func inspectVideo() {
+        let url = file.url
+        videoInspectionTask?.cancel()
+        videoInspectionTask = Task { [weak self] in
+            do {
+                let info = try await VideoSourceInfo.inspect(url)
+                try Task.checkCancellation()
+                self?.videoSource = info; self?.videoError = nil
+            } catch is CancellationError { }
+            catch { self?.videoSource = nil; self?.videoError = error.localizedDescription }
+        }
+    }
+    private func activateVideo(_ action: RingAction) -> Bool {
+        guard tab == .convert else { return false }
+        if videoStage == .format {
+            guard let container = VideoContainer(rawValue: action.id.lowercased()) else { return false }
+            guard let info = videoSource else { showToast(videoError ?? "영상 정보를 확인하고 있어요", closeAfter: false); return true }
+            guard !(info.codecs[container] ?? []).isEmpty else {
+                showToast(info.reencodeRestriction ?? "이 입력은 \(container.title)로 저장할 수 없어요", closeAfter: false); return true
+            }
+            transitionMenu {
+                self.videoContainer = container
+                if let codec = self.videoCodec, info.codecs[container]?.contains(codec) != true {
+                    self.videoCodec = nil; self.videoQuality = nil
+                }
+                self.videoStage = .codec
+            }
+        } else if videoStage == .codec {
+            guard let codec = VideoConversionCodec(rawValue: String(action.id.dropFirst("video-codec-".count))),
+                  let container = videoContainer, videoSource?.codecs[container]?.contains(codec) == true else { return true }
+            if codec == .passthrough {
+                withAnimation(.spring(response: 0.24, dampingFraction: 0.82)) { videoCodec = codec; hovered = nil }
+            } else {
+                transitionMenu { self.videoCodec = codec; self.videoStage = .quality }
+            }
+        } else {
+            guard let quality = VideoQuality(rawValue: String(action.id.dropFirst("video-quality-".count))) else { return true }
+            withAnimation(.spring(response: 0.24, dampingFraction: 0.82)) { videoQuality = quality; hovered = nil }
+        }
+        return true
+    }
+    var videoReady: Bool {
+        guard file.kind == .video, tab == .convert, videoStage != .format,
+              let container = videoContainer, let codec = videoCodec, let info = videoSource,
+              info.codecs[container]?.contains(codec) == true else { return false }
+        return codec == .passthrough || (videoStage == .quality && videoQuality != nil)
+    }
+    var videoPreviewOptions: VideoConversionOptions? {
+        guard let info = videoSource else { return nil }
+        var container = videoContainer ?? VideoContainer.allCases.first { !(info.codecs[$0] ?? []).isEmpty } ?? .mp4
+        var codec = videoCodec
+        var quality = videoQuality ?? .balanced
+        if let action = hoveredAction {
+            if videoStage == .format, let value = VideoContainer(rawValue: action.id.lowercased()) { container = value }
+            if videoStage == .codec { codec = VideoConversionCodec(rawValue: String(action.id.dropFirst("video-codec-".count))) }
+            if videoStage == .quality, let value = VideoQuality(rawValue: String(action.id.dropFirst("video-quality-".count))) { quality = value }
+        }
+        if codec == nil || info.codecs[container]?.contains(codec!) != true { codec = info.codecs[container]?.first }
+        guard let codec else { return nil }
+        return VideoConversionOptions(container: container, codec: codec, quality: codec == .passthrough ? nil : quality,
+            sourceBytes: info.sourceBytes, sourceModified: info.modified)
+    }
+    var videoPreviewPlan: VideoEncodingPlan? {
+        guard let info = videoSource, let options = videoPreviewOptions else { return nil }
+        return try? info.plan(options)
+    }
+    var videoIsPreview: Bool {
+        guard videoReady, let options = videoPreviewOptions else { return true }
+        return options.container != videoContainer || options.codec != videoCodec || (options.codec != .passthrough && options.quality != videoQuality)
+    }
+    var videoNotice: String {
+        if let error = videoError { return error }
+        guard let info = videoSource else { return "영상 정보를 확인하고 있어요" }
+        if let restriction = info.reencodeRestriction { return restriction }
+        var text = "원본 해상도·프레임 타이밍 유지"
+        if info.colorProperties.isEmpty { text += " · 색상 태그 없음: macOS 기본 해석" }
+        if let plan = videoPreviewPlan, info.hasAudio {
+            text += plan.copyAudio ? " · 음성 원본 유지" : " · 음성 AAC \(plan.audioBitrate / 1000)kbps"
+        }
+        return text
+    }
+    func startVideoConversion() {
+        guard videoReady, !isWorking, !isNavigating, let container = videoContainer, let codec = videoCodec,
+              let info = videoSource else { return }
+        let options = VideoConversionOptions(container: container, codec: codec, quality: codec == .passthrough ? nil : videoQuality,
+            sourceBytes: info.sourceBytes, sourceModified: info.modified)
+        run(.video(.convert(options)))
     }
 }
 

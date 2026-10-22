@@ -67,7 +67,7 @@ struct FileInfo {
         case .document:
             return ["PDF","PNG","JPG","WEBP"].map { RingAction(id:$0,title:$0,symbol:nil,kind:.convert($0)) }
         case .video:
-            return ["GIF","WEBP"].map { RingAction(id:$0,title:$0,symbol:nil,kind:.convert($0)) }
+            return ["MP4","MOV","GIF","WEBP"].map { RingAction(id:$0,title:$0,symbol:nil,kind:.convert($0)) }
         case .animatedImage:
             return [animation?.format == "WEBP"
                     ? RingAction(id: "speed", title: "재생 속도", symbol: "speedometer", kind: .tool)

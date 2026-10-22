@@ -193,12 +193,14 @@ struct AnimationOptions {
     }
 }
 enum VideoOperation {
+    case convert(VideoConversionOptions)
     /// Passthrough cuts use container/sample boundaries, not arbitrary decoded frames.
     case trim(start: Double, end: Double)
     case compress(VideoCompressionOptions)
     case animation(AnimationOptions)
     var fileExtension: String {
         switch self {
+        case .convert(let options): return options.container.rawValue
         case .trim: return "mov"
         case .compress: return "mp4"
         case .animation(let options): return options.format.rawValue

@@ -56,17 +56,30 @@ struct RingScreen: View {
             VStack(spacing: 8 * RingMetrics.scale) {
                 RingView(model: model, layer: .surface)
                 Group {
-                    if model.choosingFrameFormat || (!model.file.convertActions.isEmpty && !model.file.editActions.isEmpty) {
+                    if model.isSubmenu || (!model.file.convertActions.isEmpty && !model.file.editActions.isEmpty) {
                         TabPill(model: model)
                     }
                     if showHints {
-                        if model.choosingFrameFormat {
+                        if model.isSubmenu {
                             Text("⇧tab 선택 · return 열기 · esc 뒤로").font(.system(size: 10)).foregroundStyle(.secondary)
                         } else { ShortcutHints() }
                     }
                 }
                 .allowsHitTesting(!model.isWorking && !model.isNavigating)
                 .opacity(model.isWorking ? 0 : 1)
+                if model.showsVideoHub && !model.isWorking {
+                    VStack(spacing: 4) {
+                        Text(model.videoNotice)
+                            .font(.system(size: 10)).foregroundStyle(.secondary)
+                            .multilineTextAlignment(.center).lineLimit(3)
+                        if model.videoReady {
+                            Text("중앙 클릭 또는 ⌘↩︎로 변환 시작")
+                                .font(.system(size: 10, weight: .medium)).foregroundStyle(.secondary)
+                        }
+                    }
+                    .frame(width: RingMetrics.canvas - 12)
+                    .shadow(color: .black.opacity(0.3), radius: 2, y: 0.5)
+                }
             }
             .overlay(alignment: .top) {
                 RingView(model: model, layer: .content)
@@ -105,7 +118,7 @@ struct RingView: View {
                     .scaleEffect(g)
                     .opacity(model.isCompleting ? 0 : 1)
                     .accessibilityHidden(model.isCompleting)
-                    .allowsHitTesting(false)
+                    .allowsHitTesting(model.showsVideoHub && !model.menuFolded && !model.isNavigating && !model.isWorking)
                 if model.isWorking {
                     HubProgress(model: model)
                         .frame(width: hub, height: hub)
@@ -150,7 +163,7 @@ struct RingView: View {
         return RingWedges(progress: model.tabProgress, grow: grow * size,
                    appearance: grow, hubScale: model.menuFolded ? 1.06 : 1,
                    convert: convert, edit: edit,
-                   lifts: LiftVector((0..<max(convert.count, edit.count)).map { settled && $0 == model.hovered ? 1 : 0 }),
+                   lifts: LiftVector((0..<max(convert.count, edit.count)).map { settled && $0 == model.highlightedIndex ? 1 : 0 }),
                    side: side, labelsOnly: labelsOnly)
     }
 }
@@ -377,6 +390,13 @@ struct HubContent: View {
     private let s = RingMetrics.scale
 
     var body: some View {
+        Group {
+            if model.showsVideoHub { VideoHubContent(model: model) }
+            else { regularContent }
+        }
+    }
+
+    private var regularContent: some View {
         VStack(spacing: 2) {
             Group {
                 if let image = model.thumbnail {
@@ -470,7 +490,7 @@ struct TabPill: View {
     private var chipW: CGFloat { 84 * s }
     private var chipH: CGFloat { 30 * s }
     private let spacing: CGFloat = 3
-    private var back: Bool { model.choosingFrameFormat }
+    private var back: Bool { model.isSubmenu }
     private var trackW: CGFloat { back ? chipW : chipW * 2 + spacing }
 
     // The knob's two ends move on separate springs: the leading end sets off first and the
@@ -497,8 +517,8 @@ struct TabPill: View {
             .animation(.easeInOut(duration: 0.08).delay(back ? 0 : 0.08), value: back)
             .allowsHitTesting(!back)
             .accessibilityHidden(back)
-            Button { model.navigateFrameFormats(false) } label: {
-                Label("뒤로", systemImage: "chevron.left")
+            Button { model.backMenu() } label: {
+                Label(model.backTitle, systemImage: "chevron.left")
                     .font(.system(size: max(10.5, 13 * s), weight: .medium))
                     .foregroundStyle(Color.black.opacity(0.85))
                     .frame(width: chipW, height: chipH)

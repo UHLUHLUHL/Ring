@@ -13,7 +13,7 @@ import Foundation
         }
         for ext in ["mp4","mov","m4v"] {
             let f=FileInfo(url:URL(fileURLWithPath:"/tmp/Ring.\(ext)"))
-            try require(f.kind == .video && f.convertActions.map(\.title)==["GIF","WEBP"] && f.editActions.map(\.id)==["trim","compress"],"video routing \(ext)")
+            try require(f.kind == .video && f.convertActions.map(\.title)==["MP4","MOV","GIF","WEBP"] && f.editActions.map(\.id)==["trim","compress"],"video routing \(ext)")
         }
         for ext in ["png","jpg","webp","heic","avif","pdf"] {
             let f=FileInfo(url:URL(fileURLWithPath:"/tmp/Ring.\(ext)"))

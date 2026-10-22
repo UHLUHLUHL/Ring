@@ -4,13 +4,17 @@ import AVFoundation
 /// Deterministic local inputs shared by the VFR checks and resource benchmark.
 enum MediaFixture {
     static func write(_ url: URL, codec: AVVideoCodecType = .h264, width: Int = 320, height: Int = 180,
-                      times: [Double], duration: Double) async throws {
+                      times: [Double], duration: Double, transform: CGAffineTransform = .identity,
+                      colorProperties: [String: Any] = [:]) async throws {
         let writer = try AVAssetWriter(outputURL: url, fileType: url.pathExtension == "mov" ? .mov : .mp4)
         var settings: [String: Any] = [AVVideoCodecKey: codec, AVVideoWidthKey: width, AVVideoHeightKey: height]
         if codec == .h264 || codec == .hevc {
             settings[AVVideoCompressionPropertiesKey] = [AVVideoAverageBitRateKey: width * height * 6]
         }
+        if !colorProperties.isEmpty { settings[AVVideoColorPropertiesKey] = colorProperties }
         let input = AVAssetWriterInput(mediaType: .video, outputSettings: settings)
+        input.transform = transform
+        input.mediaTimeScale = 60000
         let adaptor = AVAssetWriterInputPixelBufferAdaptor(assetWriterInput: input, sourcePixelBufferAttributes: [
             kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
             kCVPixelBufferWidthKey as String: width, kCVPixelBufferHeightKey as String: height])
