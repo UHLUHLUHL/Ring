@@ -106,12 +106,6 @@ struct RingView: View {
                     .opacity(model.isCompleting ? 0 : 1)
                     .accessibilityHidden(model.isCompleting)
                     .allowsHitTesting(false)
-                // Hit-testable veil over the glass (see hitTestableGlass): without it every click on
-                // a wedge went through to Finder behind the ring.
-                Circle()
-                    .fill(Color.white.opacity(0.01))
-                    .frame(width: (model.isWorking ? RingMetrics.hubDiameter : RingMetrics.outer * 2) * g,
-                           height: (model.isWorking ? RingMetrics.hubDiameter : RingMetrics.outer * 2) * g)
                 if model.isWorking {
                     HubProgress(model: model)
                         .frame(width: hub, height: hub)
@@ -238,12 +232,12 @@ struct RingWedges: View, Animatable {
 
     var body: some View {
         let wedges = (0..<slotCount).map(wedge)
+        let all = SectorSet(sectors: wedges.map { ($0.start, $0.end, $0.outer, shift($0)) }, grow: grow, hubRadius: hubRadius)
         // Every wedge stays in the ONE glass shape, the selected one just shifted outward by its
         // lift. Selecting used to move a wedge into a separate glass view, which cannot animate
         // (it appears and disappears), so the selection jumped from wedge to wedge.
         ZStack {
             if !labelsOnly {
-                let all = SectorSet(sectors: wedges.map { ($0.start, $0.end, $0.outer, shift($0)) }, grow: grow, hubRadius: hubRadius)
                 let exposed = smooth((RingMetrics.outer * grow - hubRadius) / (RingMetrics.outer - RingMetrics.hubDiameter / 2))
                 Circle()
                     .fill(.black.opacity(0.18 * Double(exposed)))
@@ -269,13 +263,18 @@ struct RingWedges: View, Animatable {
                     .frame(width: side, height: side)
                     .glassEffect(RingMetrics.glass.interactive(), in: all)
             } else {
+                // Native transparent panels need painted pixels to receive clicks.
+                // Follow the animated glass outline, never a full-size disc that
+                // remains visible on dark backgrounds after the ring is absorbed.
+                all.fill(Color.white.opacity(0.01))
+                    .frame(width: side, height: side)
                 ForEach(wedges, id: \.index) { w in
                     labels(w)
                 }
             }
         }
         .frame(width: side, height: side)
-        .allowsHitTesting(false)
+        .allowsHitTesting(labelsOnly)
     }
 
     @ViewBuilder private func labels(_ w: Wedge) -> some View {
@@ -495,7 +494,7 @@ struct TabPill: View {
                 chip("편집", .edit)
             }
             .opacity(back ? 0 : 1)
-            .animation(.easeInOut(duration: 0.10).delay(back ? 0 : 0.12), value: back)
+            .animation(.easeInOut(duration: 0.08).delay(back ? 0 : 0.08), value: back)
             .allowsHitTesting(!back)
             .accessibilityHidden(back)
             Button { model.navigateFrameFormats(false) } label: {
@@ -507,7 +506,7 @@ struct TabPill: View {
             }
             .buttonStyle(.plain).focusEffectDisabled()
             .opacity(back ? 1 : 0)
-            .animation(.easeInOut(duration: 0.10).delay(back ? 0.12 : 0), value: back)
+            .animation(.easeInOut(duration: 0.08).delay(back ? 0.08 : 0), value: back)
             .allowsHitTesting(back)
             .accessibilityHidden(!back)
             .accessibilityIdentifier("ring.back")
@@ -533,8 +532,7 @@ struct TabPill: View {
         }
         .onChange(of: back) { _, _ in
             let (l, r) = edges(for: model.tab)
-            withAnimation(.spring(response: NSWorkspace.shared.accessibilityDisplayShouldReduceMotion ? 0.22 : 0.56,
-                                  dampingFraction: 0.82)) {
+            withAnimation(RingMotion.menuExpansion) {
                 leftEdge = l; rightEdge = r
             }
         }
