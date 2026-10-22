@@ -70,7 +70,7 @@ private struct SizeFields:View {
         HStack {
             TextField("예: 1.5",text:$value).textFieldStyle(.roundedBorder).accessibilityLabel("목표 용량")
             Picker("단위",selection:$unit) { Text("KB").tag(Int64(1000));Text("MB").tag(Int64(1_000_000)) }
-                .labelsHidden().frame(width:80).accessibilityLabel("용량 단위")
+                .labelsHidden().frame(width:80,alignment:.leading).accessibilityLabel("용량 단위")
         }
     }
 }

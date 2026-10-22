@@ -277,7 +277,7 @@ struct CropRatioControls: View {
             Picker("비율", selection: $ratio) {
                 ForEach(VideoCropRatio.allCases, id: \.self) { Text($0.label(portrait: portrait)).tag($0) }
             }
-            .labelsHidden().frame(width: 110).accessibilityIdentifier("crop.ratio")
+            .labelsHidden().frame(width: 110, alignment: .leading).accessibilityIdentifier("crop.ratio")
             if !ratio.isSquare && ratio != .free {
                 ForEach([false, true], id: \.self) { value in
                     Button { portrait = value } label: { Image(systemName: value ? "rectangle.portrait" : "rectangle") }
