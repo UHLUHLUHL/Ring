@@ -22,11 +22,10 @@ final class RingModel: ObservableObject {
     @Published private(set) var menuFolded = false
     @Published private(set) var isNavigating = false
     private var navigationTask: Task<Void, Never>?
-    var convertItems: [RingAction] {
-        choosingFrameFormat ? ["PNG", "JPG", "WEBP"].map {
-            RingAction(id: "frame-" + $0, title: $0, symbol: nil, kind: .convert($0))
-        } : file.convertActions
+    var frameFormatItems: [RingAction] {
+        ["PNG", "JPG", "WEBP"].map { RingAction(id: "frame-" + $0, title: $0, symbol: nil, kind: .convert($0)) }
     }
+    var convertItems: [RingAction] { choosingFrameFormat ? frameFormatItems : file.convertActions }
     var editItems: [RingAction] { choosingFrameFormat ? convertItems : file.editActions }
 
     @Published var screen: Screen = .ring { didSet { if screen != oldValue { screenChanged(screen) } } }

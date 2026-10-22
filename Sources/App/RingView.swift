@@ -57,6 +57,11 @@ struct RingScreen: View {
                 VStack(spacing: 8 * RingMetrics.scale) {
                     ZStack {
                         RingView(model: model, layer: .surface)
+                        // Keep both menu surfaces warm. The inactive ring sits
+                        // inside the hub, rather than being created on selection.
+                        if model.file.kind == .animatedImage {
+                            RingView(model: model, layer: .formats)
+                        }
                         RingView(model: model, layer: .hub)
                     }
                     Group {
@@ -96,7 +101,7 @@ struct RingScreen: View {
 }
 
 struct RingView: View {
-    enum Layer { case surface, hub, content }
+    enum Layer { case surface, formats, hub, content }
     @ObservedObject var model: RingModel
     let layer: Layer
 
@@ -123,6 +128,8 @@ struct RingView: View {
                     .blur(radius: 22)
                     .allowsHitTesting(false)
                 // While a job runs the wedges fold into the hub and fade; only the hub stays.
+                wedges(grow: g, settled: settled, labelsOnly: false)
+            } else if layer == .formats {
                 wedges(grow: g, settled: settled, labelsOnly: false)
             } else if layer == .hub {
                 FrostLayer()
@@ -184,9 +191,14 @@ struct RingView: View {
     }
 
     private func wedges(grow: CGFloat, settled: Bool, labelsOnly: Bool) -> RingWedges {
-        RingWedges(progress: model.tabProgress, grow: grow * (model.menuFolded ? 0.25 : model.isWorking ? 0.62 : 1),
-                   convert: model.convertItems, edit: model.editItems,
-                   lifts: LiftVector((0..<max(model.convertItems.count, model.editItems.count)).map { settled && $0 == model.hovered ? 1 : 0 }),
+        let formats = layer == .formats
+        let convert = labelsOnly ? model.convertItems : formats ? model.frameFormatItems : model.file.convertActions
+        let edit = labelsOnly ? model.editItems : formats ? model.frameFormatItems : model.file.editActions
+        let active = labelsOnly || formats == model.choosingFrameFormat
+        let size: CGFloat = model.menuFolded || !active ? 0.25 : model.isWorking ? 0.62 : 1
+        return RingWedges(progress: model.tabProgress, grow: grow * size,
+                   convert: convert, edit: edit,
+                   lifts: LiftVector((0..<max(convert.count, edit.count)).map { active && settled && $0 == model.hovered ? 1 : 0 }),
                    side: side, labelsOnly: labelsOnly)
     }
 }
@@ -275,7 +287,7 @@ struct RingWedges: View, Animatable {
                 Color.clear
                     .frame(width: side, height: side)
                     .glassEffect(RingMetrics.glass.interactive(), in: all)
-                    .id(slotCount) // Invalidate the glass path when the menu topology changes.
+
             } else {
                 ForEach(wedges, id: \.index) { w in
                     labels(w)
@@ -475,7 +487,7 @@ struct BackPill: View {
             Label("뒤로", systemImage: "chevron.left")
                 .font(.system(size: max(10.5, 13 * RingMetrics.scale), weight: .medium))
                 .foregroundStyle(Color.black.opacity(0.85))
-                .frame(width: 168 * RingMetrics.scale + 3, height: 30 * RingMetrics.scale)
+                .frame(width: 84 * RingMetrics.scale, height: 30 * RingMetrics.scale)
                 .background(.white.opacity(0.92), in: Capsule())
                 .padding(3)
                 .glassEffect(.regular.interactive(), in: Capsule())
