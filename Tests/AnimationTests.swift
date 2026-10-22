@@ -8,8 +8,8 @@ import CryptoKit
     static func require(_ condition: Bool, _ message: String) throws {
         if !condition { throw EngineError.quality("TEST: " + message) }
     }
-    static func fixture(_ root: URL, name: String, kind: Int, rate: CMTime = CMTime(value: 1, timescale: 30), rotated: Bool = false, offset: CMTime = .zero) async throws -> URL {
-        let url = root.appendingPathComponent(name + ".mp4"), w = 320, h = 180
+    static func fixture(_ root: URL, name: String, kind: Int, rate: CMTime = CMTime(value: 1, timescale: 30), rotated: Bool = false, offset: CMTime = .zero, width:Int = 320, height:Int = 180) async throws -> URL {
+        let url = root.appendingPathComponent(name + ".mp4"), w = width, h = height
         let writer = try AVAssetWriter(outputURL: url, fileType: .mp4)
         let input = AVAssetWriterInput(mediaType: .video, outputSettings: [AVVideoCodecKey: AVVideoCodecType.h264, AVVideoWidthKey: w, AVVideoHeightKey: h, AVVideoCompressionPropertiesKey: [AVVideoAverageBitRateKey: 2_000_000]])
         if rotated { input.transform = CGAffineTransform(a: 0, b: 1, c: -1, d: 0, tx: CGFloat(h), ty: 0) }
@@ -89,6 +89,17 @@ import CryptoKit
             try timing()
             let root = URL(fileURLWithPath: ".work/animation-tests-" + UUID().uuidString, isDirectory: true)
             try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+            if CommandLine.arguments.contains("--dimensions") {
+                let source = try await fixture(root,name:"wide",kind:0,width:2048,height:64)
+                for format in [AnimationFormat.webp,.gif] {
+                    for limit in [2048,1024] {
+                        let result = try await RingEngine.shared.run(.init(source:source,operation:.video(.animation(.init(format:format,fps:30,maxDimension:limit,duration:0.1)))))
+                        try inspect(result.url,expectedDuration:AnimationPlan(duration:0.1,fps:30,format:format).duration,width:limit,height:limit/32)
+                        print("PASS original/downscaled dimensions",format.rawValue,limit)
+                    }
+                }
+                return
+            }
             let moving = try await fixture(root, name: "moving", kind: 0)
             let still = try await fixture(root, name: "still", kind: 1)
             let subtle = try await fixture(root, name: "subtle", kind: 2)

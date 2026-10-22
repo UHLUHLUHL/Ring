@@ -11,4 +11,4 @@ xcrun swiftc -swift-version 5 -O -parse-as-library -target "$ARCH-apple-macos26.
   -import-objc-header Sources/Engine/CodecBridge.h -module-cache-path .work/module-cache \
   -Xlinker -dead_strip Sources/Engine/*.swift Tests/AnimationTests.swift \
   ".work/CodecBridge-animation-$ARCH.o" "${ENGINE_LIBS[@]}" -o ".work/animation-tests-$ARCH"
-/usr/bin/arch -"$ARCH" ".work/animation-tests-$ARCH"
+/usr/bin/arch -"$ARCH" ".work/animation-tests-$ARCH" "$@"

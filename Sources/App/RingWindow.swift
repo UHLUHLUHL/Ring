@@ -27,6 +27,7 @@ final class RingPanel: NSPanel {
     /// to move focus between buttons instead of switching 변환/편집.
     var keyHandler: ((NSEvent) -> Bool)?
     var canDragAt: ((NSPoint) -> Bool)?
+    weak var titleDragView:NSView?
     private var dragStart: (mouse: NSPoint, origin: NSPoint)?
 
     override func constrainFrameRect(_ frameRect: NSRect, to screen: NSScreen?) -> NSRect {
@@ -157,7 +158,12 @@ final class RingWindowController {
         // esc key press never arrived (see EscapeHotKey).
         panel.keyHandler = { [weak self] event in self?.model.handleKey(event) ?? false }
         panel.canDragAt = { [weak self] point in
-            guard let self,self.model.screen == .ring,!self.model.isNavigating,!self.model.isCompleting else { return false }
+            guard let self,!self.model.isNavigating,!self.model.isCompleting else { return false }
+            if self.model.screen != .ring {
+                guard let title=self.panel.titleDragView else { return false }
+                let rect=title.convert(title.bounds,to:nil)
+                return rect.insetBy(dx:0,dy:-8).contains(point) && point.x>rect.minX+44
+            }
             let dx=point.x-self.panel.frame.width/2
             let dy=point.y-(self.panel.frame.height-RingWindowLayout.ringCenterY)
             return dx*dx+dy*dy<=RingWindowLayout.dragRadius*RingWindowLayout.dragRadius

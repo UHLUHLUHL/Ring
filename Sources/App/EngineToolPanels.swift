@@ -442,7 +442,6 @@ private struct VideoToolPanel:View {
     @State private var codec="HEVC"
     @State private var fps=""
     @State private var sourceFPS: Double?
-    @State private var dimension="640"
     @State private var compressionDimension=""
     @State private var compressionWidth=""
     @State private var compressionHeight=""
@@ -627,31 +626,7 @@ private struct VideoToolPanel:View {
                 PanelRow(label:"목표") { SizeFields(value:$size,unit:$unit) }
                 Text("비워두면 화질을 우선해 자동 압축해요. 입력하면 상한 안에서 화질을 높여요.")
                     .font(.system(size:11)).foregroundStyle(.secondary)
-                PanelRow(label:"가로") {
-                    HStack(spacing:8) {
-                        TextField("원본",text:compressionBinding(horizontal:true)).textFieldStyle(.roundedBorder)
-                            .frame(width:72).accessibilityLabel("비디오 가로").accessibilityIdentifier("video.width")
-                        Text("px")
-                        Spacer(minLength:4)
-                        Button("원본") { compressionDimension="";refreshCompressionDimensions() }
-                            .buttonStyle(.glass).tint(compressionDimension.isEmpty ? .accentColor:nil)
-                            .accessibilityIdentifier("video.dimensions.original")
-                        ForEach([1280,1920,3840].filter { $0<=compressionBase.width },id:\.self) { width in
-                            Button(String(width)) { updateCompressionDimension(String(width),horizontal:true) }
-                                .buttonStyle(.glass).tint(Int(compressionWidth)==width ? .accentColor:nil)
-                                .accessibilityIdentifier("video.width.\(width)")
-                        }
-                    }
-                }
-                PanelRow(label:"세로") {
-                    HStack(spacing:8) {
-                        TextField("원본",text:compressionBinding(horizontal:false)).textFieldStyle(.roundedBorder)
-                            .frame(width:72).accessibilityLabel("비디오 세로").accessibilityIdentifier("video.height")
-                        Text("px")
-                        Spacer(minLength:4)
-                        Text("비율 유지").font(.system(size:11)).foregroundStyle(.secondary)
-                    }
-                }
+                dimensionControls
                 Text("영상만 재압축해요. 목표가 작을수록 화질이 낮아질 수 있어요.")
                     .font(.system(size:11)).foregroundStyle(.secondary)
                 PanelRow(label:"코덱") { Picker("코덱",selection:$codec) { Text("HEVC · 고효율/작은 용량").tag("HEVC");Text("H.264 · 범용 호환성").tag("H264") }.labelsHidden() }
@@ -687,16 +662,7 @@ private struct VideoToolPanel:View {
                     Text("60fps GIF는 일부 뷰어에서 느리게 재생될 수 있어요. 일정한 재생 속도에는 WebP를 권장해요.")
                         .font(.system(size:11)).foregroundStyle(.secondary).fixedSize(horizontal:false,vertical:true)
                 }
-                PanelRow(label:"긴 변") {
-                    HStack(spacing:8) {
-                        TextField("640",text:$dimension).textFieldStyle(.roundedBorder)
-                            .frame(width:72).accessibilityLabel("애니메이션 긴 변")
-                            .accessibilityIdentifier("animation.maxDimension")
-                        Text("px")
-                        Spacer(minLength:4)
-                        DimensionPresets(text:$dimension,values:[480,720,1080],automatic:false,prefix:"animation")
-                    }
-                }
+                dimensionControls
                 ResolutionNote(text:animationResolution)
                 Toggle("목표 용량 지정",isOn:$target)
                 if target { PanelRow(label:"용량") { SizeFields(value:$size,unit:$unit) } }
@@ -711,6 +677,7 @@ private struct VideoToolPanel:View {
                 sourceSize=CGSize(width:abs(shown.width),height:abs(shown.height))
                 // Like Photos, presets start in the frame's own orientation.
                 cropPortrait=abs(shown.height)>abs(shown.width)
+                if isAnimation { compressionDimension="640" }
                 refreshCompressionDimensions()
             }
             let total = d.seconds
@@ -749,15 +716,57 @@ private struct VideoToolPanel:View {
         }
     }
 
+    private var dimensionControls:some View {
+        VStack(spacing:14) {
+                PanelRow(label:"가로") {
+                    HStack(spacing:8) {
+                        TextField("원본",text:compressionBinding(horizontal:true)).textFieldStyle(.roundedBorder)
+                            .frame(width:72).accessibilityLabel("비디오 가로").accessibilityIdentifier("video.width")
+                        Text("px")
+                        Spacer(minLength:4)
+                        Button("원본") { compressionDimension="";refreshCompressionDimensions() }
+                            .buttonStyle(.glass).tint(compressionDimension.isEmpty ? .accentColor:nil)
+                            .accessibilityIdentifier("video.dimensions.original")
+                        ForEach([1280,1920,3840].filter { $0<=compressionBase.width },id:\.self) { width in
+                            Button(String(width)) { updateCompressionDimension(String(width),horizontal:true) }
+                                .buttonStyle(.glass).tint(Int(compressionWidth)==width ? .accentColor:nil)
+                                .accessibilityIdentifier("video.width.\(width)")
+                        }
+                    }
+                }
+                PanelRow(label:"세로") {
+                    HStack(spacing:8) {
+                        TextField("원본",text:compressionBinding(horizontal:false)).textFieldStyle(.roundedBorder)
+                            .frame(width:72).accessibilityLabel("비디오 세로").accessibilityIdentifier("video.height")
+                        Text("px")
+                        Spacer(minLength:4)
+                        Text("비율 유지").font(.system(size:11)).foregroundStyle(.secondary)
+                    }
+                }
+        }
+    }
+    private var isAnimation:Bool { if case .animation = tool { return true };return false }
+    private func outputDimensions(_ limit:Int?) -> (width:Int,height:Int) {
+        guard let sourceSize else { return (0,0) }
+        if isAnimation {
+            let raw=VideoCropGeometry.cropSize(width:sourceSize.width,height:sourceSize.height,crop:videoCrop)
+            let maximum=min(Int(ceil(max(raw.width,raw.height))),animationFormatLimit)
+            return VideoCropGeometry.animationSize(width:sourceSize.width,height:sourceSize.height,crop:videoCrop,maxDimension:limit ?? maximum)
+        }
+        return VideoCropGeometry.compressedSize(width:sourceSize.width,height:sourceSize.height,crop:videoCrop,maxDimension:limit)
+    }
+    private var animationFormatLimit:Int {
+        if case .animation(.webp) = tool { return 16383 };return 65535
+    }
+
     /// Same geometry as the engine, so the shown size is what gets written.
     private var animationResolution:String? {
-        guard let sourceSize,let limit=Int(dimension.trimmingCharacters(in:.whitespaces)),(16...1920).contains(limit) else { return nil }
-        let size=VideoCropGeometry.animationSize(width:sourceSize.width,height:sourceSize.height,crop:videoCrop,maxDimension:limit)
+        guard sourceSize != nil else { return nil }
+        let size=outputDimensions(Int(compressionDimension))
         return "결과 \(size.width)×\(size.height)" + (target ? " · 목표 용량을 넘으면 줄어들어요":"")
     }
     private var compressionBase:(width:Int,height:Int) {
-        guard let sourceSize else { return (0,0) }
-        return VideoCropGeometry.compressedSize(width:sourceSize.width,height:sourceSize.height,crop:videoCrop,maxDimension:nil)
+        outputDimensions(nil)
     }
     private func compressionBinding(horizontal:Bool) -> Binding<String> {
         Binding(get:{ horizontal ? compressionWidth:compressionHeight },set:{ updateCompressionDimension($0,horizontal:horizontal) })
@@ -776,14 +785,15 @@ private struct VideoToolPanel:View {
         // shorter axis still reaches the requested even width/height exactly.
         let raw=VideoCropGeometry.cropSize(width:sourceSize.width,height:sourceSize.height,crop:videoCrop)
         let axis=horizontal ? raw.width:raw.height
-        let limit=Int(ceil(Double(value)*Double(max(raw.width,raw.height))/Double(axis)/2))*2
+        let alignment=isAnimation ? 1.0:2.0
+        let limit=Int(ceil(Double(value)*Double(max(raw.width,raw.height))/Double(axis)/alignment))*Int(alignment)
         compressionDimension=value==maximum ? "":String(limit)
-        let result=VideoCropGeometry.compressedSize(width:sourceSize.width,height:sourceSize.height,crop:videoCrop,maxDimension:Int(compressionDimension))
+        let result=outputDimensions(Int(compressionDimension))
         if horizontal { compressionHeight=String(result.height) } else { compressionWidth=String(result.width) }
     }
     private func refreshCompressionDimensions() {
         guard let sourceSize else { return }
-        let result=VideoCropGeometry.compressedSize(width:sourceSize.width,height:sourceSize.height,crop:videoCrop,maxDimension:Int(compressionDimension))
+        let result=outputDimensions(Int(compressionDimension))
         compressionWidth=String(result.width);compressionHeight=String(result.height)
     }
 
@@ -807,7 +817,11 @@ private struct VideoToolPanel:View {
         guard to > from, to <= duration + 0.001 else { throw EngineError.invalid("종료는 시작보다 늦고 영상 길이 이내여야 해요.") }
         if case .trim=tool { return .video(.trim(start:from,end:min(duration,to))) }
         if case .animation(let format)=tool {
-            let frames=try ToolSettings.number(fps,name:"FPS",range:1...AnimationOptions.maximumFPS),limit=try ToolSettings.integer(dimension,name:"긴 변",range:16...1920)
+            let base=compressionBase
+            _ = try ToolSettings.integer(compressionWidth,name:"가로",range:2...max(2,base.width))
+            _ = try ToolSettings.integer(compressionHeight,name:"세로",range:2...max(2,base.height))
+            let frames=try ToolSettings.number(fps,name:"FPS",range:1...AnimationOptions.maximumFPS)
+            let limit=Int(compressionDimension) ?? max(base.width,base.height)
             guard (to-from)*frames<=Double(AnimationOptions.maximumFrames) else { throw EngineError.invalid("선택 구간은 최대 1,800프레임이어야 해요. 구간이나 FPS를 줄여 주세요.") }
             return .video(.animation(.init(format:format,fps:frames,maxDimension:limit,targetBytes:target ? try ToolSettings.bytes(size,unit:unit):nil,start:from,duration:min(duration,to)-from,crop:videoCrop)))
         }

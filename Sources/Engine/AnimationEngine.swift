@@ -19,7 +19,7 @@ extension MediaEngine {
         guard options.start.isFinite, duration.isFinite, options.start >= 0, duration > 0,
               options.start + duration <= assetDuration.seconds + 0.001,
               options.fps.isFinite, (1...AnimationOptions.maximumFPS).contains(options.fps),
-              (16...1920).contains(options.maxDimension), duration * options.fps <= Double(AnimationOptions.maximumFrames),
+              (2...(options.format == .webp ? 16383:65535)).contains(options.maxDimension), duration * options.fps <= Double(AnimationOptions.maximumFrames),
               options.targetBytes == nil || options.targetBytes! > 0 else {
             throw EngineError.invalid("애니메이션 시간·FPS·크기 오류 (최대 60fps·1,800프레임)")
         }

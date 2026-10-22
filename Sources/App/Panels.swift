@@ -30,6 +30,7 @@ struct GlassPanel<Content: View>: View {
                         .frame(maxWidth: 150, alignment: .trailing)
                 }
             }
+            .background(PanelTitleDragRegion())
             content
         }
         .padding(20)
@@ -37,6 +38,18 @@ struct GlassPanel<Content: View>: View {
         .glassEffect(.regular, in: RoundedRectangle(cornerRadius: 30, style: .continuous))
         .hitTestableGlass(RoundedRectangle(cornerRadius: 30, style: .continuous))
     }
+}
+
+private struct PanelTitleDragRegion:NSViewRepresentable {
+    final class Region:NSView {
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            (window as? RingPanel)?.titleDragView=self
+        }
+        override func hitTest(_ point:NSPoint)->NSView? { nil }
+    }
+    func makeNSView(context:Context)->Region { Region() }
+    func updateNSView(_ nsView:Region,context:Context) {}
 }
 
 struct FieldLabel: View {
