@@ -2,7 +2,7 @@ import AppKit
 import SwiftUI
 import Combine
 
-enum AnimatedImageTool: Hashable { case webp, crop, resize, frame }
+enum AnimatedImageTool: Hashable { case webp, crop, resize, speed, frame(ImageFormat) }
 
 private actor AnimationPreviewSource {
     let url: URL
@@ -28,6 +28,7 @@ private final class AnimatedImagePlayback: ObservableObject {
     private var loadTask: Task<Void, Never>?
     private var playTask: Task<Void, Never>?
     private var request = UUID()
+    var rate = 1.0
 
     init(url: URL, info: AnimatedImageInfo) { source = AnimationPreviewSource(url: url); self.info = info }
     deinit { loadTask?.cancel(); playTask?.cancel() }
@@ -63,14 +64,14 @@ private final class AnimatedImagePlayback: ObservableObject {
                     if next == 0 {
                         completedPlays += 1
                         if info.loopCount > 0 && completedPlays >= info.loopCount {
-                            try await Task.sleep(for: .milliseconds(info.durationsMS[current]))
+                            try await Task.sleep(for: .seconds(Double(info.durationsMS[current]) / 1000 / self.rate))
                             self.playing = false
                             return
                         }
                     }
                     let started = ProcessInfo.processInfo.systemUptime
                     let cg = try await source.frame(next)
-                    let wait = Double(info.durationsMS[current]) / 1000 - (ProcessInfo.processInfo.systemUptime - started)
+                    let wait = Double(info.durationsMS[current]) / 1000 / self.rate - (ProcessInfo.processInfo.systemUptime - started)
                     if wait > 0 { try await Task.sleep(for: .seconds(wait)) }
                     try Task.checkCancellation()
                     self.index = next; self.image = NSImage(cgImage: cg, size: .zero)
@@ -94,6 +95,8 @@ struct AnimatedImagePanel: View {
     @State private var height: String
     @State private var locked = true
     @State private var validation: String?
+    @State private var rate = 1.5
+    private var frameFormat: ImageFormat? { if case .frame(let format) = tool { return format }; return nil }
 
     init(model: RingModel, tool: AnimatedImageTool) {
         self.model = model; self.tool = tool
@@ -111,7 +114,8 @@ struct AnimatedImagePanel: View {
         case .webp: return "움짤 WebP 변환"
         case .crop: return "움짤 자르기"
         case .resize: return "움짤 크기 조절"
-        case .frame: return "한 장 저장"
+        case .frame(let format): return "한 장 저장 · \(format.rawValue.uppercased())"
+        case .speed: return "움짤 재생 속도"
         }
     }
     private var previewSize: CGSize {
@@ -148,6 +152,17 @@ struct AnimatedImagePanel: View {
                     .onChange(of: portrait) { _, _ in applyAspect() }
                 }
                 if tool == .resize { resizeFields }
+                if tool == .speed {
+                    PanelRow(label: "속도") {
+                        Picker("재생 속도", selection: $rate) {
+                            ForEach([0.25, 0.5, 1.0, 1.5, 2.0, 4.0], id: \.self) { value in
+                                Text("\(value.formatted())×").tag(value)
+                            }
+                        }.labelsHidden().accessibilityIdentifier("animation.speed")
+                    }
+                    Text(String(format: "%.2f초 → %.2f초 · 모든 프레임 유지", info.duration, info.duration / rate))
+                        .font(.system(size: 11)).foregroundStyle(.secondary)
+                }
                 outputDescription
                 if let message = validation ?? playback.error ?? info.editingIssue {
                     Text(message).font(.system(size: 12)).foregroundStyle(.red)
@@ -157,14 +172,15 @@ struct AnimatedImagePanel: View {
                 HStack(spacing: 8) {
                     Spacer()
                     Button("취소", action: back).buttonStyle(.glass)
-                    Button(tool == .frame ? "PNG 한 장 저장" : "WEBP로 저장", action: save)
+                    Button(frameFormat.map { "\($0.rawValue.uppercased()) 한 장 저장" } ?? "WEBP로 저장", action: save)
                         .buttonStyle(.glassProminent).keyboardShortcut(.defaultAction)
                         .disabled(playback.image == nil || playback.error != nil || info.editingIssue != nil || model.isWorking)
                         .accessibilityIdentifier("animation.save")
                 }
             }
         }
-        .onAppear { playback.seek(0) }
+        .onAppear { playback.rate = tool == .speed ? rate : 1; playback.seek(0) }
+        .onChange(of: rate) { _, value in playback.pause(); playback.rate = value }
         .onDisappear { playback.stop() }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didResignActiveNotification)) { _ in playback.pause() }
     }
@@ -197,7 +213,7 @@ struct AnimatedImagePanel: View {
             }
         }
         .frame(width: size.width, height: size.height)
-        .clipShape(RoundedRectangle(cornerRadius: 14))
+        .clipShape(RoundedRectangle(cornerRadius: tool == .crop ? 0 : 14))
         .accessibilityLabel("움짤 미리보기")
     }
 
@@ -210,7 +226,7 @@ struct AnimatedImagePanel: View {
                 .buttonStyle(.glass).accessibilityLabel(playback.playing ? "미리보기 일시 정지" : "움짤 미리보기 재생")
                 .accessibilityIdentifier("animation.play").disabled(playback.image == nil || playback.error != nil)
                 Slider(value: Binding(get: { Double(playback.index) }, set: { playback.seek(Int($0)) }),
-                       in: 0...Double(info.frameCount - 1), step: 1)
+                       in: 0...Double(info.frameCount - 1))
                     .accessibilityLabel("프레임 선택").accessibilityIdentifier("animation.timeline")
                 Text(String(format: "%.2f / %.2f초", info.time(at: playback.index), info.duration))
                     .font(.system(size: 11)).monospacedDigit().foregroundStyle(.secondary).frame(minWidth: 96, alignment: .trailing)
@@ -242,8 +258,8 @@ struct AnimatedImagePanel: View {
 
     private var outputDescription: some View {
         VStack(alignment: .leading, spacing: 5) {
-            Label(tool == .frame ? "PNG · 선택한 한 장" : "WEBP · 움직임 유지",
-                  systemImage: tool == .frame ? "photo" : "play.rectangle")
+            Label(frameFormat.map { "\($0.rawValue.uppercased()) · 선택한 한 장" } ?? "WEBP · 움직임 유지",
+                  systemImage: frameFormat != nil ? "photo" : "play.rectangle")
                 .font(.system(size: 12, weight: .semibold))
             Text(explanation).font(.system(size: 11.5)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
         }
@@ -251,7 +267,11 @@ struct AnimatedImagePanel: View {
         .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 12))
     }
     private var explanation: String {
-        if tool == .frame { return "선택한 프레임만 무손실 PNG로 저장해요. 원본 움짤은 그대로 남아요." }
+        if let format = frameFormat {
+            return format == .jpg ? "선택한 프레임을 최고 품질 JPG로 저장해요. 투명한 영역은 흰색으로 저장돼요."
+                : "선택한 프레임만 무손실 \(format.rawValue.uppercased())로 저장해요. 원본 움짤은 그대로 남아요."
+        }
+        if tool == .speed { return "프레임을 빼지 않고 재생 시간만 바꿔요. 무손실 WebP로 저장하며 반복·투명도·화질을 유지해요." }
         if tool == .webp && info.format == "WEBP" { return "이미 WebP예요. 원본 움직임과 화질을 그대로 복사해 새 파일로 저장해요." }
         if tool == .webp && info.format == "GIF" { return "GIF의 원본 화질을 유지해 무손실 WebP로 저장해요. 이미 사라진 색·디테일이 복원되지는 않으며, 용량은 달라질 수 있어요." }
         let action = tool == .crop ? "선택한 영역을 모든 프레임에 적용해요. " : ""
@@ -272,7 +292,8 @@ struct AnimatedImagePanel: View {
             switch tool {
             case .webp: edit = .webp
             case .crop: edit = .crop(crop)
-            case .frame: edit = .frame(playback.index)
+            case .frame(let format): edit = .frame(playback.index, format: format)
+            case .speed: edit = .speed(rate)
             case .resize:
                 let w = try ToolSettings.integer(width, name: "너비", range: 1...16383)
                 let h = try ToolSettings.integer(height, name: "높이", range: 1...16383)

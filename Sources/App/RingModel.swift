@@ -18,6 +18,17 @@ final class RingModel: ObservableObject {
     /// 0 = 변환 layout, 1 = 편집 layout; animated between the two on a tab switch.
     @Published var tabProgress: Double = 0
     @Published var hovered: Int?
+    @Published private(set) var choosingFrameFormat = false
+    @Published private(set) var menuFolded = false
+    @Published private(set) var isNavigating = false
+    private var navigationTask: Task<Void, Never>?
+    var convertItems: [RingAction] {
+        choosingFrameFormat ? ["PNG", "JPG", "WEBP"].map {
+            RingAction(id: "frame-" + $0, title: $0, symbol: nil, kind: .convert($0))
+        } : file.convertActions
+    }
+    var editItems: [RingAction] { choosingFrameFormat ? convertItems : file.editActions }
+
     @Published var screen: Screen = .ring { didSet { if screen != oldValue { screenChanged(screen) } } }
     @Published var toast: String?
     @Published var thumbnail: NSImage?
@@ -48,7 +59,7 @@ final class RingModel: ObservableObject {
         loadThumbnail()
     }
 
-    var items: [RingAction] { tab == .convert ? file.convertActions : file.editActions }
+    var items: [RingAction] { tab == .convert ? convertItems : editItems }
 
     var hoveredAction: RingAction? {
         guard let i = hovered, items.indices.contains(i) else { return nil }
@@ -56,7 +67,7 @@ final class RingModel: ObservableObject {
     }
 
     func switchTab() {
-        guard !file.convertActions.isEmpty, !file.editActions.isEmpty else { return }
+        guard !choosingFrameFormat, !isNavigating, !file.convertActions.isEmpty, !file.editActions.isEmpty else { return }
         tab = (tab == .convert) ? .edit : .convert
         // Apple-style spring with a little bounce; the morph handles the slight overshoot.
         withAnimation(.spring(response: 0.5, dampingFraction: 0.74)) {
@@ -75,8 +86,17 @@ final class RingModel: ObservableObject {
     private static let panelTransition = Animation.easeOut(duration: 0.16)
 
     func activate(_ index: Int) {
-        guard !isWorking, items.indices.contains(index) else { return }
+        guard !isWorking, !isNavigating, items.indices.contains(index) else { return }
         let action = items[index]
+        if choosingFrameFormat, case .convert(let name) = action.kind, let format = ImageFormat(rawValue: name.lowercased()) {
+            withAnimation(Self.panelTransition) { screen = .tool(.animatedImage(.frame(format))) }
+            return
+        }
+        if file.kind == .animatedImage, action.id == "frame" {
+            hovered = index
+            navigateFrameFormats(true)
+            return
+        }
         switch action.kind {
         case .convert(let format):
             if file.kind == .animatedImage {
@@ -112,7 +132,7 @@ final class RingModel: ObservableObject {
         case .tool:
             withAnimation(Self.panelTransition) {
                 if file.kind == .animatedImage {
-                    screen = .tool(.animatedImage(action.id == "frame" ? .frame : .resize))
+                    screen = .tool(.animatedImage(action.id == "speed" ? .speed : .resize))
                 } else if action.id == "compress" {
                     switch file.kind {
                     case .image: screen = .tool(.imageCompression)
@@ -136,6 +156,25 @@ final class RingModel: ObservableObject {
                     showToast("\(action.title) — 준비 중이에요", closeAfter: false)
                 }
             }
+        }
+    }
+
+    func navigateFrameFormats(_ show: Bool) {
+        guard !isNavigating, !isWorking else { return }
+        isNavigating = true
+        let reduced = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        let fold = reduced ? 0.12 : 0.30
+        withAnimation(RingMotion.sCurve(reduced ? 0.24 : 0.30)) { menuFolded = true }
+        navigationTask = Task { [weak self] in
+            do {
+                try await Task.sleep(for: .seconds(fold))
+                guard let self, self.screen == .ring else { return }
+                self.hovered = nil
+                self.choosingFrameFormat = show
+                withAnimation(.spring(response: reduced ? 0.22 : 0.42, dampingFraction: 0.82)) { self.menuFolded = false }
+                try await Task.sleep(for: .seconds(reduced ? 0.22 : 0.46))
+                self.isNavigating = false
+            } catch { }
         }
     }
 
@@ -257,7 +296,9 @@ final class RingModel: ObservableObject {
     func escape() {
         if isCompleting { completionTask?.cancel();close();return }
         if isWorking { cancelWork();return }
-        if screen == .ring { close() } else { backToRing() }
+        if isNavigating { return }
+        if screen == .ring, choosingFrameFormat { navigateFrameFormats(false) }
+        else if screen == .ring { close() } else { backToRing() }
     }
 
     /// Keyboard handling forwarded from the panel. Returns true when consumed.
@@ -268,6 +309,7 @@ final class RingModel: ObservableObject {
         }
         // Everything else belongs to the panels' own controls once a tool is open.
         guard screen == .ring,!isWorking else { return false }
+        if isNavigating { return true }
         switch event.keyCode {
         case 48 where event.modifierFlags.contains(.shift):
             // ⇧tab: start at the top slot, then step clockwise.

@@ -52,6 +52,7 @@ import ImageIO
                 let reference = try AnimatedImageEngine.transform(input.frame(frame), edit: edit)
                 try require(try PixelCheck.compare(reference, output.frame(frame)).exact, "frame \(frame): color/alpha/crop/resize preservation")
             }
+            try require(FileInfo(url: result.url).convertActions.map(\.id) == ["speed", "frame"], "WebP replaces redundant conversion with speed")
             let copied = try await RingEngine.shared.run(EngineJob(source: result.url, operation: .animatedImage(.webp)))
             try require(try Data(contentsOf: copied.url) == Data(contentsOf: result.url), "same-WebP conversion retains original bytes")
             print("PASS animated edit", result.detail)
@@ -60,6 +61,34 @@ import ImageIO
         let still = try ImageInput(frame.url)
         try require(try PixelCheck.compare(AnimatedImageDecoder(gif).frame(2), still.image).exact, "extract selected frame, not silently first frame")
         try require(FileInfo(url: frame.url).kind == .image, "single PNG remains a still image")
+        for format in [ImageFormat.png, .jpg, .webp] {
+            let result = try await RingEngine.shared.run(.init(source: gif, operation: .animatedImage(.frame(2, format: format))))
+            let actual = try ImageInput(result.url)
+            let expected = try AnimatedImageDecoder(gif).frame(2)
+            try require(result.url.pathExtension == format.rawValue && FileInfo(url: result.url).kind == .image, "selected still format and routing")
+            let reference = format == .jpg ? try ImageCodec.flattenWhite(expected) : expected
+            let metrics = try PixelCheck.compare(reference, actual.image)
+            try require(format == .jpg ? metrics.psnr >= 45 : metrics.exact, "selected frame quality and alpha policy")
+        }
+        for rate in [0.5, 1.5, 2.0] {
+            let result = try await RingEngine.shared.run(.init(source: gif, operation: .animatedImage(.speed(rate))))
+            let actual = try AnimatedImageDecoder(result.url), expected = try AnimatedImageDecoder(gif)
+            let durations = try AnimatedImageEngine.retimedDurations(info.durationsMS, rate: rate)
+            try require(actual.info.durationsMS == durations && actual.info.loopCount == 3 && actual.info.frameCount == 4, "speed changes only timeline")
+            try require(abs(actual.info.duration - info.duration / rate) <= 0.001, "cumulative speed timing")
+            for index in 0..<4 { try require(try PixelCheck.compare(actual.frame(index), expected.frame(index)).exact, "speed retains every frame's pixels/alpha") }
+        }
+        print("PASS PNG/JPG/WebP selected frame formats and lossless variable-timing speed changes")
+        let webp = root.appendingPathComponent("transparent.webp")
+        let speedResult = try await RingEngine.shared.run(.init(source: webp, operation: .animatedImage(.speed(2))))
+        let fastInput = try AnimatedImageDecoder(webp), fastOutput = try AnimatedImageDecoder(speedResult.url)
+        try require(fastOutput.info.durationsMS == [20, 35, 65, 45], "WebP timing-only speed change")
+        let beforeBytes = try Data(contentsOf: webp), afterBytes = try Data(contentsOf: speedResult.url)
+        try require(beforeBytes.count == afterBytes.count, "speed does not re-encode WebP")
+        for i in 0..<4 { try require(try PixelCheck.compare(fastInput.frame(i), fastOutput.frame(i)).exact, "native WebP speed pixel preservation") }
+        let restored = try AnimatedImageEngine.retimeWebP(afterBytes, durations: info.durationsMS)
+        try require(restored == beforeBytes, "speed changes only duration fields; compressed pixels and metadata identical")
+        print("PASS WebP speed changes only frame durations; original encoded pixels and metadata retained")
         let before = try FileManager.default.contentsOfDirectory(atPath: root.path).sorted()
         do {
             _ = try await RingEngine.shared.run(EngineJob(source: gif, operation: .animatedImage(.frame(99))))
@@ -76,6 +105,9 @@ import ImageIO
             for index in [min(2, input.info.frameCount - 1), 0, 1, min(2, input.info.frameCount - 1), 0, 1] {
                 try require(try PixelCheck.compare(input.frame(index), AnimatedImageDecoder(copied).frame(index)).exact, "WebP backwards seek/composition")
             }
+            let retimed = try await RingEngine.shared.run(.init(source: copied, operation: .animatedImage(.speed(1.5))))
+            try require(try AnimatedImageEngine.retimeWebP(Data(contentsOf: retimed.url), durations: input.info.durationsMS) == bytes, "real WebP speed preserves encoded frames and metadata")
+            print("PASS real WebP timing-only speed", retimed.seconds)
             let result = try await RingEngine.shared.run(EngineJob(source: copied, operation: .animatedImage(.crop(CGRect(x: 0.2, y: 0.2, width: 0.5, height: 0.5)))))
             let output = try AnimatedImageDecoder(result.url)
             try require(output.info.frameCount == input.info.frameCount && output.info.durationsMS == input.info.durationsMS && output.info.loopCount == input.info.loopCount, "real WebP metadata preserved")

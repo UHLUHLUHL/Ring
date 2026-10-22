@@ -54,12 +54,20 @@ struct RingScreen: View {
                 VStack(spacing: 8 * RingMetrics.scale) {
                     RingView(model: model, layer: .surface)
                     Group {
-                        if !model.file.convertActions.isEmpty && !model.file.editActions.isEmpty {
+                        if model.choosingFrameFormat {
+                            Button { model.navigateFrameFormats(false) } label: { Label("뒤로", systemImage: "chevron.left") }
+                                .buttonStyle(.glass).disabled(model.isNavigating)
+                                .accessibilityIdentifier("ring.back")
+                        } else if !model.file.convertActions.isEmpty && !model.file.editActions.isEmpty {
                             TabPill(model: model)
                         }
-                        if showHints { ShortcutHints() }
+                        if showHints {
+                            if model.choosingFrameFormat {
+                                Text("⇧tab 선택 · return 열기 · esc 뒤로").font(.system(size: 10)).foregroundStyle(.secondary)
+                            } else { ShortcutHints() }
+                        }
                     }
-                    .allowsHitTesting(!model.isWorking)
+                    .allowsHitTesting(!model.isWorking && !model.isNavigating)
                 }
             }
             // Fade the container itself: harvested glass ignores a child's opacity.
@@ -99,7 +107,7 @@ struct RingView: View {
                 // clear variant). The glass refracts this soft shadow together with the desktop.
                 // While a job runs it folds in with the wedges and fades out, otherwise it was left
                 // as a soft round halo around the lone hub.
-                let backdrop = model.isWorking ? RingMetrics.hubDiameter : RingMetrics.outer * 2 + 10
+                let backdrop = (model.isWorking || model.menuFolded) ? RingMetrics.hubDiameter : RingMetrics.outer * 2 + 10
                 Circle()
                     .fill(.black.opacity(0.18))
                     .frame(width: backdrop * g, height: backdrop * g)
@@ -149,7 +157,7 @@ struct RingView: View {
         .onContinuousHover { phase in
             switch phase {
             case .active(let p):
-                guard !model.isWorking else { return }
+                guard !model.isWorking, !model.isNavigating else { return }
                 let hit = RingSlot.hit(p, center: center, count: items.count)
                 if hit != model.hovered {
                     withAnimation(.spring(response: 0.28, dampingFraction: 0.7)) { model.hovered = hit }
@@ -159,16 +167,16 @@ struct RingView: View {
             }
         }
         .onTapGesture { p in
-            guard settled, !model.isWorking, let i = RingSlot.hit(p, center: center, count: items.count) else { return }
+            guard settled, !model.isWorking, !model.isNavigating, let i = RingSlot.hit(p, center: center, count: items.count) else { return }
             model.activate(i)
         }
         .allowsHitTesting(layer == .content)
     }
 
     private func wedges(grow: CGFloat, settled: Bool, labelsOnly: Bool) -> RingWedges {
-        RingWedges(progress: model.tabProgress, grow: grow * (model.isWorking ? 0.62 : 1),
-                   convert: model.file.convertActions, edit: model.file.editActions,
-                   lifts: LiftVector((0..<max(model.file.convertActions.count, model.file.editActions.count)).map { settled && $0 == model.hovered ? 1 : 0 }),
+        RingWedges(progress: model.tabProgress, grow: grow * (model.menuFolded ? 0.25 : model.isWorking ? 0.62 : 1),
+                   convert: model.convertItems, edit: model.editItems,
+                   lifts: LiftVector((0..<max(model.convertItems.count, model.editItems.count)).map { settled && $0 == model.hovered ? 1 : 0 }),
                    side: side, labelsOnly: labelsOnly)
     }
 }
@@ -379,10 +387,10 @@ struct HubContent: View {
             // sizes change, so moving between wedges morphs instead of swapping views.
             VStack(spacing: 2) {
                 chip(action)
-                Text(action.map(resultName) ?? model.file.name)
+                Text(action.map(resultName) ?? (model.choosingFrameFormat ? "저장할 포맷" : model.file.name))
                     .font(.system(size: 11, weight: .semibold))
                     .lineLimit(1).truncationMode(.middle)
-                Text(model.items.isEmpty ? "지원하지 않는 형식" : model.file.summary)
+                Text(model.items.isEmpty ? "지원하지 않는 형식" : model.choosingFrameFormat ? "한 장 저장" : model.file.summary)
                     .font(.system(size: 10)).foregroundStyle(.secondary)
                     .opacity(action == nil ? 1 : 0)
                     .frame(height: action == nil ? nil : 0)
@@ -433,7 +441,7 @@ struct HubContent: View {
     }
 
     private func kicker(for action: RingAction) -> String {
-        if case .convert(let f) = action.kind { return "\(f)로 변환" }
+        if case .convert(let f) = action.kind { return model.choosingFrameFormat ? "\(f) 한 장 저장" : "\(f)로 변환" }
         return action.title
     }
 

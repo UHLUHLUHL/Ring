@@ -165,11 +165,51 @@ final class AnimatedImageDecoder {
 }
 
 enum AnimatedImageEdit {
-    case webp, crop(CGRect), resize(width: Int, height: Int), frame(Int)
-    var fileExtension: String { if case .frame = self { return "png" }; return "webp" }
+    case webp, crop(CGRect), resize(width: Int, height: Int), speed(Double), frame(Int, format: ImageFormat = .png)
+    var fileExtension: String { if case .frame(_, let format) = self { return format.rawValue }; return "webp" }
 }
 
 enum AnimatedImageEngine {
+    static func retimedDurations(_ durations: [Int], rate: Double) throws -> [Int] {
+        guard rate.isFinite, (0.25...4).contains(rate) else { throw EngineError.invalid("재생 속도는 0.25~4배여야 해요.") }
+        var source = 0, previous = 0
+        return try durations.map { duration in
+            source += duration
+            let end = Int((Double(source) / rate).rounded()), delay = end - previous
+            guard (1...0xffffff).contains(delay) else { throw EngineError.invalid("이 속도에서는 프레임 재생 시간을 보존할 수 없어요.") }
+            previous = end
+            return delay
+        }
+    }
+
+    /// ANMF duration is a 24-bit little-endian value at byte 12 of its header.
+    /// Keep the compressed frames, their blending/disposal, and all metadata intact.
+    static func retimeWebP(_ input: Data, durations: [Int]) throws -> Data {
+        var data = input
+        try data.withUnsafeMutableBytes { raw in
+            let b = raw.bindMemory(to: UInt8.self), n = b.count
+            func u32(_ p: Int) -> Int { (0..<4).reduce(0) { $0 | Int(b[p+$1]) << ($1*8) } }
+            guard n >= 12, Array(b[0..<4]) == Array("RIFF".utf8), Array(b[8..<12]) == Array("WEBP".utf8), u32(4) == n-8 else {
+                throw EngineError.invalid("WebP 컨테이너 길이가 올바르지 않아요.")
+            }
+            var p = 12, frame = 0
+            while p + 8 <= n {
+                let size = u32(p+4), start = p+8
+                guard size <= n-start else { throw EngineError.invalid("WebP 청크가 잘렸어요.") }
+                if Array(b[p..<p+4]) == Array("ANMF".utf8) {
+                    guard size >= 16, frame < durations.count, (1...0xffffff).contains(durations[frame]) else {
+                        throw EngineError.invalid("WebP 프레임 시간을 바꿀 수 없어요.")
+                    }
+                    for k in 0..<3 { b[start+12+k] = UInt8((durations[frame] >> (k*8)) & 255) }
+                    frame += 1
+                }
+                p = start+size+(size & 1)
+            }
+            guard p == n, frame == durations.count else { throw EngineError.invalid("WebP 프레임 수가 맞지 않아요.") }
+        }
+        return data
+    }
+
     static func transform(_ image: CGImage, edit: AnimatedImageEdit) throws -> CGImage {
         switch edit {
         case .crop(let region):
@@ -189,22 +229,41 @@ enum AnimatedImageEngine {
                 throw EngineError.io("크기 조절한 프레임의 픽셀 버퍼를 만들 수 없어요.")
             }
             return result
-        case .webp, .frame: return image
+        case .webp, .speed, .frame: return image
         }
     }
 
     static func run(_ source: URL, to output: URL, edit: AnimatedImageEdit) throws -> String {
         let decoder = try AnimatedImageDecoder(source), info = decoder.info
-        if case .frame(let index) = edit {
+        if case .frame(let index, let format) = edit {
+            guard [.png, .jpg, .webp].contains(format) else { throw EngineError.invalid("지원하지 않는 한 장 저장 형식이에요.") }
             let image = try decoder.frame(index)
             let props: [CFString: Any] = [kCGImagePropertyOrientation: 1]
-            try ImageCodec.write(image, properties: props, format: .png, to: output)
-            try ImageCodec.verify(image, properties: props, output: output, exact: true)
-            return "\(index + 1)번째 프레임 · PNG 무손실 · 저장 픽셀 일치"
+            if format == .png {
+                try ImageCodec.write(image, properties: props, format: .png, to: output)
+                try ImageCodec.verify(image, properties: props, output: output, exact: true)
+            } else {
+                let intermediate = output.deletingLastPathComponent().appendingPathComponent("frame-" + UUID().uuidString + ".tiff")
+                defer { try? FileManager.default.removeItem(at: intermediate) }
+                let raster = format == .jpg ? try ImageCodec.flattenWhite(image) : image
+                // TIFF keeps this decoded 8-bit raster and alpha without PNG's
+                // deliberate 16-bit alpha promotion in the shared writer.
+                try ImageCodec.write(raster, properties: props, format: .tiff, to: intermediate)
+                if format == .webp { _ = try ExternalCodecs.convert(intermediate, to: output, format: .webp) }
+                else { _ = try TargetSizeCodec.encode(intermediate, to: output, format: .jpg, intent: .quality(1)) }
+            }
+            return "\(index + 1)번째 프레임 · \(format.rawValue.uppercased()) · \(format == .jpg ? "최고 품질·투명 영역은 흰색" : "무손실·저장 픽셀 일치")"
         }
         if case .webp = edit, info.format == "WEBP" {
             try FileIntegrity.copy(source, to: output)
             return "움직이는 WebP · 원본 바이트 그대로"
+        }
+        let durations: [Int]
+        if case .speed(let rate) = edit { durations = try retimedDurations(info.durationsMS, rate: rate) }
+        else { durations = info.durationsMS }
+        if case .speed = edit, info.format == "WEBP" {
+            try retimeWebP(Data(contentsOf: source), durations: durations).write(to: output)
+            return try verify(source, output: output, edit: edit, info: info, durations: durations)
         }
         let first = try autoreleasepool { try transform(decoder.frame(0), edit: edit) }
         guard first.width <= 16383, first.height <= 16383 else { throw EngineError.unsupported("WebP 크기는 가로·세로 16,383px 이하여야 해요.") }
@@ -224,7 +283,7 @@ enum AnimatedImageEngine {
                 var bytes = 0
                 let ok = rgba.withUnsafeBytes {
                     ring_webp_lossless_mux_add(mux, $0.bindMemory(to: UInt8.self).baseAddress!, Int32(image.width), Int32(image.height),
-                                               Int32(info.durationsMS[index]), Int32(ThermalPolicy.threads), &bytes)
+                                               Int32(durations[index]), Int32(ThermalPolicy.threads), &bytes)
                 }
                 guard ok == 1 else { throw EngineError.io("\(index + 1)번째 프레임을 저장하지 못했어요.") }
                 encodedBytes += bytes
@@ -238,9 +297,13 @@ enum AnimatedImageEngine {
         guard ok == 1, let buffer else { throw EngineError.io("움짤 저장을 마무리하지 못했어요.") }
         try Task.checkCancellation()
         try Data(bytes: buffer, count: count).write(to: output)
+        return try verify(source, output: output, edit: edit, info: info, durations: durations)
+    }
+
+    private static func verify(_ source: URL, output: URL, edit: AnimatedImageEdit, info: AnimatedImageInfo, durations: [Int]) throws -> String {
         let written = try AnimatedImageDecoder(output)
         let referenceDecoder = try AnimatedImageDecoder(source)
-        guard written.info.frameCount == info.frameCount, written.info.durationsMS == info.durationsMS,
+        guard written.info.frameCount == info.frameCount, written.info.durationsMS == durations,
               written.info.loopCount == info.loopCount else { throw EngineError.quality("프레임·재생 시간·반복 보존 검사 실패. 결과를 저장하지 않았어요.") }
         for index in 0..<info.frameCount {
             try Task.checkCancellation()
