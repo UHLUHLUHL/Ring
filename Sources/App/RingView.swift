@@ -6,13 +6,16 @@ struct RootView: View {
 
     var body: some View {
         ZStack {
+            // Keep the glass graph alive when a tool covers the ring. Rebuilding
+            // harvested surfaces could leave labels visible before the glass returned.
+            RingScreen(model: model)
+                .padding(.top, RingWindowLayout.ringCenterY - RingMetrics.canvas / 2)
+                .frame(maxHeight: .infinity, alignment: .top)
+                .opacity(model.screen == .ring ? 1 : 0)
+                .allowsHitTesting(model.screen == .ring)
+                .accessibilityHidden(model.screen != .ring)
             switch model.screen {
-            case .ring:
-                // Pin the ring's centre to ringCenterY so it sits on the clicked point.
-                RingScreen(model: model)
-                    .padding(.top, RingWindowLayout.ringCenterY - RingMetrics.canvas / 2)
-                    .frame(maxHeight: .infinity, alignment: .top)
-                    .transition(.opacity)
+            case .ring: EmptyView()
             case .crop:
                 CropPanel(model: model)
                     .transition(.opacity.combined(with: .scale(scale: 0.96)))
@@ -48,16 +51,17 @@ struct RingScreen: View {
 
     var body: some View {
         ZStack(alignment: .top) {
-            // These surfaces share a visibility lifetime. Keep the always-visible hub
-            // and the wedge labels outside so refraction and folding stay independent.
-            GlassEffectContainer(spacing: 0) {
+            // Hub and sectors share one glass graph: they fuse as their gap closes,
+            // instead of two independently composited surfaces appearing out of sync.
+            GlassEffectContainer(spacing: 6) {
                 VStack(spacing: 8 * RingMetrics.scale) {
-                    RingView(model: model, layer: .surface)
+                    ZStack {
+                        RingView(model: model, layer: .surface)
+                        RingView(model: model, layer: .hub)
+                    }
                     Group {
                         if model.choosingFrameFormat {
-                            Button { model.navigateFrameFormats(false) } label: { Label("뒤로", systemImage: "chevron.left") }
-                                .buttonStyle(.glass).disabled(model.isNavigating)
-                                .accessibilityIdentifier("ring.back")
+                            BackPill(model: model)
                         } else if !model.file.convertActions.isEmpty && !model.file.editActions.isEmpty {
                             TabPill(model: model)
                         }
@@ -73,7 +77,12 @@ struct RingScreen: View {
             // Fade the container itself: harvested glass ignores a child's opacity.
             .opacity(model.isWorking ? 0 : 1)
             .overlay(alignment: .top) {
-                RingView(model: model, layer: .content)
+                // Working/completion retains a standalone hub while the entire
+                // navigation glass group fades, including its harvested surfaces.
+                ZStack {
+                    if model.isWorking { RingView(model: model, layer: .hub) }
+                    RingView(model: model, layer: .content)
+                }
             }
             if model.isWorking && !model.isCompleting {
                 Button(model.isCancelling ? "취소 중…":"작업 취소") { model.cancelWork() }
@@ -87,7 +96,7 @@ struct RingScreen: View {
 }
 
 struct RingView: View {
-    enum Layer { case surface, content }
+    enum Layer { case surface, hub, content }
     @ObservedObject var model: RingModel
     let layer: Layer
 
@@ -100,7 +109,7 @@ struct RingView: View {
         // Open/close: everything grows out of (and back into) the ring centre. Sizes change
         // instead of a scale effect so the glass keeps its final tone from the first frame.
         let g = model.appeared ? 1 : RingMetrics.closedGrow
-        let hub = RingMetrics.hubDiameter * g
+        let hub = RingMetrics.hubDiameter * g * (model.menuFolded ? 1.09 : 1)
         ZStack {
             if layer == .surface {
                 // Clear glass needs a darker backdrop to stay legible (Apple's guidance for the
@@ -115,15 +124,16 @@ struct RingView: View {
                     .allowsHitTesting(false)
                 // While a job runs the wedges fold into the hub and fade; only the hub stays.
                 wedges(grow: g, settled: settled, labelsOnly: false)
-            } else {
-                wedges(grow: g, settled: settled, labelsOnly: true)
-                    .opacity(model.isWorking ? 0 : 1)
+            } else if layer == .hub {
                 FrostLayer()
                     .frame(width: hub, height: hub)
                     .clipShape(Circle())
                 Color.clear
                     .frame(width: hub, height: hub)
                     .glassEffect(RingMetrics.glass.interactive(), in: Circle())
+            } else {
+                wedges(grow: g, settled: settled, labelsOnly: true)
+                    .opacity(model.isWorking ? 0 : 1)
                 HubContent(model: model)
                     .scaleEffect(g)
                     .opacity(model.isCompleting ? 0 : 1)
@@ -265,6 +275,7 @@ struct RingWedges: View, Animatable {
                 Color.clear
                     .frame(width: side, height: side)
                     .glassEffect(RingMetrics.glass.interactive(), in: all)
+                    .id(slotCount) // Invalidate the glass path when the menu topology changes.
             } else {
                 ForEach(wedges, id: \.index) { w in
                     labels(w)
@@ -453,6 +464,25 @@ struct HubContent: View {
         case .addBackground: return "\(base) 배경.png"
         case .tool: return model.file.name
         }
+    }
+}
+
+/// Same capsule track, inset and type treatment as the convert/edit control.
+struct BackPill: View {
+    @ObservedObject var model: RingModel
+    var body: some View {
+        Button { model.navigateFrameFormats(false) } label: {
+            Label("뒤로", systemImage: "chevron.left")
+                .font(.system(size: max(10.5, 13 * RingMetrics.scale), weight: .medium))
+                .foregroundStyle(Color.black.opacity(0.85))
+                .frame(width: 168 * RingMetrics.scale + 3, height: 30 * RingMetrics.scale)
+                .background(.white.opacity(0.92), in: Capsule())
+                .padding(3)
+                .glassEffect(.regular.interactive(), in: Capsule())
+                .hitTestableGlass(Capsule())
+        }
+        .buttonStyle(.plain).focusEffectDisabled().disabled(model.isNavigating)
+        .accessibilityIdentifier("ring.back")
     }
 }
 
