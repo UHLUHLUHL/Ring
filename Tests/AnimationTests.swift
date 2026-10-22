@@ -65,6 +65,72 @@ import CryptoKit
         }
         try require(abs(duration - expectedDuration) < 0.0025, "duration \(duration) != \(expectedDuration)")
     }
+    static func paletteSIMD() throws {
+        // Independent scalar oracle, including ties, error-row carry and the
+        // final partial row band. Optimizing palette lookup must be lossless.
+        let width=37,height=45
+        let total: Int = width*height*4
+        let rgba: [UInt8] = (0..<total).map { (i: Int) -> UInt8 in let value = i*73+i/11;return UInt8(value%256) }
+        for count in [1,2,63,255] {
+            let palette=(0..<(count*3)).map { UInt8(($0*47+17)%256) }
+            var actual=[UInt8](repeating:0,count:width*height),expected=actual
+            var cache=[Int16](repeating:-1,count:32768),errors=[Float](repeating:0,count:(width+2)*6)
+            for row in stride(from:0,to:height,by:32) {
+                try require(ring_palette_dither(rgba,Int32(width),Int32(height),Int32(row),Int32(min(32,height-row)),
+                    palette,Int32(count),&actual,&cache,&errors)==1,"SIMD palette band")
+            }
+            var current=[Float](repeating:0,count:(width+2)*3),next=current
+            for y in 0..<height {
+                for x in 0..<width {
+                    let pixel=y*width+x,e=(x+1)*3
+                    let rgb=(0..<3).map { max(0,min(255,Int((Float(rgba[pixel*4+$0])+current[e+$0]).rounded()))) }
+                    let quantized=rgb.map { ($0>>3)*8+4 }
+                    var best=0,distance=Int.max
+                    for index in 0..<count {
+                        let d=(0..<3).reduce(0) { sum,c in let delta=quantized[c]-Int(palette[index*3+c]);return sum+delta*delta }
+                        if d<distance { best=index;distance=d }
+                    }
+                    expected[pixel]=UInt8(best)
+                    for c in 0..<3 {
+                        let error=Float(rgb[c]-Int(palette[best*3+c]))
+                        current[e+3+c]+=error*(7.0/16);next[e-3+c]+=error*(3.0/16)
+                        next[e+c]+=error*(5.0/16);next[e+3+c]+=error*(1.0/16)
+                    }
+                }
+                swap(&current,&next);next=[Float](repeating:0,count:next.count)
+            }
+            try require(actual==expected,"SIMD changed palette pixels for \(count) colors")
+        }
+        print("PASS SIMD palette matches scalar oracle across row bands and palette sizes")
+    }
+    static func gifDeltaEdges() throws {
+        let width=37,height=45,space=CGColorSpace(name:CGColorSpace.sRGB)!
+        let table:[UInt8]=[10,20,30,220,180,120,50,100,200]
+        let indexed=table.withUnsafeBufferPointer { CGColorSpace(indexedBaseSpace:space,last:2,colorTable:$0.baseAddress!)! }
+        var pixels=(0..<(width*height)).map { UInt8(($0/3)%3) }
+        func image(_ pixels:[UInt8]) -> CGImage {
+            CGImage(width:width,height:height,bitsPerComponent:8,bitsPerPixel:8,bytesPerRow:width,
+                space:indexed,bitmapInfo:CGBitmapInfo(rawValue:CGImageAlphaInfo.none.rawValue),
+                provider:CGDataProvider(data:Data(pixels) as CFData)!,decode:nil,shouldInterpolate:false,intent:.defaultIntent)!
+        }
+        let first=image(pixels)
+        pixels[7*width+3]=(pixels[7*width+3]+1)%3;pixels[pixels.count-1]=(pixels.last!+1)%3
+        let second=image(pixels),previous=try AnimationPipeline.GIFDeltaFrame(first),current=try AnimationPipeline.GIFDeltaFrame(second)
+        let region=try current.changedRegion(after:previous),cropped=try current.cropped(to:region)
+        try require(region==CGRect(x:3,y:7,width:34,height:38),"delta bounding rectangle")
+        let memory=NSMutableData()
+        let animation=CGImageDestinationCreateWithData(memory,"com.compuserve.gif" as CFString,2,nil)!
+        CGImageDestinationSetProperties(animation,[kCGImagePropertyGIFDictionary:[kCGImagePropertyGIFHasGlobalColorMap:false]] as CFDictionary)
+        for image in [first,cropped] { CGImageDestinationAddImage(animation,image,[kCGImagePropertyGIFDictionary:[kCGImagePropertyGIFDelayTime:0.04]] as CFDictionary) }
+        try require(CGImageDestinationFinalize(animation),"GIF delta edge encoding")
+        let fixed=try AnimationPipeline.opaqueGIF(memory as Data,regions:[CGRect(x:0,y:0,width:width,height:height),region])
+        let decoded=CGImageSourceCreateWithData(fixed as CFData,nil)!
+        let reference=NSMutableData(),single=CGImageDestinationCreateWithData(reference,"com.compuserve.gif" as CFString,1,nil)!
+        CGImageDestinationAddImage(single,second,nil);try require(CGImageDestinationFinalize(single),"GIF full-frame reference")
+        let expected=CGImageSourceCreateWithData(reference,nil)!
+        try require(try AdaptivePalette.sRGB(CGImageSourceCreateImageAtIndex(decoded,1,nil)!) == AdaptivePalette.sRGB(CGImageSourceCreateImageAtIndex(expected,0,nil)!),"GIF delta final scanline changed")
+        print("PASS GIF delta odd-width crop retains the final row and column exactly")
+    }
     static func timing() throws {
         for format in [AnimationFormat.gif, .webp] {
             for fps in [15.0, 24, 29.97, 30, 59.94, 60] {
@@ -87,6 +153,9 @@ import CryptoKit
         setbuf(stdout, nil)
         do {
             try timing()
+            try paletteSIMD()
+            try gifDeltaEdges()
+            if CommandLine.arguments.contains("--palette") { return }
             let root = URL(fileURLWithPath: ".work/animation-tests-" + UUID().uuidString, isDirectory: true)
             try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
             if CommandLine.arguments.contains("--dimensions") {
@@ -117,12 +186,35 @@ import CryptoKit
                 }
                 let turned = try await RingEngine.shared.run(.init(source: rotated, operation: .video(.animation(.init(format: format, fps: detected, maxDimension: 160, start: 0.2, duration: 1.017)))))
                 try inspect(turned.url, expectedDuration: AnimationPlan(duration: 1.017, fps: detected, format: format).duration, width: 90, height: 160)
-                let limited = try await RingEngine.shared.run(.init(source: moving, operation: .video(.animation(.init(format: format, fps: 30, maxDimension: 320, targetBytes: 50_000, duration: 2)))))
-                try require(try Data(contentsOf: limited.url).count <= 50_000, "target exceeded")
+                // GIF's per-frame palettes impose a larger minimum when all
+                // requested frames are retained instead of silently dropping FPS.
+                let target: Int64 = format == .gif ? 100_000:50_000
+                let limited = try await RingEngine.shared.run(.init(source: moving, operation: .video(.animation(.init(format: format, fps: 30, maxDimension: 320, targetBytes: target, duration: 2)))))
+                try require(try Data(contentsOf: limited.url).count <= target, "target exceeded")
+                try inspect(limited.url,expectedDuration:2,frames:60)
+                try require(limited.detail.contains("30fps"),"byte target silently lowered requested FPS")
                 print("PASS", format.rawValue, "15/24/30/60fps, rotation, fractional FPS/trim, sampled target", limited.detail)
             }
             let frozen = try await RingEngine.shared.run(.init(source: still, operation: .video(.animation(.init(format: .webp, fps: 60, maxDimension: 160, duration: 1)))))
             try inspect(frozen.url, expectedDuration: 1)
+            let frozenGIF = try await RingEngine.shared.run(.init(source: still, operation: .video(.animation(.init(format: .gif, fps: 30, maxDimension: 160, duration: 1)))))
+            try inspect(frozenGIF.url,expectedDuration:1,frames:30,width:160,height:90)
+            let frozenFrames=CGImageSourceCreateWithURL(frozenGIF.url as CFURL,nil)!
+            let frozenReference=AVAssetImageGenerator(asset:AVURLAsset(url:still))
+            frozenReference.maximumSize=CGSize(width:320,height:320)
+            frozenReference.requestedTimeToleranceBefore = .zero;frozenReference.requestedTimeToleranceAfter = .zero
+            // A still scene encoded with H.264 can change a few decoded pixels
+            // between frames. Compare each against its own independent palette.
+            for index in 0..<30 {
+                let reference=try ImageResampler.fit(await frozenReference.image(at:CMTime(value:Int64(index),timescale:30)).image,maxDimension:160)
+                let memory=NSMutableData()
+                let writer=CGImageDestinationCreateWithData(memory,"com.compuserve.gif" as CFString,1,nil)!
+                CGImageDestinationAddImage(writer,try AdaptivePalette.indexed(reference),nil)
+                try require(CGImageDestinationFinalize(writer),"independent GIF frame")
+                let decoded=CGImageSourceCreateWithData(memory,nil)!
+                let expected=try AdaptivePalette.sRGB(CGImageSourceCreateImageAtIndex(decoded,0,nil)!)
+                try require(try AdaptivePalette.sRGB(CGImageSourceCreateImageAtIndex(frozenFrames,index,nil)!)==expected,"GIF delta canvas changed at \(index)")
+            }
             let single = try await RingEngine.shared.run(.init(source: still, operation: .video(.animation(.init(format: .webp, fps: 1, maxDimension: 160, duration: 0.2)))))
             try inspect(single.url, expectedDuration: 0.2)
             // The default animation must retain the q90/method4/sharp-YUV

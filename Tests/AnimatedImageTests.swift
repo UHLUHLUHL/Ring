@@ -6,8 +6,47 @@ import ImageIO
     static func require(_ condition: Bool, _ message: String) throws {
         if !condition { throw EngineError.invalid("TEST: " + message) }
     }
+    static func nativeDeltaChecks() throws {
+        let width=17,height=13
+        var frames=[[UInt8]](),pixels=[UInt8](repeating:0,count:width*height*4)
+        for i in 0..<(width*height) { pixels[i*4]=20;pixels[i*4+1]=60;pixels[i*4+2]=100;pixels[i*4+3]=255 }
+        frames.append(pixels)
+        let odd=(5*width+3)*4
+        pixels.replaceSubrange(odd..<(odd+4),with:[200,100,20,128]);frames.append(pixels)
+        pixels.replaceSubrange(odd..<(odd+4),with:[0,0,0,0])
+        pixels.replaceSubrange((pixels.count-4)..<pixels.count,with:[255,0,80,255]);frames.append(pixels)
+        frames.append(pixels)
+        guard let mux=ring_webp_lossless_mux_create(Int32(width),Int32(height),2,nil,0) else { throw EngineError.io("test mux") }
+        defer { ring_webp_mux_destroy(mux) }
+        for i in frames.indices {
+            var count=0
+            let ok=frames[i].withUnsafeBufferPointer { current in
+                if i==0 { return ring_webp_lossless_mux_add_delta(mux,current.baseAddress,nil,Int32(width),Int32(height),40,1,&count) }
+                return frames[i-1].withUnsafeBufferPointer { previous in
+                    ring_webp_lossless_mux_add_delta(mux,current.baseAddress,previous.baseAddress,Int32(width),Int32(height),40,1,&count)
+                }
+            }
+            try require(ok==1,"lossless delta encode")
+        }
+        var bytes:UnsafeMutablePointer<UInt8>?,count=0
+        try require(ring_webp_mux_finish(mux,&bytes,&count)==1,"lossless delta mux")
+        defer { ring_buffer_free(bytes) }
+        var w:Int32=0,h:Int32=0,n:Int32=0,loops:Int32=0
+        guard let decoder=ring_webp_image_decoder_create(bytes,count,1,&w,&h,&n,&loops) else { throw EngineError.io("test decoder") }
+        defer { ring_webp_image_decoder_destroy(decoder) }
+        try require(w==width && h==height && n==frames.count && loops==2,"delta canvas, frames, loop")
+        for i in frames.indices {
+            var pixels:UnsafePointer<UInt8>?
+            try require(ring_webp_image_decoder_next(decoder,&pixels)==1 && pixels != nil,"delta frame decode")
+            try require(Array(UnsafeBufferPointer(start:pixels,count:width*height*4))==frames[i],"delta changed RGBA at frame \(i)")
+        }
+        let source=CGImageSourceCreateWithData(Data(bytes:bytes!,count:count) as CFData,nil)!
+        try require(AnimatedImageInfo.inspect(source)?.durationsMS == [40,40,40,40],"delta frame timing")
+        print("PASS lossless delta: odd offsets, canvas edge, partial alpha, erased pixels, identical frames")
+    }
     static func main() async throws {
         setbuf(stdout, nil)
+        try nativeDeltaChecks()
         let root = URL(fileURLWithPath: ".work/animated-image-tests-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         let gif = root.appendingPathComponent("transparent.gif")

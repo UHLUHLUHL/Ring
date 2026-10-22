@@ -2,7 +2,7 @@
 
 파일 우클릭으로 여는 가벼운 macOS 변환·편집 앱.
 
-## [⬇️ Ring 0.2.12 다운로드](https://github.com/UHLUHLUHL/Ring/releases/download/v0.2.12/Ring.dmg)
+## [⬇️ Ring 0.2.24 다운로드](https://github.com/UHLUHLUHL/Ring/releases/download/v0.2.24/Ring.dmg)
 
 macOS 26 이상 · Apple Silicon / Intel
 

@@ -286,7 +286,7 @@ enum AnimationPipeline {
         var images = try await reader.read(plan.frames[0..<initialCount])
         let width = images[0].width, height = images[0].height
         var parallelWebP = false
-        if format == .webp, allowParallelWebP, resources.workers > 1, plan.frames.count >= 16 {
+        if format == .webp, allowParallelWebP, resources.workers > 1, plan.frames.count >= 8 {
             parallelWebP = try motionFraction(images[0], images[images.count - 1]) > 0.15
         }
         let memory = NSMutableData()
@@ -297,13 +297,17 @@ enum AnimationPipeline {
             CGImageDestinationSetProperties(gif, [kCGImagePropertyGIFDictionary: [kCGImagePropertyGIFLoopCount: 0, kCGImagePropertyGIFHasGlobalColorMap: false]] as CFDictionary)
         } else { gif = nil }
         let mux = format == .webp ? try WebPAnimationMux(width: width, height: height) : nil
-        let continuous = format == .webp && !parallelWebP ? try WebPAnimationWriter(width: width, height: height) : nil
+        var continuous: WebPAnimationWriter?
+        var continuousOrigin = 0
+        var usedParallelWebP = false
+        var previousGIF: GIFDeltaFrame?
+        var gifRegions: [CGRect] = []
         var position = 0
         while position < plan.frames.count {
             try Task.checkCancellation()
             let capacity = max(1, resources.frameCapacity(width: width, height: height, bytesPerPixel: format == .gif ? 12 : 4) / 2)
             let workers = min(resources.workers, capacity)
-            let chunkSize = 1
+            let chunkSize = 4
             // Decode ahead within the byte budget. Tiny extraction requests
             // repeatedly restart AVFoundation's batch decoder and lose most of
             // the parallel encoder's gain, especially on low-motion clips.
@@ -313,6 +317,23 @@ enum AnimationPipeline {
                 images += try await reader.read(plan.frames[(position + images.count)..<(position + count)])
             }
             let batch = images
+            // Re-evaluate local motion after decode-ahead. A quiet opening
+            // must not force the rest of a moving clip through a serial encoder.
+            if format == .webp {
+                parallelWebP = try allowParallelWebP && workers > 1 && batch.count >= 4 &&
+                    motionFraction(batch[0],batch[batch.count-1]) > 0.15
+                if parallelWebP {
+                    if let writer = continuous {
+                        let end = plan.frames[position].start
+                        try mux!.append(writer.finish(at:end-continuousOrigin),duration:end-continuousOrigin)
+                        continuous = nil
+                    }
+                    usedParallelWebP = true
+                } else if continuous == nil {
+                    continuous = try WebPAnimationWriter(width:width,height:height)
+                    continuousOrigin = plan.frames[position].start
+                }
+            }
             // One reader owns the generator; it prepares the next bounded
             // window while the current window is encoded. Both windows share
             // the 128MiB pixel-buffer allowance across active animation jobs.
@@ -343,11 +364,16 @@ enum AnimationPipeline {
                             try Task.checkCancellation()
                             let frame = plan.frames[position + index]
                             let delay = Double(frame.end - frame.start) / Double(plan.scale)
-                            CGImageDestinationAddImage(gif, image, [kCGImagePropertyGIFDictionary: [kCGImagePropertyGIFDelayTime: delay, kCGImagePropertyGIFUnclampedDelayTime: delay]] as CFDictionary)
+                            let prepared = try GIFDeltaFrame(image)
+                            let region = try prepared.changedRegion(after:previousGIF)
+                            let delta = try prepared.cropped(to:region)
+                            gifRegions.append(region)
+                            CGImageDestinationAddImage(gif, delta, [kCGImagePropertyGIFDictionary: [kCGImagePropertyGIFDelayTime: delay, kCGImagePropertyGIFUnclampedDelayTime: delay]] as CFDictionary)
+                            previousGIF = prepared
                         }
                     } else if let continuous {
                         for (index, image) in batch.enumerated() {
-                            try continuous.add(image, timestamp: plan.frames[position + index].start, quality: quality, threads: resources.workers)
+                            try continuous.add(image, timestamp: plan.frames[position + index].start - continuousOrigin, quality: quality, threads: resources.workers)
                         }
                     } else if let mux {
                         let base = position
@@ -390,26 +416,77 @@ enum AnimationPipeline {
         let bytes: Data
         if let gif {
             guard CGImageDestinationFinalize(gif) else { throw EngineError.io("GIF 마감 실패") }
-            bytes = try opaqueGIF(memory as Data)
+            bytes = try opaqueGIF(memory as Data,regions:gifRegions)
         } else if let mux {
-            if let continuous { try mux.append(continuous.finish(at: plan.ticks), duration: plan.ticks) }
+            if let continuous { try mux.append(continuous.finish(at: plan.ticks-continuousOrigin), duration: plan.ticks-continuousOrigin) }
             bytes = try mux.finish()
         } else { throw EngineError.io("애니메이션 인코더 없음") }
         try Task.checkCancellation()
-        return AnimationEncoding(bytes: bytes, width: width, height: height, parallelWebP: parallelWebP)
+        return AnimationEncoding(bytes: bytes, width: width, height: height, parallelWebP: usedParallelWebP)
     }
 
-    /// ImageIO writes a GIF87a header and gives every frame "restore to
-    /// background" disposal with palette index 255 transparent. Our frames are
-    /// full-canvas and opaque (the palette never uses index 255), so rewrite
-    /// those bytes to GIF89a, no transparency and "do not dispose".
-    static func opaqueGIF(_ data: Data) throws -> Data {
+    /// Store only changed rectangles. Identical frames keep a 1px image and
+    /// their original delay; no frame or playback time is removed.
+    struct GIFDeltaFrame {
+        let image: CGImage
+        let indices: CFData
+        let colors: [UInt32]
+        init(_ image: CGImage) throws {
+            guard image.bitsPerPixel == 8, let indices=image.dataProvider?.data,
+                  CFDataGetLength(indices)>=image.bytesPerRow*image.height,
+                  let palette=image.colorSpace?.colorTable else { throw EngineError.io("GIF 팔레트 읽기 실패") }
+            self.image=image;self.indices=indices
+            var colors=[UInt32](repeating:0,count:256)
+            for i in 0..<(palette.count/3) {
+                colors[i]=UInt32(palette[i*3])<<16 | UInt32(palette[i*3+1])<<8 | UInt32(palette[i*3+2])
+            }
+            self.colors=colors
+        }
+        func cropped(to region: CGRect) throws -> CGImage {
+            let x=Int(region.minX),y=Int(region.minY),width=Int(region.width),height=Int(region.height)
+            if x==0 && y==0 && width==image.width && height==image.height { return image }
+            // A cropped indexed CGImage can retain its parent's row stride and
+            // provider offset. Give ImageIO tightly packed, owned rows so the
+            // final scanline is encoded exactly, including odd-width regions.
+            var pixels=Data(count:width*height)
+            pixels.withUnsafeMutableBytes { bytes in
+                let source=CFDataGetBytePtr(indices)!,destination=bytes.bindMemory(to:UInt8.self).baseAddress!
+                for row in 0..<height {
+                    destination.advanced(by:row*width).update(from:source.advanced(by:(y+row)*image.bytesPerRow+x),count:width)
+                }
+            }
+            guard let provider=CGDataProvider(data:pixels as CFData),let space=image.colorSpace,
+                  let result=CGImage(width:width,height:height,bitsPerComponent:8,bitsPerPixel:8,bytesPerRow:width,
+                    space:space,bitmapInfo:image.bitmapInfo,provider:provider,decode:nil,shouldInterpolate:false,intent:.defaultIntent) else {
+                throw EngineError.io("GIF 변경 영역 생성 실패")
+            }
+            return result
+        }
+        func changedRegion(after previous: GIFDeltaFrame?) throws -> CGRect {
+            guard let previous else { return CGRect(x:0,y:0,width:image.width,height:image.height) }
+            let a=CFDataGetBytePtr(indices)!,b=CFDataGetBytePtr(previous.indices)!
+            var left=image.width,right = -1,top=image.height,bottom = -1
+            for y in 0..<image.height {
+                if y & 31 == 0 { try Task.checkCancellation() }
+                for x in 0..<image.width where colors[Int(a[y*image.bytesPerRow+x])] != previous.colors[Int(b[y*previous.image.bytesPerRow+x])] {
+                    left=min(left,x);right=max(right,x);top=min(top,y);bottom=y
+                    if left == 0 && right == image.width-1 { break }
+                }
+            }
+            return right < left ? CGRect(x:0,y:0,width:1,height:1):
+                CGRect(x:left,y:top,width:right-left+1,height:bottom-top+1)
+        }
+    }
+
+    /// ImageIO supplies the LZW payload and local palette. Set each cropped
+    /// image's placement and retain the preceding canvas (opaque disposal 1).
+    static func opaqueGIF(_ data: Data,regions:[CGRect] = []) throws -> Data {
         var data = data
         try data.withUnsafeMutableBytes { raw in
             let b = raw.bindMemory(to: UInt8.self), n = b.count
             guard n >= 13, b[0] == 0x47, b[1] == 0x49, b[2] == 0x46 else { throw EngineError.quality("GIF 헤더 검사 실패") }
             b[3] = 0x38; b[4] = 0x39; b[5] = 0x61
-            var p = 13
+            var p = 13, frameIndex = 0
             if b[10] & 0x80 != 0 { p += 3 << (Int(b[10] & 7) + 1) }
             func skipSubBlocks() throws {
                 while true {
@@ -429,13 +506,27 @@ enum AnimationPipeline {
                     try skipSubBlocks()
                 case 0x2C:
                     guard p + 10 < n else { throw EngineError.quality("GIF 블록 검사 실패") }
-                    guard b[p + 1] == 0, b[p + 2] == 0, b[p + 3] == 0, b[p + 4] == 0, b[p + 5] == b[6], b[p + 6] == b[7], b[p + 7] == b[8], b[p + 8] == b[9] else { throw EngineError.quality("GIF 프레임 영역 검사 실패") }
+                    let canvasWidth=Int(b[6]) | Int(b[7])<<8,canvasHeight=Int(b[8]) | Int(b[9])<<8
+                    let width=Int(b[p+5]) | Int(b[p+6])<<8,height=Int(b[p+7]) | Int(b[p+8])<<8
+                    let region: CGRect
+                    if regions.isEmpty { region=CGRect(x:0,y:0,width:canvasWidth,height:canvasHeight) }
+                    else {
+                        guard frameIndex<regions.count else { throw EngineError.quality("GIF 프레임 수 검사 실패") }
+                        region=regions[frameIndex]
+                    }
+                    guard width==Int(region.width),height==Int(region.height),region.minX>=0,region.minY>=0,
+                          region.maxX<=Double(canvasWidth),region.maxY<=Double(canvasHeight),
+                          frameIndex>0 || (width==canvasWidth && height==canvasHeight) else { throw EngineError.quality("GIF 프레임 영역 검사 실패") }
+                    b[p+1]=UInt8(Int(region.minX)&255);b[p+2]=UInt8(Int(region.minX)>>8)
+                    b[p+3]=UInt8(Int(region.minY)&255);b[p+4]=UInt8(Int(region.minY)>>8)
+                    frameIndex += 1
                     let flags = b[p + 9]
                     p += 10
                     if flags & 0x80 != 0 { p += 3 << (Int(flags & 7) + 1) }
                     p += 1
                     try skipSubBlocks()
                 case 0x3B:
+                    guard regions.isEmpty || frameIndex==regions.count else { throw EngineError.quality("GIF 프레임 수 검사 실패") }
                     return
                 default:
                     throw EngineError.quality("GIF 블록 검사 실패")

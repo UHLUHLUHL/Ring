@@ -23,6 +23,7 @@ void ring_webp_animation_destroy(void *animation);
 void *ring_webp_mux_create(int width,int height);
 void *ring_webp_lossless_mux_create(int width,int height,int loop_count,const uint8_t *icc,size_t icc_size);
 int ring_webp_lossless_mux_add(void *mux,const uint8_t *rgba,int width,int height,int duration_ms,int threads,size_t *encoded_size);
+int ring_webp_lossless_mux_add_delta(void *mux,const uint8_t *rgba,const uint8_t *previous,int width,int height,int duration_ms,int threads,size_t *encoded_size);
 void *ring_webp_image_decoder_create(const uint8_t *bytes,size_t size,int threads,int *width,int *height,int *frames,int *loops);
 int ring_webp_image_decoder_next(void *decoder,const uint8_t **pixels);
 void ring_webp_image_decoder_reset(void *decoder);
@@ -42,6 +43,9 @@ typedef struct { double ssim, tail_ssim, mse; } RingVideoPlaneQuality;
 int ring_video_plane_quality(const uint8_t *reference, size_t reference_stride,
     const uint8_t *encoded, size_t encoded_stride, int width, int height,
     int pixel_stride, int phase, RingVideoPlaneQuality *result);
+// Exact RGB5 palette lookup and Floyd–Steinberg diffusion in cancellable row bands.
+int ring_palette_dither(const uint8_t *rgba,int width,int height,int first_row,int rows,
+    const uint8_t *palette,int colors,uint8_t *pixels,int16_t *cache,float *errors);
 #ifdef __cplusplus
 }
 #endif

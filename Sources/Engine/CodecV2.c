@@ -290,19 +290,38 @@ void *ring_webp_lossless_mux_create(int width,int height,int loop_count,const ui
     return mux;
 }
 int ring_webp_lossless_mux_add(void *opaque,const uint8_t *rgba,int width,int height,int duration_ms,int threads,size_t *encoded_size) {
+    return ring_webp_lossless_mux_add_delta(opaque,rgba,NULL,width,height,duration_ms,threads,encoded_size);
+}
+int ring_webp_lossless_mux_add_delta(void *opaque,const uint8_t *rgba,const uint8_t *previous,int width,int height,int duration_ms,int threads,size_t *encoded_size) {
     if(!opaque || !rgba || !encoded_size || width<1 || height<1 || width>16383 || height>16383 || duration_ms<1 || duration_ms>0xffffff) return 0;
     int w,h;
     if(WebPMuxGetCanvasSize(opaque,&w,&h)!=WEBP_MUX_OK || w!=width || h!=height) return 0;
+    int left=0,top=0,right=width-1,bottom=height-1;
+    if(previous) {
+        int frames=0;
+        if(WebPMuxNumChunks(opaque,WEBP_CHUNK_ANMF,&frames)!=WEBP_MUX_OK || !frames) return 0;
+        left=width;top=height;right=bottom=-1;
+        for(int y=0;y<height;y++) for(int x=0;x<width;x++) {
+            size_t offset=((size_t)y*width+x)*4;
+            if(memcmp(rgba+offset,previous+offset,4)) {
+                if(x<left) left=x;if(x>right) right=x;if(y<top) top=y;bottom=y;
+                if(left==0 && right==width-1) break;
+            }
+        }
+        if(right<left) left=top=right=bottom=0;
+        // WebP stores even pixel offsets. Include the bordering pixels exactly.
+        left&=~1;top&=~1;
+    }
     WebPConfig config;WebPPicture picture;WebPMemoryWriter writer;
     if(!WebPConfigInit(&config) || !WebPConfigLosslessPreset(&config,4) || !WebPPictureInit(&picture)) return 0;
     config.exact=1;config.low_memory=1;config.thread_level=threads>1;
-    picture.width=width;picture.height=height;picture.use_argb=1;
+    picture.width=right-left+1;picture.height=bottom-top+1;picture.use_argb=1;
     WebPMemoryWriterInit(&writer);picture.writer=WebPMemoryWrite;picture.custom_ptr=&writer;
-    int ok=WebPValidateConfig(&config) && WebPPictureImportRGBA(&picture,rgba,width*4) && WebPEncode(&config,&picture);
+    int ok=WebPValidateConfig(&config) && WebPPictureImportRGBA(&picture,rgba+((size_t)top*width+left)*4,width*4) && WebPEncode(&config,&picture);
     if(ok) {
         WebPMuxFrameInfo frame={0};
         frame.bitstream.bytes=writer.mem;frame.bitstream.size=writer.size;
-        frame.id=WEBP_CHUNK_ANMF;frame.duration=duration_ms;
+        frame.id=WEBP_CHUNK_ANMF;frame.duration=duration_ms;frame.x_offset=left;frame.y_offset=top;
         frame.dispose_method=WEBP_MUX_DISPOSE_NONE;frame.blend_method=WEBP_MUX_NO_BLEND;
         ok=WebPMuxPushFrame(opaque,&frame,1)==WEBP_MUX_OK;
         if(ok) *encoded_size=writer.size;
@@ -345,4 +364,50 @@ int ring_inflate_raw(const uint8_t *source,size_t size,uint8_t *output,size_t ou
     int rc=inflate(&stream,Z_FINISH);
     int ok=rc==Z_STREAM_END && stream.total_in==size && stream.total_out==output_size;
     inflateEnd(&stream);return ok;
+}
+
+// Four palette candidates per SIMD operation on both Apple Silicon and Intel.
+// Stable first-index ties, rounding and error diffusion match the Swift path.
+#pragma clang fp contract(off)
+int ring_palette_dither(const uint8_t *rgba,int width,int height,int first_row,int rows,
+    const uint8_t *palette,int colors,uint8_t *pixels,int16_t *cache,float *errors) {
+    if(!rgba || !palette || !pixels || !cache || !errors || width<1 || height<1 ||
+       first_row<0 || rows<1 || first_row>height-rows || colors<1 || colors>255) return 0;
+    typedef int Int4 __attribute__((vector_size(16)));
+    int red[256]={0},green[256]={0},blue[256]={0};
+    for(int i=0;i<colors;i++) { red[i]=palette[i*3];green[i]=palette[i*3+1];blue[i]=palette[i*3+2]; }
+    const size_t length=((size_t)width+2)*3;
+    for(int y=first_row;y<first_row+rows;y++) {
+        float *cur=errors+(y&1)*length,*next=errors+((y+1)&1)*length;
+        for(int x=0;x<width;x++) {
+            size_t pixel=(size_t)y*width+x,e=((size_t)x+1)*3;
+            int r=(int)floorf(fminf(255,fmaxf(0,rgba[pixel*4]+cur[e]))+0.5f);
+            int g=(int)floorf(fminf(255,fmaxf(0,rgba[pixel*4+1]+cur[e+1]))+0.5f);
+            int b=(int)floorf(fminf(255,fmaxf(0,rgba[pixel*4+2]+cur[e+2]))+0.5f);
+            int key=(r>>3)<<10 | (g>>3)<<5 | (b>>3),index=cache[key];
+            if(index<0) {
+                int rr=((key>>10)&31)*8+4,gg=((key>>5)&31)*8+4,bb=(key&31)*8+4;
+                Int4 rv={rr,rr,rr,rr},gv={gg,gg,gg,gg},bv={bb,bb,bb,bb};
+                int best=0,distance=INT_MAX,i=0;
+                for(;i+4<=colors;i+=4) {
+                    Int4 pr,pg,pb;
+                    memcpy(&pr,red+i,sizeof(pr));memcpy(&pg,green+i,sizeof(pg));memcpy(&pb,blue+i,sizeof(pb));
+                    Int4 dr=rv-pr,dg=gv-pg,db=bv-pb,ds=dr*dr+dg*dg+db*db;
+                    for(int j=0;j<4;j++) if(ds[j]<distance) { distance=ds[j];best=i+j; }
+                }
+                for(;i<colors;i++) {
+                    int dr=rr-red[i],dg=gg-green[i],db=bb-blue[i],d=dr*dr+dg*dg+db*db;
+                    if(d<distance) { distance=d;best=i; }
+                }
+                cache[key]=(int16_t)best;index=best;
+            }
+            pixels[pixel]=(uint8_t)index;
+            float dr=r-red[index],dg=g-green[index],db=b-blue[index];
+            cur[e+3]+=dr*(7.0f/16);next[e-3]+=dr*(3.0f/16);next[e]+=dr*(5.0f/16);next[e+3]+=dr*(1.0f/16);
+            cur[e+4]+=dg*(7.0f/16);next[e-2]+=dg*(3.0f/16);next[e+1]+=dg*(5.0f/16);next[e+4]+=dg*(1.0f/16);
+            cur[e+5]+=db*(7.0f/16);next[e-1]+=db*(3.0f/16);next[e+2]+=db*(5.0f/16);next[e+5]+=db*(1.0f/16);
+        }
+        memset(cur,0,length*sizeof(float));
+    }
+    return 1;
 }

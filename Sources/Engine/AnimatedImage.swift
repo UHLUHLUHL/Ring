@@ -274,6 +274,10 @@ enum AnimatedImageEngine {
         guard let mux else { throw EngineError.io("움짤 저장을 시작하지 못했어요.") }
         defer { ring_webp_mux_destroy(mux) }
         var encodedBytes = 0
+        // Bound the extra delta reference; large canvases retain the full-frame
+        // lossless path instead of allocating an unbounded additional raster.
+        var previousRGBA: Data?
+        let keepReference = first.width*first.height*4 <= 32*1024*1024
         for index in 0..<info.frameCount {
             try Task.checkCancellation()
             try autoreleasepool {
@@ -281,10 +285,14 @@ enum AnimatedImageEngine {
                 guard image.colorSpace?.copyICCData() == first.colorSpace?.copyICCData() else { throw EngineError.unsupported("프레임마다 색상 프로필이 달라요. 보존을 확인할 수 없어 저장하지 않아요.") }
                 let rgba = try ExternalCodecs.straightRGBA8(image)
                 var bytes = 0
-                let ok = rgba.withUnsafeBytes {
-                    ring_webp_lossless_mux_add(mux, $0.bindMemory(to: UInt8.self).baseAddress!, Int32(image.width), Int32(image.height),
-                                               Int32(durations[index]), Int32(ThermalPolicy.threads), &bytes)
+                let ok = rgba.withUnsafeBytes { current in
+                    (previousRGBA ?? Data()).withUnsafeBytes { previous in
+                        ring_webp_lossless_mux_add_delta(mux, current.bindMemory(to: UInt8.self).baseAddress!,
+                            previous.isEmpty ? nil:previous.bindMemory(to: UInt8.self).baseAddress, Int32(image.width), Int32(image.height),
+                            Int32(durations[index]), Int32(ThermalPolicy.threads), &bytes)
+                    }
                 }
+                if keepReference { previousRGBA = rgba }
                 guard ok == 1 else { throw EngineError.io("\(index + 1)번째 프레임을 저장하지 못했어요.") }
                 encodedBytes += bytes
                 guard encodedBytes <= 256 * 1024 * 1024 else { throw EngineError.unsupported("움짤 결과가 256MB를 넘어요. 크기나 자를 영역을 줄여 주세요.") }

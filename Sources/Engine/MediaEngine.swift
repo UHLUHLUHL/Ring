@@ -79,6 +79,17 @@ enum MediaEngine {
         let initial=automatic ? Double(width)*Double(height)*fps*(codec == .hevc ? 0.06:0.10):budget
         var rate=Int(max(100000,min(Double(maximumRate),budget,initial)))
         let progress=EngineProgress.handler
+        // Calibrate the starting rate on short, distributed motion windows.
+        // This only schedules work: the published file still passes the full
+        // frame-by-frame quality, timing and original-audio checks below.
+        // Skip short clips, already budget-limited rates, and the higher-rate
+        // H.264 starting profile where a probe often just adds a second pass.
+        if automatic, codec == .hevc, duration.seconds >= 8, Double(rate)*1.05 < budget {
+            rate = try await calibratedVideoRate(track: track, duration: duration.seconds,
+                workspace: workspace, rate: rate, maximumRate: min(maximumRate, Int(budget)),
+                width: width, height: height, natural: natural, transform: transform, crop: region,
+                codec: codec, colors: info.colorProperties, fullRange: info.fullRange)
+        }
         for attempt in 0..<maximumAttempts {
             try Task.checkCancellation()
             attempts+=1
@@ -121,9 +132,12 @@ enum MediaEngine {
                 // toward the smallest file that barely meets the safety floor.
                 // Explicit limit: spend the available budget on higher quality.
                 finished=automatic ? quality.preferredForAutomatic:
-                    quality.acceptable && Double(bytes)>=Double(byteLimit)*0.95
-                let increase=automatic ? quality.rateIncreaseFactor(preferred:true):
-                    max(quality.acceptable ? 1.05:quality.rateIncreaseFactor(preferred:false),available/measured*0.99)
+                    quality.acceptable && Double(bytes)>=Double(byteLimit)*0.90
+                // Stay inside the measured video budget. A quality deficit is
+                // not a reason to schedule a predictably oversized full pass.
+                let room = available / measured * 0.99
+                let increase = automatic ? min(quality.rateIncreaseFactor(preferred:true), room) : room
+                if increase <= 1.02 { finished = true }
                 next=Int(min(Double(maximumRate),ceil(Double(rate)*min(4,increase))))
             }
             if FileManager.default.fileExists(atPath:candidate.path) { try FileManager.default.removeItem(at:candidate) }
@@ -141,7 +155,7 @@ enum MediaEngine {
         guard let quality=bestQuality else {
             throw EngineError.quality(targetBytes == nil || targetBytes!>=savingLimit
                 ? "원본 프레임·해상도·오디오와 화질 기준을 지키면서 줄일 수 있는 결과가 없어요. 원본을 유지했어요."
-                : "목표 용량에서 원본 프레임·해상도·오디오와 화질 기준을 함께 지킬 수 없어요. 목표를 높이거나 비워 주세요.")
+                : "목표 용량과 화질 기준을 함께 만족하는 결과를 찾지 못했어요. 원본은 유지했어요. 목표를 높이거나 비워 주세요.")
         }
         try Task.checkCancellation()
         EngineProgress.report(0.90)
@@ -174,6 +188,47 @@ enum MediaEngine {
         try FileManager.default.moveItem(at:best,to:output)
         EngineProgress.report(0.99)
         return "\(codec == .hevc ? "HEVC":"H.264") · \(shown.width)×\(shown.height) · 원본 프레임·오디오 유지 · \(bestBytes)바이트 · \(automatic ? "자동 화질 우선":"상한 내 화질 우선") · \(quality.summary) · 후보 \(attempts)회"
+    }
+
+    /// Probe at most 2.25 seconds, not an entire second candidate. New keyframes
+    /// and unobserved scenes can make a probe optimistic, so never publish or
+    /// reject a source based on this estimate alone.
+    private static func calibratedVideoRate(track: AVAssetTrack, duration: Double,
+        workspace: URL, rate: Int, maximumRate: Int, width: Int, height: Int, natural: CGSize,
+        transform: CGAffineTransform, crop: CGRect?, codec: VideoCodec, colors: [String: Any], fullRange: Bool) async throws -> Int {
+        let composition = AVMutableComposition()
+        guard let sampled = composition.addMutableTrack(withMediaType: .video, preferredTrackID: kCMPersistentTrackID_Invalid) else { return rate }
+        sampled.preferredTransform = transform
+        let url = workspace.appendingPathComponent("rate-probe.mp4")
+        defer { try? FileManager.default.removeItem(at: url) }
+        do {
+            let window = 0.75
+            var position = CMTime.zero
+            for start in [0.0, (duration - window) / 2, duration - window] {
+                try Task.checkCancellation()
+                let range = CMTimeRange(start: CMTime(seconds: start, preferredTimescale: 600000),
+                    duration: CMTime(seconds: window, preferredTimescale: 600000))
+                try sampled.insertTimeRange(range, of: track, at: position)
+                position = CMTimeAdd(position, range.duration)
+            }
+            return try await EngineProgress.$handler.withValue(nil) {
+                try await encode(composition, to: url, video: sampled, audio: nil, duration: position,
+                    width: width, height: height, transform: transform, natural: natural, crop: crop,
+                    bitrate: rate, codec: codec, colorProperties: colors, fullRange: fullRange)
+                let encoded = AVURLAsset(url: url), outputTrack = try await encoded.loadTracks(withMediaType: .video)[0]
+                let quality = try VideoQuality.compare(source: composition, video: sampled, output: encoded, track: outputTrack,
+                    width: width, height: height, natural: natural, transform: transform, crop: crop,
+                    fullRange: fullRange, duration: position.seconds)
+                if quality.preferredForAutomatic { return rate }
+                return max(rate, min(maximumRate, Int(ceil(Double(rate) * quality.rateIncreaseFactor(preferred: true)))))
+            }
+        } catch is CancellationError { throw CancellationError() }
+        catch {
+            // Unusual edit lists can prevent a representative short composition.
+            // The ordinary verified full-file search remains the fallback.
+            try Task.checkCancellation()
+            return rate
+        }
     }
 
     static func encode(_ asset:AVAsset,to output:URL,video:AVAssetTrack,audio:AVAssetTrack?,duration:CMTime,width:Int,height:Int,transform:CGAffineTransform,natural:CGSize,crop:CGRect?,bitrate:Int,codec:VideoCodec,

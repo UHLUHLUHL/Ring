@@ -31,24 +31,26 @@ extension MediaEngine {
         }
         let resources = AnimationResources.shared
         resources.enter(); defer { resources.leave() }
-        var fps = options.fps, dimension = options.maxDimension, lastSize = 0
+        let fps = options.fps
+        var dimension = options.maxDimension, lastSize = 0
+        var previousSize: (pixels: Int, bytes: Int)?
         let initial = AnimationPlan(duration: duration, fps: fps, format: options.format)
         if let target = options.targetBytes, initial.frames.count >= 48,
            target < Int64(initial.frames.count) * Int64(dimension * dimension) * 2 {
             let sample = initial.sample
             let encoded = try await AnimationPipeline.encode(asset: asset, start: options.start, fps: fps, dimension: dimension,
-                extractionSize:extractionSize(for:dimension),crop: options.crop, plan: sample, format: options.format, quality: 90, allowParallelWebP: false) { EngineProgress.report(0.03 + 0.07 * $0) }
-            let estimate = Double(encoded.bytes.count) * Double(initial.frames.count) / Double(sample.frames.count) * 1.10
-            if estimate > Double(target) * 1.10 {
-                let ratio = max(0.4, min(0.95, sqrt(Double(target) / estimate) * 0.95))
-                dimension = max(16, Int(Double(dimension) * ratio))
+                extractionSize:extractionSize(for:dimension),crop: options.crop, plan: sample, format: options.format, quality: 90, allowParallelWebP: true) { EngineProgress.report(0.03 + 0.07 * $0) }
+            let estimate = Double(encoded.bytes.count) * Double(initial.frames.count) / Double(sample.frames.count) * 1.03
+            if estimate > Double(target) {
+                let ratio = max(0.1, min(0.98, sqrt(Double(target) / estimate) * 0.98))
+                dimension = max(min(16,dimension), Int(Double(dimension) * ratio))
             }
         }
-        for attempt in 0..<4 {
+        for _ in 0..<4 {
             try Task.checkCancellation()
             let plan = AnimationPlan(duration: duration, fps: fps, format: options.format)
             let encoded = try await AnimationPipeline.encode(asset: asset, start: options.start, fps: fps, dimension: dimension,
-                extractionSize:extractionSize(for:dimension),crop: options.crop, plan: plan, format: options.format, quality: max(40, 90 - attempt * 10), allowParallelWebP: options.targetBytes == nil) {
+                extractionSize:extractionSize(for:dimension),crop: options.crop, plan: plan, format: options.format, quality: 90, allowParallelWebP: true) {
                     EngineProgress.report(0.10 + 0.80 * $0)
                 }
             EngineProgress.report(0.92)
@@ -61,16 +63,27 @@ extension MediaEngine {
                 return "\(options.format.rawValue.uppercased()) · \(encoded.width)×\(encoded.height) · \(AnimationOptions.frameRateText(fps))fps · \(lastSize)바이트" + (options.format == .gif ? " · 적응형 255색·오차 확산 디더링" : "")
             }
             let excess = Double(options.targetBytes!) / Double(max(1, lastSize))
-            // Keep the requested motion as long as possible: quality and
-            // resolution go first. Frames go only on the final attempt, or once
-            // frames are so small that per-frame headers and GIF palettes
-            // dominate and shrinking them further saves little.
-            let tiny = encoded.width * encoded.height <= 64 * 64
-            if attempt == 2 || tiny { fps = max(1, fps * max(0.4, min(0.8, excess * 0.9))) }
-            if !tiny { dimension = max(16, Int(Double(dimension) * max(0.4, min(0.85, sqrt(excess) * 0.90)))) }
+            // Keep the requested cadence and q90 profile throughout the
+            // search. Correct spatial size using actual encoded bytes, rather
+            // than simultaneously changing FPS, quality and resolution.
+            var ratio = sqrt(excess)
+            let pixels = encoded.width*encoded.height
+            if let previous=previousSize,previous.pixels>pixels,previous.bytes>lastSize {
+                // Fit bytes = pixelCost * pixels + fixedCost from two actual
+                // encodes. Palettes/headers otherwise make sqrt(target/bytes)
+                // converge very slowly near small GIF/WebP byte limits.
+                let cost=Double(previous.bytes-lastSize)/Double(previous.pixels-pixels)
+                let overhead=max(0,Double(lastSize)-cost*Double(pixels))
+                let projected=max(1,(Double(options.targetBytes!)-overhead)/cost)
+                ratio=min(ratio,max(0.35,sqrt(projected/Double(pixels))))
+            }
+            previousSize=(pixels,lastSize)
+            let next = max(min(16, dimension), Int(Double(max(encoded.width,encoded.height)) * min(0.98, ratio * 0.96)))
+            if next >= dimension { break }
+            dimension = next
             EngineProgress.report(0.10)
         }
-        throw EngineError.quality("애니메이션 \(lastSize)바이트가 목표를 초과했어요.")
+        throw EngineError.quality("지정한 FPS와 인코딩 품질 설정으로 목표 용량을 맞추지 못했어요 (\(lastSize)바이트). 목표를 높여 주세요.")
     }
 }
 
@@ -168,50 +181,19 @@ enum AdaptivePalette {
         }
         var lookup=Data( capacity: palette.count * 3 )
         for color in palette { lookup.append(contentsOf:[UInt8(color.r),UInt8(color.g),UInt8(color.b)]) }
-        var cache=[Int](repeating:-1,count:32768),pixels=Data(count:width*height)
-        let rowLen = (width + 2) * 3
-        var current=[Float](repeating:0,count:rowLen),next=[Float](repeating:0,count:rowLen)
-        let pCount = palette.count
-        try rgba.withUnsafeBytes { rawIn in
-            try pixels.withUnsafeMutableBytes { rawOut in
-                let src = rawIn.bindMemory(to: UInt8.self).baseAddress!
-                let dst = rawOut.bindMemory(to: UInt8.self).baseAddress!
-                try palette.withUnsafeBufferPointer { pal in
-                    try cache.withUnsafeMutableBufferPointer { cacheBuf in
-                        try current.withUnsafeMutableBufferPointer { curBuf in
-                            try next.withUnsafeMutableBufferPointer { nxtBuf in
-                                var cur = curBuf.baseAddress!
-                                var nxt = nxtBuf.baseAddress!
-                                for y in 0..<height {
-                                    if (y & 31) == 0 { try Task.checkCancellation() }
-                                    let rowOffset = y * width
-                                    for x in 0..<width {
-                                        let p = (rowOffset + x) * 4, e = (x + 1) * 3
-                                        let r = max(0, min(255, Int((Float(src[p]) + cur[e]).rounded())))
-                                        let g = max(0, min(255, Int((Float(src[p+1]) + cur[e+1]).rounded())))
-                                        let b = max(0, min(255, Int((Float(src[p+2]) + cur[e+2]).rounded())))
-                                        let key = (r >> 3) << 10 | (g >> 3) << 5 | (b >> 3)
-                                        var index = cacheBuf[key]
-                                        if index < 0 {
-                                            let rr = ((key >> 10) & 31) * 8 + 4, gg = ((key >> 5) & 31) * 8 + 4, bb = (key & 31) * 8 + 4
-                                            var best = 0, distance = Int.max
-                                            for i in 0..<pCount {
-                                                let c = pal[i]
-                                                let d = (rr - c.r) * (rr - c.r) + (gg - c.g) * (gg - c.g) + (bb - c.b) * (bb - c.b)
-                                                if d < distance { distance = d; best = i }
-                                            }
-                                            cacheBuf[key] = best
-                                            index = best
-                                        }
-                                        let color = pal[index]
-                                        dst[rowOffset + x] = UInt8(index)
-                                        let dr = Float(r - color.r), dg = Float(g - color.g), db = Float(b - color.b)
-                                        cur[e+3] += dr * (7.0/16.0); nxt[e-3] += dr * (3.0/16.0); nxt[e] += dr * (5.0/16.0); nxt[e+3] += dr * (1.0/16.0)
-                                        cur[e+4] += dg * (7.0/16.0); nxt[e-2] += dg * (3.0/16.0); nxt[e+1] += dg * (5.0/16.0); nxt[e+4] += dg * (1.0/16.0)
-                                        cur[e+5] += db * (7.0/16.0); nxt[e-1] += db * (3.0/16.0); nxt[e+2] += db * (5.0/16.0); nxt[e+5] += db * (1.0/16.0)
-                                    }
-                                    swap(&cur, &nxt)
-                                    nxt.initialize(repeating: 0, count: rowLen)
+        var cache=[Int16](repeating:-1,count:32768),pixels=Data(count:width*height)
+        var errors=[Float](repeating:0,count:(width+2)*3*2)
+        try rgba.withUnsafeBytes { input in
+            try pixels.withUnsafeMutableBytes { output in
+                try lookup.withUnsafeBytes { palette in
+                    try cache.withUnsafeMutableBufferPointer { cache in
+                        try errors.withUnsafeMutableBufferPointer { errors in
+                            for row in stride(from:0,to:height,by:32) {
+                                try Task.checkCancellation()
+                                guard ring_palette_dither(input.bindMemory(to:UInt8.self).baseAddress!,Int32(width),Int32(height),
+                                    Int32(row),Int32(min(32,height-row)),palette.bindMemory(to:UInt8.self).baseAddress!,Int32(buckets.count),
+                                    output.bindMemory(to:UInt8.self).baseAddress!,cache.baseAddress!,errors.baseAddress!) == 1 else {
+                                    throw EngineError.io("팔레트 픽셀 변환 실패")
                                 }
                             }
                         }
