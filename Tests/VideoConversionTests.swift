@@ -56,9 +56,17 @@ import CryptoKit
     }
     static func compressionChecks(_ source:URL) async throws {
     for crop in [VideoCrop.full,VideoCrop(ratio:.square)] {
-        let result=try await RingEngine.shared.run(.init(source:source,operation:.video(.compress(.init(targetBytes:520000,codec:.hevc,crop:crop)))))
-        try await playback(result.url)
-        print("PASS compression",crop.isFull ? "original size":"VFR crop",result.detail)
+        do {
+            let result=try await RingEngine.shared.run(.init(source:source,operation:.video(.compress(.init(targetBytes:520000,codec:.hevc,crop:crop)))))
+            try await playback(result.url)
+            print("PASS compression",crop.isFull ? "original size":"VFR crop",result.detail)
+        } catch let error as EngineError {
+            // Original PCM consumes 460800 bytes. An old byte-only test could
+            // silently sacrifice video quality in the tiny remaining budget.
+            if case .quality(let reason)=error,reason.contains("화질 기준을 함께 지킬 수 없어요") {
+                print("PASS unchanged-audio target rejected at quality floor",crop.isFull ? "original":"crop")
+            } else { throw error }
+        }
     }
     do {
         _ = try await RingEngine.shared.run(.init(source:source,operation:.video(.compress(.init(targetBytes:1000,codec:.hevc)))))

@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 
 /// Window content: switches between the ring and the tool panels, plus the toast.
 struct RootView: View {
@@ -67,13 +68,14 @@ struct RingScreen: View {
                 }
                 .allowsHitTesting(!model.isWorking && !model.isNavigating)
                 .opacity(model.isWorking ? 0 : 1)
-                if model.showsVideoHub && !model.isWorking {
+                if model.file.kind == .video && model.tab == .convert && !model.isWorking {
                     VStack(spacing: 4) {
                         Text(model.videoNotice)
                             .font(.system(size: 10)).foregroundStyle(.secondary)
                             .multilineTextAlignment(.center).lineLimit(3)
                     }
-                    .frame(width: RingMetrics.canvas - 12)
+                    .frame(width: RingMetrics.canvas - 12, height: 36)
+                    .opacity(model.showsVideoHub ? 1 : 0)
                     .shadow(color: .black.opacity(0.3), radius: 2, y: 0.5)
                 }
             }
@@ -112,8 +114,8 @@ struct RingView: View {
                     .opacity(model.isWorking ? 0 : 1)
                 HubContent(model: model)
                     .scaleEffect(g)
-                    .opacity(model.isCompleting ? 0 : 1)
-                    .accessibilityHidden(model.isCompleting)
+                    .opacity(model.isWorking ? 0 : 1)
+                    .accessibilityHidden(model.isWorking)
                     .allowsHitTesting(false)
                 if model.isWorking {
                     HubProgress(model: model)
@@ -137,13 +139,17 @@ struct RingView: View {
         .onContinuousHover { phase in
             switch phase {
             case .active(let p):
+                let dx=p.x-center.x,dy=p.y-center.y
+                let drag=dx*dx+dy*dy<=RingWindowLayout.dragRadius*RingWindowLayout.dragRadius
+                (drag && !model.isNavigating && !model.isCompleting ? NSCursor.openHand:NSCursor.arrow).set()
                 guard !model.isWorking, !model.isNavigating else { return }
                 let hit = RingSlot.hit(p, center: center, count: items.count)
                 if hit != model.hovered {
-                    withAnimation(.spring(response: 0.28, dampingFraction: 0.7)) { model.hovered = hit }
+                    withAnimation(RingMotion.hover) { model.hovered = hit }
                 }
             case .ended:
-                withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) { model.hovered = nil }
+                NSCursor.arrow.set()
+                withAnimation(RingMotion.hover) { model.hovered = nil }
             }
         }
         .onTapGesture { p in
@@ -279,6 +285,10 @@ struct RingWedges: View, Animatable {
                     .frame(width: side, height: side)
                 ForEach(wedges, id: \.index) { w in
                     labels(w)
+                        // RingWedges already interpolates the label position and
+                        // tint. A second implicit animation makes text trail the
+                        // glass, then twitch again after the hover has settled.
+                        .transaction { $0.animation = nil }
                 }
             }
         }
@@ -356,14 +366,10 @@ struct SlotLabel: View {
     private let s = RingMetrics.scale
 
     var body: some View {
-        ZStack {
-            content.foregroundStyle(.primary)
-                .shadow(color: .black.opacity(0.35), radius: 3, y: 0.5)
-                .opacity(1 - lit)
-            content.foregroundStyle(.white)
-                .opacity(lit)
-        }
-        .fixedSize()
+        content
+            .foregroundStyle(Color.primary.mix(with:.white,by:lit))
+            .shadow(color:.black.opacity(0.35*(1-lit)),radius:3,y:0.5)
+            .fixedSize()
     }
 
     private var content: some View {
@@ -387,7 +393,7 @@ struct HubContent: View {
 
     var body: some View {
         Group {
-            if model.showsVideoHub { VideoHubContent(model: model) }
+            if model.file.kind == .video { VideoHubContent(model: model) }
             else { regularContent }
         }
     }
@@ -626,8 +632,8 @@ struct FrostLayer: View {
 
 /// Progress drawn on the hub's rim while the engine works. The engine reports real
 /// checkpoints (start, each PDF page, verification, saved); the arc eases between reports
-/// and creeps forward on a fixed curve so a single long step does not look frozen. It never
-/// passes 95% before the engine says the file is saved. Redrawn only while a job runs.
+/// Only engine-reported work advances the ring. Internal candidate changes do
+/// not reset it or change the caption. Redrawn only while a job runs.
 struct HubProgress: View {
     @ObservedObject var model: RingModel
 
@@ -643,10 +649,24 @@ struct HubProgress: View {
                     .trim(from: 0, to: value)
                     .stroke(Color.accentColor, style: StrokeStyle(lineWidth: 3, lineCap: .round))
                     .rotationEffect(.degrees(-90))
+                Group {
+                    if let image = model.thumbnail {
+                        Image(nsImage: image).resizable().scaledToFit()
+                            .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                    } else {
+                        Image(systemName: model.file.kind == .video ? "film" : "doc")
+                            .font(.system(size: 34)).foregroundStyle(.secondary)
+                    }
+                }
+                .frame(width: RingMetrics.hubDiameter * 0.68, height: RingMetrics.hubDiameter * 0.5)
+                .offset(y: -9)
+                .accessibilityLabel("처리 중인 파일 미리보기")
+                .accessibilityIdentifier("job.thumbnail")
                 VStack {
                     Spacer()
-                    Text("\(Int((value * 100).rounded()))%")
-                        .font(.system(size: 11, weight: .semibold).monospacedDigit())
+                    Text((model.progressLabel.map { $0+" " } ?? "")+"\(Int((value * 100).rounded()))%")
+                        .font(.system(size: model.progressLabel == nil ? 11:10.5, weight: .semibold).monospacedDigit())
+                        .frame(width:RingMetrics.hubDiameter-24,alignment:.center)
                         .shadow(color: .black.opacity(0.3), radius: 2, y: 0.5)
                         .padding(.bottom, 22)
                 }

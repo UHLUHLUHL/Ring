@@ -49,10 +49,10 @@ final class RingModel: ObservableObject {
     @Published var isCompleting = false
     /// Latest fraction reported by the engine. HubProgress interpolates between reports.
     @Published private(set) var progress: Double = 0
+    @Published private(set) var progressLabel: String?
     private(set) var progressFrom: Double = 0
     private(set) var progressChangedAt = Date()
     private(set) var progressAnimationDuration: TimeInterval = 0.16
-    private(set) var workStarted = Date()
     private var engineTask: Task<Void, Never>?
     private var completionTask: Task<Void, Never>?
 
@@ -90,7 +90,7 @@ final class RingModel: ObservableObject {
 
     func moveHover(_ delta: Int) {
         guard !items.isEmpty else { return }
-        withAnimation(.spring(response: 0.3, dampingFraction: 0.75)) {
+        withAnimation(RingMotion.hover) {
             hovered = ((hovered ?? (delta > 0 ? -1 : 0)) + delta + items.count) % items.count
         }
     }
@@ -205,6 +205,7 @@ final class RingModel: ObservableObject {
         isCompleting = false
         isCancelling = false
         resetProgress()
+        if case .video(.compress)=operation { progressLabel="최적화 중" }
         // Back on the ring (tool panels hand over here) so the hub can show the progress.
         withAnimation(RingMotion.sCurve(RingMotion.fold)) { screen = .ring; hovered = nil; isWorking = true }
         let job = EngineJob(source: file.url, operation: operation)
@@ -249,7 +250,7 @@ final class RingModel: ObservableObject {
         progressFrom = 0
         progressChangedAt = now
         progressAnimationDuration = 0.16
-        workStarted = now
+        progressLabel = nil
     }
 
     private func reportProgress(_ value: Double) {
@@ -273,12 +274,7 @@ final class RingModel: ObservableObject {
         let eased = t * t * (3 - 2 * t)
         let reported = progressFrom + (progress - progressFrom) * eased
 
-        // Keep the established slow creep between engine checkpoints, but make reported
-        // checkpoints ease into it instead of snapping the ring and percentage label.
-        guard progress < 1 else { return reported }
-        let workElapsed = max(0, date.timeIntervalSince(workStarted))
-        let creep = 0.78 * (1 - exp(-workElapsed / 3.5))
-        return min(max(reported, creep), 0.95)
+        return reported
     }
 
     var regionTitle: String {
@@ -332,7 +328,7 @@ final class RingModel: ObservableObject {
         switch event.keyCode {
         case 48 where event.modifierFlags.contains(.shift):
             // ⇧tab: start at the top slot, then step clockwise.
-            withAnimation(.spring(response: 0.3, dampingFraction: 0.72)) {
+            withAnimation(RingMotion.hover) {
                 hovered = hovered.map { ($0 + 1) % max(items.count, 1) } ?? 0
             }
         case 48: // tab
@@ -465,6 +461,7 @@ extension RingModel {
 
 /// Folding uses standard ease-in-ease-out; dismissal has a slower start and soft landing.
 enum RingMotion {
+    static let hover = Animation.spring(response: 0.24, dampingFraction: 1)
     static let opening = Animation.spring(response: 0.42, dampingFraction: 0.74)
     static let checkDraw = 0.55
     /// Draw the check, hold it briefly, then use the normal ring close animation.

@@ -9,6 +9,58 @@
 #include <webp/mux.h>
 #include <webp/demux.h>
 #include <zlib.h>
+#include <math.h>
+
+int ring_video_plane_quality(const uint8_t *reference,size_t reference_stride,
+    const uint8_t *encoded,size_t encoded_stride,int width,int height,
+    int pixel_stride,int phase,RingVideoPlaneQuality *result) {
+    if(!reference || !encoded || !result || width<1 || height<1 || phase<0 ||
+       (pixel_stride!=1 && pixel_stride!=2) || reference_stride<(size_t)width*pixel_stride ||
+       encoded_stride<(size_t)width*pixel_stride) return 0;
+    const int columns=(width+7)/8,rows=(height+7)/8;
+    int step=1;
+    while(((columns+step-1)/step)*((rows+step-1)/step)>4096) step++;
+    const int x_phase=phase%step,y_phase=(phase/step)%step;
+    unsigned histogram[1001]={0};
+    double sum_ssim=0;unsigned blocks=0;
+    for(int by=y_phase;by<rows;by+=step) for(int bx=x_phase;bx<columns;bx+=step) {
+        double a=0,b=0,aa=0,bb=0,ab=0;
+        const int block_width=width-bx*8<8 ? width-bx*8:8;
+        const int block_height=height-by*8<8 ? height-by*8:8;
+        const double pixels=block_width*block_height;
+        for(int y=0;y<block_height;y++) {
+            const uint8_t *r=reference+(by*8+y)*reference_stride+bx*8*pixel_stride;
+            const uint8_t *e=encoded+(by*8+y)*encoded_stride+bx*8*pixel_stride;
+            for(int x=0;x<block_width;x++) {
+                double v=r[x*pixel_stride],w=e[x*pixel_stride];
+                a+=v;b+=w;aa+=v*v;bb+=w*w;ab+=v*w;
+            }
+        }
+        a/=pixels;b/=pixels;
+        const double va=fmax(0,aa/pixels-a*a),vb=fmax(0,bb/pixels-b*b),cov=ab/pixels-a*b;
+        // SSIM constants K1=.01, K2=.03, L=255; box windows, no rescaling.
+        double score=((2*a*b+6.5025)*(2*cov+58.5225))/((a*a+b*b+6.5025)*(va+vb+58.5225));
+        score=fmin(1,fmax(0,score));
+        histogram[(int)(score*1000)]++;sum_ssim+=score;blocks++;
+    }
+    if(!blocks) return 0;
+    const unsigned tail_count=(blocks+9)/10;
+    unsigned remaining=tail_count;double tail=0;
+    for(int bin=0;bin<=1000 && remaining;bin++) {
+        unsigned count=histogram[bin]<remaining ? histogram[bin]:remaining;
+        tail+=count*(double)bin/1000;remaining-=count;
+    }
+    result->ssim=sum_ssim/blocks;result->tail_ssim=tail/tail_count;
+    uint64_t squared=0;
+    for(int y=0;y<height;y++) {
+        const uint8_t *r=reference+y*reference_stride,*e=encoded+y*encoded_stride;
+        for(int x=0;x<width;x++) {
+            int d=(int)r[x*pixel_stride]-(int)e[x*pixel_stride];
+            squared+=(unsigned)(d*d);
+        }
+    }
+    result->mse=(double)squared/((double)width*height);return 1;
+}
 
 void ring_buffer_free(void *buffer) { free(buffer); }
 void ring_rgba16_to_rgba8(const uint16_t * restrict source,uint8_t * restrict output,size_t pixels) {

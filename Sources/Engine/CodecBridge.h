@@ -35,6 +35,13 @@ int ring_pdf_pages(const char *const *sources,const int *pages,size_t count,doub
 typedef int (*ring_pdf_image_callback)(void *context,const uint8_t *data,size_t size,int width,int height,int channels,int jpeg,const uint8_t *icc,size_t icc_size,uint8_t **output,size_t *output_size,int *out_width,int *out_height);
 int ring_pdf_smart_compress(const char *source,const char *output,int minimum_dimension,ring_pdf_image_callback callback,void *context,int *changed,char *error,size_t error_size);
 int ring_pdf_check(const char *source,int expected_pages,char *error,size_t error_size);
+/* Full-resolution 8x8 box SSIM on a bounded spatial grid; squared error over
+   every pixel, including partial edge blocks.
+   pixel_stride is 1 for luma, 2 for either interleaved NV12 chroma component. */
+typedef struct { double ssim, tail_ssim, mse; } RingVideoPlaneQuality;
+int ring_video_plane_quality(const uint8_t *reference, size_t reference_stride,
+    const uint8_t *encoded, size_t encoded_stride, int width, int height,
+    int pixel_stride, int phase, RingVideoPlaneQuality *result);
 #ifdef __cplusplus
 }
 #endif

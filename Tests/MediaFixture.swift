@@ -5,11 +5,13 @@ import AVFoundation
 enum MediaFixture {
     static func write(_ url: URL, codec: AVVideoCodecType = .h264, width: Int = 320, height: Int = 180,
                       times: [Double], duration: Double, transform: CGAffineTransform = .identity,
-                      colorProperties: [String: Any] = [:]) async throws {
+                      colorProperties: [String: Any] = [:], bitrate: Int? = nil, keyFrameInterval: Int? = nil) async throws {
         let writer = try AVAssetWriter(outputURL: url, fileType: url.pathExtension == "mov" ? .mov : .mp4)
         var settings: [String: Any] = [AVVideoCodecKey: codec, AVVideoWidthKey: width, AVVideoHeightKey: height]
         if codec == .h264 || codec == .hevc {
-            settings[AVVideoCompressionPropertiesKey] = [AVVideoAverageBitRateKey: width * height * 6]
+            var compression: [String: Any] = [AVVideoAverageBitRateKey: bitrate ?? width * height * 6]
+            if let keyFrameInterval { compression[AVVideoMaxKeyFrameIntervalKey] = keyFrameInterval }
+            settings[AVVideoCompressionPropertiesKey] = compression
         }
         if !colorProperties.isEmpty { settings[AVVideoColorPropertiesKey] = colorProperties }
         let input = AVAssetWriterInput(mediaType: .video, outputSettings: settings)

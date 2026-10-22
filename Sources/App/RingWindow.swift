@@ -5,6 +5,7 @@ enum RingWindowLayout {
     static let size = CGSize(width: 560, height: 720)
     /// Distance from the window's top edge to the ring centre.
     static let ringCenterY: CGFloat = 300
+    static let dragRadius:CGFloat = (RingMetrics.hubDiameter-12)/2
     /// The part of the window the ring screen actually uses (ring + tab pill + hints),
     /// relative to the ring centre. Only this has to stay on screen.
     static let ringBlock = CGRect(x: -RingMetrics.canvas / 2, y: -RingMetrics.canvas / 2,
@@ -25,8 +26,40 @@ final class RingPanel: NSPanel {
     /// Ring's own key handling. Runs before SwiftUI sees the key: otherwise SwiftUI used tab
     /// to move focus between buttons instead of switching 변환/편집.
     var keyHandler: ((NSEvent) -> Bool)?
+    var canDragAt: ((NSPoint) -> Bool)?
+    private var dragStart: (mouse: NSPoint, origin: NSPoint)?
+
+    override func constrainFrameRect(_ frameRect: NSRect, to screen: NSScreen?) -> NSRect {
+        // The transparent canvas may extend beyond the screen. AppKit must not
+        // shrink it during a native drag and shift the fixed-size SwiftUI content.
+        frameRect
+    }
 
     override func sendEvent(_ event: NSEvent) {
+        // Handle the hub before SwiftUI's ancestor tap recognizer. A representable
+        // drag view under that recognizer does not consistently receive mouseDown.
+        if event.type == .leftMouseDown {
+            dragStart = nil
+            if canDragAt?(event.locationInWindow) == true {
+                dragStart = (convertPoint(toScreen: event.locationInWindow), frame.origin)
+                NSCursor.closedHand.set()
+                return
+            }
+        }
+        if let start = dragStart {
+            if event.type == .leftMouseDragged {
+                let mouse = convertPoint(toScreen: event.locationInWindow)
+                setFrameOrigin(NSPoint(x: start.origin.x + mouse.x - start.mouse.x,
+                                       y: start.origin.y + mouse.y - start.mouse.y))
+                return
+            }
+            if event.type == .leftMouseUp {
+                dragStart = nil
+                NSCursor.openHand.set()
+                DebugLog.write("window dragged \(NSStringFromPoint(start.origin)) → \(NSStringFromRect(frame))")
+                return
+            }
+        }
         if event.type == .keyDown {
             DebugLog.write("panel keyDown \(event.keyCode)")
             if keyHandler?(event) == true { return }
@@ -98,7 +131,8 @@ final class RingWindowController {
         panel.hasShadow = false
         panel.level = .popUpMenu
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .transient]
-        panel.isMovable = false
+        panel.isMovable = true
+        panel.isMovableByWindowBackground = false
         panel.hidesOnDeactivate = false
         panel.becomesKeyOnlyIfNeeded = false
 
@@ -122,6 +156,12 @@ final class RingWindowController {
         // Keys are handled in the panel itself, and esc additionally as a hot key, because a plain
         // esc key press never arrived (see EscapeHotKey).
         panel.keyHandler = { [weak self] event in self?.model.handleKey(event) ?? false }
+        panel.canDragAt = { [weak self] point in
+            guard let self,self.model.screen == .ring,!self.model.isNavigating,!self.model.isCompleting else { return false }
+            let dx=point.x-self.panel.frame.width/2
+            let dy=point.y-(self.panel.frame.height-RingWindowLayout.ringCenterY)
+            return dx*dx+dy*dy<=RingWindowLayout.dragRadius*RingWindowLayout.dragRadius
+        }
         EscapeHotKey.register()
         // Clicking anywhere outside the panel closes it, like a menu.
         if let m = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown], handler: { [weak self] e in

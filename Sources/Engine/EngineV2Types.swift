@@ -165,7 +165,7 @@ enum VideoCropGeometry {
 }
 
 struct VideoCompressionOptions {
-    var targetBytes: Int64
+    var targetBytes: Int64? = nil
     var codec: VideoCodec
     var maxDimension: Int? = nil
     var crop: VideoCrop = .full
