@@ -40,7 +40,7 @@ struct RootView: View {
         // whole view made the glass render lighter until the animation ended.
         .opacity(model.appeared ? 1 : 0)
         .onAppear {
-            withAnimation(.spring(response: 0.42, dampingFraction: 0.74)) { model.appeared = true }
+            withAnimation(RingMotion.opening) { model.appeared = true }
         }
     }
 }

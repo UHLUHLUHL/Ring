@@ -346,6 +346,7 @@ final class RingModel: ObservableObject {
 
 /// Folding uses standard ease-in-ease-out; dismissal has a slower start and soft landing.
 enum RingMotion {
+    static let opening = Animation.spring(response: 0.42, dampingFraction: 0.74)
     static let checkDraw = 0.55
     /// Draw the check, hold it briefly, then use the normal ring close animation.
     static let successVisible = 1.35
@@ -353,7 +354,7 @@ enum RingMotion {
     static let close = 0.30
     static var menuExpansion: Animation {
         let reduced = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
-        return .spring(response: reduced ? 0.18 : 0.32, dampingFraction: reduced ? 1 : 0.82)
+        return reduced ? .spring(response: 0.18, dampingFraction: 1) : opening
     }
     static var closeDuration: Double { NSWorkspace.shared.accessibilityDisplayShouldReduceMotion ? 0.18 : close }
     static var dismissal: Animation {
