@@ -17,31 +17,15 @@ enum VideoConversionCodec: String, Hashable {
     var encodingCodec: VideoCodec { self == .hevc ? .hevc : .h264 }
 }
 
-enum VideoQuality: String, CaseIterable, Hashable {
-    case sharp, balanced, small
-    var title: String {
-        switch self { case .sharp: return "선명하게"; case .balanced: return "균형"; case .small: return "작게" }
-    }
-    // Target bits per source pixel per source frame. These are actual encoder
-    // targets, shared by both codecs; codec names never imply a size reduction.
-    var bitsPerPixel: Double {
-        switch self { case .sharp: return 0.16; case .balanced: return 0.095; case .small: return 0.05 }
-    }
-}
-
 struct VideoConversionOptions {
     var container: VideoContainer
     var codec: VideoConversionCodec
-    var quality: VideoQuality? = nil
     var sourceBytes: Int64? = nil
     var sourceModified: Date? = nil
 }
 
 struct VideoEncodingPlan {
     let videoBitrate: Int
-    let audioBitrate: Int
-    let copyAudio: Bool
-    let estimatedBytes: Int64
 }
 
 struct VideoSourceInfo {
@@ -61,6 +45,7 @@ struct VideoSourceInfo {
     let audioChannels: Int
     let audioSampleRate: Double
     let colorProperties: [String: Any]
+    let fullRange: Bool
     let reencodeRestriction: String?
     let codecs: [VideoContainer: [VideoConversionCodec]]
     let copyAudio: [VideoContainer: Bool]
@@ -89,8 +74,12 @@ struct VideoSourceInfo {
         let resource = try url.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey])
         var restriction: String?
         var colors: [String: Any] = [:]
+        var fullRange: Bool?
         for d in descriptions {
             let ext = (CMFormatDescriptionGetExtensions(d) as NSDictionary?) ?? [:]
+            let range = (ext[kCMFormatDescriptionExtension_FullRangeVideo] as? NSNumber)?.boolValue ?? false
+            if let previous = fullRange, previous != range { restriction = "도중에 색상 범위가 달라지는 영상은 원본 유지만 가능해요." }
+            fullRange = range
             let dimensions = CMVideoFormatDescriptionGetDimensions(d)
             if Int(dimensions.width) != width || Int(dimensions.height) != height {
                 restriction = "별도 표시 해상도가 있는 영상은 원본 유지만 가능해요."
@@ -165,14 +154,11 @@ struct VideoSourceInfo {
             defer { try? FileManager.default.removeItem(at: scratch) }
             let writer = try AVAssetWriter(outputURL: scratch, fileType: container.fileType)
             let audioPass = audioDescription.map {
-                let type = CMFormatDescriptionGetMediaSubType($0)
-                let muxable = container == .mov || [kAudioFormatMPEG4AAC, kAudioFormatMPEG4AAC_HE,
-                    kAudioFormatMPEG4AAC_HE_V2, kAudioFormatAppleLossless].contains(type)
-                return muxable && writer.canAdd(AVAssetWriterInput(mediaType: .audio, outputSettings: nil, sourceFormatHint: $0))
+                writer.canAdd(AVAssetWriterInput(mediaType: .audio, outputSettings: nil, sourceFormatHint: $0))
             } ?? true
             copyAudio[container] = audioPass
             var supported: [VideoConversionCodec] = []
-            if restriction == nil && (audioPass || (1...2).contains(channels) && sampleRate.isFinite && sampleRate > 0) {
+            if restriction == nil && audioPass {
                 for codec in [VideoConversionCodec.h264, .hevc] {
                     var settings: [String: Any] = [AVVideoCodecKey: codec == .h264 ? AVVideoCodecType.h264 : .hevc,
                         AVVideoWidthKey: width, AVVideoHeightKey: height]
@@ -198,37 +184,20 @@ struct VideoSourceInfo {
         return VideoSourceInfo(duration: duration, videoDuration: videoTime, audioDuration: audioTime, width: width, height: height,
             frameRate: fps, videoBitrate: videoRate, audioBitrate: audioRate, videoBytes: videoBytes, audioBytes: audioBytes,
             sourceBytes: Int64(resource.fileSize ?? 0), modified: resource.contentModificationDate, hasAudio: !audios.isEmpty,
-            audioChannels: channels, audioSampleRate: sampleRate, colorProperties: colors, reencodeRestriction: restriction,
+            audioChannels: channels, audioSampleRate: sampleRate, colorProperties: colors, fullRange: fullRange ?? false, reencodeRestriction: restriction,
             codecs: codecs, copyAudio: copyAudio)
     }
 
     func plan(_ options: VideoConversionOptions) throws -> VideoEncodingPlan {
         guard codecs[options.container]?.contains(options.codec) == true else { throw EngineError.unsupported("이 입력과 출력 조합은 지원하지 않아요.") }
-        let overhead = 4096 + max(0, duration * max(frameRate.isFinite ? frameRate : 0, 1)) * 16
-            + max(0, audioDuration * audioSampleRate / 1024) * 16
-        guard overhead.isFinite, overhead >= 0, overhead < Double(Int64.max / 4) else { throw EngineError.invalid("길이·프레임률 정보가 유효하지 않아요.") }
         if options.codec == .passthrough {
-            let (payload, overflow) = videoBytes.addingReportingOverflow(audioBytes)
-            guard videoBytes > 0, !hasAudio || audioBytes > 0 else { throw EngineError.invalid("원본 스트림의 크기를 읽지 못했어요.") }
-            guard !overflow, payload < Int64.max - Int64(overhead) else { throw EngineError.invalid("원본 용량 정보가 유효하지 않아요.") }
-            return VideoEncodingPlan(videoBitrate: 0, audioBitrate: 0, copyAudio: true, estimatedBytes: payload + Int64(overhead))
+            return VideoEncodingPlan(videoBitrate: 0)
         }
-        guard let quality = options.quality else { throw EngineError.invalid("화질을 먼저 선택해 주세요.") }
-        let target: Double
-        if frameRate.isFinite, frameRate > 0 { target = Double(width) * Double(height) * frameRate * quality.bitsPerPixel }
-        else {
-            let factor: Double = quality == .sharp ? 1.2 : quality == .balanced ? 0.8 : 0.45
-            target = videoBitrate * factor
-        }
-        guard target.isFinite, target > 0 else { throw EngineError.invalid("용량 추정에 필요한 영상 정보를 읽지 못했어요.") }
-        let rate = Int(min(100_000_000, max(100_000, target.rounded())))
-        let pass = copyAudio[options.container] ?? false
-        let audioRate = !hasAudio ? 0 : pass ? max(0, Int(audioBitrate.isFinite ? audioBitrate : 0)) : (audioChannels == 1 ? 128_000 : 192_000)
-        let audioSize = pass ? (audioBytes > 0 ? Double(audioBytes) : Double(audioRate) * audioDuration / 8) : Double(audioRate) * audioDuration / 8
-        guard !hasAudio || audioSize > 0 else { throw EngineError.invalid("음성 용량을 추정하지 못했어요.") }
-        let size = Double(rate) * videoDuration / 8 + audioSize + overhead
-        guard size.isFinite, size > 0, size < Double(Int64.max) else { throw EngineError.invalid("용량을 추정할 수 없어요.") }
-        return VideoEncodingPlan(videoBitrate: rate, audioBitrate: audioRate, copyAudio: pass, estimatedBytes: Int64(size.rounded()))
+        // Format conversion keeps the source bitrate budget. Size reduction is
+        // a separate tool; changing a codec never applies a guessed discount.
+        let rate = videoBitrate.isFinite && videoBitrate > 0 ? videoBitrate : Double(videoBytes)*8/videoDuration
+        guard rate.isFinite, rate > 0, rate < Double(Int.max) else { throw EngineError.invalid("원본 영상 비트레이트를 읽지 못했어요.") }
+        return VideoEncodingPlan(videoBitrate: max(100_000,Int(rate.rounded())))
     }
 }
 
@@ -251,8 +220,8 @@ extension MediaEngine {
             try await encode(asset, to: output, video: track, audio: audios.first, duration: duration,
                 width: info.width, height: info.height, transform: transform,
                 natural: CGSize(width: info.width, height: info.height), crop: nil,
-                bitrate: plan.videoBitrate, audioRate: plan.audioBitrate, codec: options.codec.encodingCodec,
-                fileType: options.container.fileType, colorProperties: info.colorProperties, copyAudio: plan.copyAudio)
+                bitrate: plan.videoBitrate, codec: options.codec.encodingCodec,
+                fileType: options.container.fileType, colorProperties: info.colorProperties, fullRange: info.fullRange)
         }
         try Task.checkCancellation()
         EngineProgress.report(0.88)
@@ -270,16 +239,8 @@ extension MediaEngine {
                   [expectedTransform.a,expectedTransform.b,expectedTransform.c,expectedTransform.d,expectedTransform.tx,expectedTransform.ty]).allSatisfy({ abs($0 - $1) < 0.01 }) else {
             throw EngineError.quality("출력 영상의 회전·위치가 원본과 달라요.")
         }
-        let ext = (CMFormatDescriptionGetExtensions(outDescription) as NSDictionary?) ?? [:]
-        for (key, cmKey) in [(AVVideoColorPrimariesKey,kCMFormatDescriptionExtension_ColorPrimaries),
-                             (AVVideoTransferFunctionKey,kCMFormatDescriptionExtension_TransferFunction),
-                             (AVVideoYCbCrMatrixKey,kCMFormatDescriptionExtension_YCbCrMatrix)] {
-            if let color = info.colorProperties[key] as? String, ext[cmKey] as? String != color { throw EngineError.quality("출력 색상 정보가 원본과 달라요.") }
-        }
-        let originalVideo = try streamSignature(asset: asset, track: track, payload: options.codec == .passthrough)
-        let writtenVideo = try streamSignature(asset: result, track: outVideo, payload: options.codec == .passthrough)
-        guard originalVideo.count == writtenVideo.count, originalVideo.times == writtenVideo.times else { throw EngineError.quality("영상 프레임 타이밍이 원본과 달라요.") }
-        if options.codec == .passthrough, originalVideo.payload != writtenVideo.payload { throw EngineError.quality("원본 유지 결과의 영상 데이터가 달라요.") }
+        try await verifyVideoColor(outVideo, colors: info.colorProperties, fullRange: info.fullRange)
+        try verifyFrameTiming(source: asset, video: track, output: result, track: outVideo, copyPayload: options.codec == .passthrough)
         if let audio = audios.first {
             let outAudio = try await result.loadTracks(withMediaType: .audio)[0]
             let audioDescription = try await outAudio.load(.formatDescriptions).first
@@ -288,18 +249,37 @@ extension MediaEngine {
                   abs(stream.pointee.mSampleRate - info.audioSampleRate) < 0.01 else {
                 throw EngineError.quality("출력 음성의 채널·샘플률이 원본과 달라요.")
             }
-            if plan.copyAudio {
-                let a = try streamSignature(asset: asset, track: audio, payload: true)
-                let b = try streamSignature(asset: result, track: outAudio, payload: true)
-                let sourceRange = try await audio.load(.timeRange), resultRange = try await outAudio.load(.timeRange)
-                guard a.payload == b.payload, abs(sourceRange.start.seconds - resultRange.start.seconds) < 0.001,
-                      abs(sourceRange.end.seconds - resultRange.end.seconds) < 0.001 else { throw EngineError.quality("원본 음성의 데이터·타이밍이 달라요.") }
-            } else {
-                let a = try await audio.load(.timeRange), b = try await outAudio.load(.timeRange)
-                guard abs(a.start.seconds - b.start.seconds) < 0.05, abs(a.end.seconds - b.end.seconds) < 0.05 else { throw EngineError.quality("음성 동기화가 원본과 달라요.") }
-            }
+            try await verifyOriginalAudio(source: asset, audio: audio, output: result, track: outAudio)
         }
-        return "\(options.container.title) · \(options.codec.title) · \(options.codec == .passthrough ? "재압축 없음" : options.quality!.title) · 원본 해상도·프레임 타이밍 유지"
+        return "\(options.container.title) · \(options.codec.title) · 원본 해상도·프레임·오디오 유지"
+    }
+
+    static func verifyVideoColor(_ track: AVAssetTrack, colors: [String: Any], fullRange: Bool) async throws {
+        let description = try await track.load(.formatDescriptions)[0]
+        let ext = (CMFormatDescriptionGetExtensions(description) as NSDictionary?) ?? [:]
+        for (key, cmKey) in [(AVVideoColorPrimariesKey,kCMFormatDescriptionExtension_ColorPrimaries),
+                             (AVVideoTransferFunctionKey,kCMFormatDescriptionExtension_TransferFunction),
+                             (AVVideoYCbCrMatrixKey,kCMFormatDescriptionExtension_YCbCrMatrix)] {
+            if let color = colors[key] as? String, ext[cmKey] as? String != color { throw EngineError.quality("출력 색상 정보가 원본과 달라요.") }
+        }
+        guard ((ext[kCMFormatDescriptionExtension_FullRangeVideo] as? NSNumber)?.boolValue ?? false) == fullRange else {
+            throw EngineError.quality("출력 영상의 색상 범위가 원본과 달라요.")
+        }
+    }
+
+    static func verifyFrameTiming(source: AVAsset, video: AVAssetTrack, output: AVAsset, track: AVAssetTrack, copyPayload: Bool = false) throws {
+        let a = try streamSignature(asset: source, track: video, payload: copyPayload)
+        let b = try streamSignature(asset: output, track: track, payload: copyPayload)
+        guard a.count == b.count, a.times == b.times else { throw EngineError.quality("영상 프레임 타이밍이 원본과 달라요.") }
+        if copyPayload, a.payload != b.payload { throw EngineError.quality("원본 유지 결과의 영상 데이터가 달라요.") }
+    }
+
+    static func verifyOriginalAudio(source: AVAsset, audio: AVAssetTrack, output: AVAsset, track: AVAssetTrack) async throws {
+        let a = try streamSignature(asset: source, track: audio, payload: true)
+        let b = try streamSignature(asset: output, track: track, payload: true)
+        let sourceRange = try await audio.load(.timeRange), resultRange = try await track.load(.timeRange)
+        guard a.payload == b.payload, abs(sourceRange.start.seconds - resultRange.start.seconds) < 0.001,
+              abs(sourceRange.end.seconds - resultRange.end.seconds) < 0.001 else { throw EngineError.quality("원본 음성의 데이터·타이밍이 달라요.") }
     }
 
     /// Constant-memory sample verification. The commutative timestamp digest
@@ -321,13 +301,21 @@ extension MediaEngine {
                 // edit-list audio delay. Output PTS is the actual playback time.
                 let time = CMSampleBufferGetOutputPresentationTimeStamp(sample).seconds
                 guard time.isFinite, abs(time) < Double(Int64.max) / 1_000_000 else { throw EngineError.quality("유효하지 않은 프레임 시간이 있어요.") }
-                var micros = Int64((time * 1_000_000).rounded()).littleEndian
-                let digest = withUnsafeBytes(of: &micros) { SHA256.hash(data: Data($0)) }
-                let bytes = Array(digest)
-                for word in 0..<4 {
-                    var value: UInt64 = 0
-                    for byte in 0..<8 { value |= UInt64(bytes[word * 8 + byte]) << (byte * 8) }
-                    times[word] &+= value
+                // Compressed streams can contain decoder preroll/postroll that
+                // is explicitly excluded from display by an edit list. It must
+                // not be counted as a frame lost by the decoder/encoder.
+                let attachments = CMSampleBufferGetSampleAttachmentsArray(sample, createIfNecessary: false) as? [[String: Any]]
+                let hidden = (attachments?.first?[kCMSampleAttachmentKey_DoNotDisplay as String] as? NSNumber)?.boolValue ?? false
+                if !hidden {
+                    var micros = Int64((time * 1_000_000).rounded()).littleEndian
+                    let digest = withUnsafeBytes(of: &micros) { SHA256.hash(data: Data($0)) }
+                    let bytes = Array(digest)
+                    for word in 0..<4 {
+                        var value: UInt64 = 0
+                        for byte in 0..<8 { value |= UInt64(bytes[word * 8 + byte]) << (byte * 8) }
+                        times[word] &+= value
+                    }
+                    count += 1
                 }
                 if payload, let block = CMSampleBufferGetDataBuffer(sample) {
                     let size = CMBlockBufferGetDataLength(block)
@@ -336,7 +324,6 @@ extension MediaEngine {
                     guard status == kCMBlockBufferNoErr else { throw EngineError.io("스트림 검증 데이터 읽기 실패") }
                     hash.update(data: bytes)
                 }
-                count += 1
             }
         }
         guard reader.status == .completed, count > 0 else { throw reader.error ?? EngineError.quality("스트림 검증이 끝나지 않았어요.") }

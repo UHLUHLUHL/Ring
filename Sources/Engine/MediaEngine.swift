@@ -4,6 +4,7 @@ import VideoToolbox
 import CoreVideo
 import AudioToolbox
 import ImageIO
+import CoreImage
 
 enum MediaEngine {
     static func run(_ source:URL,to output:URL,operation:VideoOperation) async throws -> String {
@@ -38,80 +39,73 @@ enum MediaEngine {
     static func compress(_ source:URL,to output:URL,options:VideoCompressionOptions) async throws -> String {
         let targetBytes = options.targetBytes, codec = options.codec
         guard targetBytes>0,targetBytes<=1_000_000_000_000 else { throw EngineError.invalid("목표 비디오 용량 오류") }
-        if let maxDimension = options.maxDimension, !(16...8192).contains(maxDimension) {
-            throw EngineError.invalid("최대 영상 변은 16~8,192px이어야 해요.")
-        }
+        let info=try await VideoSourceInfo.inspect(source)
+        if let restriction=info.reencodeRestriction { throw EngineError.unsupported(restriction) }
+        guard info.copyAudio[.mp4] == true else { throw EngineError.unsupported("MP4에 원본 음성을 그대로 담을 수 없어요. 음성을 낮추지 않고 작업을 중단했어요.") }
         let asset=AVURLAsset(url:source),duration=try await asset.load(.duration)
         let video=try await asset.loadTracks(withMediaType:.video),audio=try await asset.loadTracks(withMediaType:.audio)
-        guard duration.seconds.isFinite,duration.seconds>0,video.count==1,audio.count<=1 else { throw EngineError.unsupported("비디오 1트랙·오디오 최대 1트랙만 압축해요.") }
         let track=video[0],natural=try await track.load(.naturalSize),transform=try await track.load(.preferredTransform)
-        let descriptions=try await track.load(.formatDescriptions)
-        for description in descriptions {
-            let extensions=(CMFormatDescriptionGetExtensions(description) as NSDictionary?) ?? [:]
-            if let transfer=extensions[kCMFormatDescriptionExtension_TransferFunction] as? String,
-               [kCVImageBufferTransferFunction_ITU_R_2100_HLG as String,kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ as String].contains(transfer) { throw EngineError.unsupported("HDR 비디오는 톤 매핑을 명시하기 전까지 압축하지 않아요.") }
+        let display=natural.applying(transform)
+        let shownWidth=abs(Double(display.width)),shownHeight=abs(Double(display.height))
+        let maximum=Int(max(shownWidth,shownHeight).rounded())
+        if let limit=options.maxDimension, !(16...max(16,maximum)).contains(limit) {
+            throw EngineError.invalid("긴 변은 16px부터 원본 \(maximum)px까지 선택할 수 있어요.")
         }
-        let audioRate=audio.isEmpty ? 0:96000
-        let budget=VideoCropGeometry.videoBitrate(targetBytes:targetBytes,duration:duration.seconds,audio:!audio.isEmpty)
-        guard budget>=100000,budget<=Double(Int.max),natural.width.isFinite,natural.height.isFinite,natural.width>=2,natural.height>=2 else { throw EngineError.quality("이 길이의 비디오에는 목표 용량이 너무 작아요.") }
-        var rate=Int(min(budget,100_000_000)),lastSize=0
-        for attempt in 0..<2 {
+        let budget=VideoCropGeometry.videoBitrate(targetBytes:targetBytes,duration:duration.seconds,audioBytes:info.audioBytes)
+        guard budget.isFinite,budget>=100000,budget<Double(Int.max) else {
+            throw EngineError.quality("원본 오디오·해상도·프레임을 유지하기에는 목표 용량이 너무 작아요. 목표를 높여 주세요.")
+        }
+        // Fix geometry once. Retrying a byte target may only adjust video bits,
+        // never resolution, sample timing, or audio quality.
+        let shown=VideoCropGeometry.compressedSize(width:shownWidth,height:shownHeight,crop:options.crop,maxDimension:options.maxDimension)
+        let region=options.crop.isFull ? nil:options.crop.pixelRect(width:max(1,Int(shownWidth.rounded())),height:max(1,Int(shownHeight.rounded())))
+        let swapsAxes=region == nil && (abs(transform.b)>0.5 || abs(transform.c)>0.5)
+        let width=swapsAxes ? shown.height:shown.width,height=swapsAxes ? shown.width:shown.height
+        var rate=Int(min(budget,info.videoBitrate.isFinite && info.videoBitrate>0 ? info.videoBitrate:budget)),lastSize=0
+        for attempt in 0..<3 {
             try Task.checkCancellation()
-            let display=natural.applying(transform)
-            let shownWidth=abs(Double(display.width)),shownHeight=abs(Double(display.height))
-            let shown=VideoCropGeometry.compressedSize(width:shownWidth,height:shownHeight,crop:options.crop,maxDimension:options.maxDimension,bitrate:rate)
-            let displayWidth=shown.width,displayHeight=shown.height
-            // A crop is composed in upright pixels and written without a track
-            // transform; an uncropped video keeps the sensor axes and rotation.
-            let region=options.crop.isFull ? nil:options.crop.pixelRect(width:max(1,Int(shownWidth.rounded())),height:max(1,Int(shownHeight.rounded())))
-            let swapsAxes=region == nil && (abs(transform.b)>0.5 || abs(transform.c)>0.5)
-            let width=swapsAxes ? displayHeight:displayWidth
-            let height=swapsAxes ? displayWidth:displayHeight
-            try await encode(asset,to:output,video:track,audio:audio.first,duration:duration,width:width,height:height,transform:transform,natural:natural,crop:region,bitrate:rate,audioRate:audioRate,codec:codec)
+            try await encode(asset,to:output,video:track,audio:audio.first,duration:duration,width:width,height:height,
+                transform:transform,natural:natural,crop:region,bitrate:rate,codec:codec,
+                colorProperties:info.colorProperties,fullRange:info.fullRange)
             lastSize=try output.resourceValues(forKeys:[.fileSizeKey]).fileSize ?? 0
             if lastSize>0,Int64(lastSize)<=targetBytes {
-                try await verify(output,duration:duration.seconds,videos:1,audios:audio.isEmpty ? 0:1,width:width,height:height)
-                return "\(codec == .hevc ? "HEVC":"H.264") 하드웨어 압축 · \(displayWidth)×\(displayHeight) · \(lastSize)바이트 · 목표 이하 검증"
+                try await verify(output,duration:duration.seconds,videos:1,audios:audio.count,width:width,height:height)
+                let result=AVURLAsset(url:output),outVideo=try await result.loadTracks(withMediaType:.video)[0]
+                try verifyFrameTiming(source:asset,video:track,output:result,track:outVideo)
+                try await verifyVideoColor(outVideo,colors:info.colorProperties,fullRange:info.fullRange)
+                if let audio=audio.first {
+                    try await verifyOriginalAudio(source:asset,audio:audio,output:result,track:try await result.loadTracks(withMediaType:.audio)[0])
+                }
+                return "\(codec == .hevc ? "HEVC":"H.264") · \(shown.width)×\(shown.height) · 원본 프레임·오디오 유지 · \(lastSize)바이트 · 목표 이하 검증"
             }
             try FileManager.default.removeItem(at:output)
-            if attempt==0 { rate=max(100000,Int(Double(rate)*Double(targetBytes)/Double(max(lastSize,1))*0.90)) }
+            // Exclude unchanged audio before correcting the video bitrate.
+            if attempt<2 {
+                let available=Double(targetBytes)-Double(info.audioBytes)-4096
+                let measured=max(1,Double(lastSize)-Double(info.audioBytes)-4096)
+                rate=max(100000,Int(Double(rate)*min(0.95,available/measured*0.97)))
+            }
         }
-        throw EngineError.quality("하드웨어 인코더 결과 \(lastSize)바이트가 목표 용량을 초과했어요.")
+        throw EngineError.quality("원본 해상도·프레임·오디오를 유지한 결과가 목표 용량을 초과했어요. 목표를 높여 주세요.")
     }
 
-    static func encode(_ asset:AVAsset,to output:URL,video:AVAssetTrack,audio:AVAssetTrack?,duration:CMTime,width:Int,height:Int,transform:CGAffineTransform,natural:CGSize,crop:CGRect?,bitrate:Int,audioRate:Int,codec:VideoCodec,
-                       fileType:AVFileType = .mp4,colorProperties:[String:Any] = [:],copyAudio:Bool = false) async throws {
+    static func encode(_ asset:AVAsset,to output:URL,video:AVAssetTrack,audio:AVAssetTrack?,duration:CMTime,width:Int,height:Int,transform:CGAffineTransform,natural:CGSize,crop:CGRect?,bitrate:Int,codec:VideoCodec,
+                       fileType:AVFileType = .mp4,colorProperties:[String:Any] = [:],fullRange:Bool = false) async throws {
         let reader=try AVAssetReader(asset:asset),writer=try AVAssetWriter(outputURL:output,fileType:fileType)
-        let pixels=[kCVPixelBufferPixelFormatTypeKey as String:kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange]
-        let videoOutput:AVAssetReaderOutput
-        if let crop {
-            // Upright frame → move the chosen region to the origin → scale it to
-            // the output size. Render coordinates are top-left based.
-            let upright=normalizedTransform(transform,width:Int(natural.width.rounded()),height:Int(natural.height.rounded()))
-            let placed=upright.concatenating(CGAffineTransform(translationX:-crop.minX,y:-crop.minY))
-                .concatenating(CGAffineTransform(scaleX:CGFloat(width)/crop.width,y:CGFloat(height)/crop.height))
-            var layer=AVVideoCompositionLayerInstruction.Configuration(assetTrack:video)
-            layer.setTransform(placed,at:.zero)
-            let instruction=AVVideoCompositionInstruction(configuration:.init(layerInstructions:[AVVideoCompositionLayerInstruction(configuration:layer)],
-                timeRange:CMTimeRange(start:.zero,duration:duration)))
-            let minimum=try await video.load(.minFrameDuration)
-            let composition=AVVideoComposition(configuration:.init(frameDuration:minimum.isValid && minimum.seconds>0 ? minimum:CMTime(value:1,timescale:60),
-                instructions:[instruction],renderSize:CGSize(width:width,height:height)))
-            let composed=AVAssetReaderVideoCompositionOutput(videoTracks:[video],videoSettings:pixels)
-            composed.videoComposition=composition;composed.alwaysCopiesSampleData=false
-            videoOutput=composed
-        } else {
-            let direct=AVAssetReaderTrackOutput(track:video,outputSettings:pixels)
-            direct.alwaysCopiesSampleData=false
-            videoOutput=direct
-        }
+        let pixels=[kCVPixelBufferPixelFormatTypeKey as String:fullRange ? kCVPixelFormatType_420YpCbCr8BiPlanarFullRange:kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange]
+        // One decoded sample in, one encoded sample out. A video composition
+        // would resample VFR onto a fixed cadence when cropping.
+        let videoOutput=AVAssetReaderTrackOutput(track:video,outputSettings:pixels)
+        videoOutput.alwaysCopiesSampleData=false
+        let cropper=try crop.map { try VideoCropRenderer(crop:$0,width:width,height:height,natural:natural,transform:transform,fullRange:fullRange) }
         guard reader.canAdd(videoOutput) else { throw EngineError.unsupported("비디오 디코딩 경로를 지원하지 않아요.") };reader.add(videoOutput)
         var settings:[String:Any]=[
             AVVideoCodecKey:codec == .hevc ? AVVideoCodecType.hevc:AVVideoCodecType.h264,
             AVVideoWidthKey:width,AVVideoHeightKey:height,AVVideoScalingModeKey:AVVideoScalingModeResizeAspectFill,
             AVVideoEncoderSpecificationKey:[kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder as String:true],
-            AVVideoCompressionPropertiesKey:[AVVideoAverageBitRateKey:bitrate,AVVideoAllowFrameReorderingKey:false,
-                AVVideoMaxKeyFrameIntervalDurationKey:2,kVTCompressionPropertyKey_DataRateLimits as String:[Double(bitrate)/8*1.2,1]]]
+            AVVideoCompressionPropertiesKey:[AVVideoAverageBitRateKey:bitrate,AVVideoAllowFrameReorderingKey:true,
+                AVVideoMaxKeyFrameIntervalDurationKey:2,
+                AVVideoProfileLevelKey:codec == .hevc ? kVTProfileLevel_HEVC_Main_AutoLevel as String:AVVideoProfileLevelH264HighAutoLevel]]
         if !colorProperties.isEmpty { settings[AVVideoColorPropertiesKey]=colorProperties }
         guard writer.canApply(outputSettings:settings,forMediaType:.video) else { throw EngineError.unsupported("선택한 출력 설정을 지원하지 않아요.") }
         let videoInput=AVAssetWriterInput(mediaType:.video,outputSettings:settings)
@@ -120,12 +114,11 @@ enum MediaEngine {
         guard writer.canAdd(videoInput) else { throw EngineError.unsupported("하드웨어 비디오 인코딩을 지원하지 않아요.") };writer.add(videoInput)
         var pairs:[(AVAssetReaderOutput,AVAssetWriterInput)]=[(videoOutput,videoInput)]
         if let audio {
-            let out=AVAssetReaderTrackOutput(track:audio,outputSettings:copyAudio ? nil : [AVFormatIDKey:kAudioFormatLinearPCM,AVLinearPCMBitDepthKey:16,AVLinearPCMIsFloatKey:false,AVLinearPCMIsBigEndianKey:false,AVLinearPCMIsNonInterleaved:false])
+            let out=AVAssetReaderTrackOutput(track:audio,outputSettings:nil)
             out.alwaysCopiesSampleData=false
-            let descriptions=try await audio.load(.formatDescriptions)
-            guard let description=descriptions.first,let stream=CMAudioFormatDescriptionGetStreamBasicDescription(description),copyAudio || stream.pointee.mChannelsPerFrame<=2 else { throw EngineError.unsupported("모노·스테레오 오디오만 압축해요.") }
-            let input=AVAssetWriterInput(mediaType:.audio,outputSettings:copyAudio ? nil : [AVFormatIDKey:kAudioFormatMPEG4AAC,AVEncoderBitRateKey:audioRate,AVSampleRateKey:stream.pointee.mSampleRate,AVNumberOfChannelsKey:stream.pointee.mChannelsPerFrame],sourceFormatHint:copyAudio ? description : nil)
-            guard reader.canAdd(out),writer.canAdd(input) else { throw EngineError.unsupported("AAC 오디오 경로를 지원하지 않아요.") }
+            guard let description=try await audio.load(.formatDescriptions).first else { throw EngineError.unsupported("원본 음성 정보를 읽지 못했어요.") }
+            let input=AVAssetWriterInput(mediaType:.audio,outputSettings:nil,sourceFormatHint:description)
+            guard reader.canAdd(out),writer.canAdd(input) else { throw EngineError.unsupported("이 포맷에 원본 음성을 그대로 저장할 수 없어요.") }
             reader.add(out);writer.add(input);pairs.append((out,input))
         }
         // Cancellation is cooperative. Calling cancelReading concurrently with
@@ -147,7 +140,8 @@ enum MediaEngine {
                                 }
                                 let hasSample:Bool=try autoreleasepool {
                                     guard let sample=out.copyNextSampleBuffer() else { return false }
-                                    guard input.append(sample) else { throw writer.error ?? EngineError.io("비디오 샘플 쓰기 실패") }
+                                    let written = input.mediaType == .video ? try cropper?.render(sample) ?? sample : sample
+                                    guard input.append(written) else { throw writer.error ?? EngineError.io("비디오 샘플 쓰기 실패") }
                                     let time=CMSampleBufferGetOutputPresentationTimeStamp(sample).seconds
                                     if input.mediaType == .video,time.isFinite { EngineProgress.report(0.05+0.8*time/duration.seconds) }
                                     return true
@@ -192,5 +186,45 @@ enum MediaEngine {
             _ = try await generator.image(at:CMTime(seconds:min(0.05,duration/2),preferredTimescale:600))
             _ = track
         }
+    }
+}
+
+/// Crop pixels without generating a new frame cadence or changing color space.
+private final class VideoCropRenderer {
+    private let context=CIContext(options:[.cacheIntermediates:false,.workingColorSpace:NSNull()])
+    private let pool:CVPixelBufferPool
+    private let mapping:CGAffineTransform
+    private let bounds:CGRect
+    init(crop:CGRect,width:Int,height:Int,natural:CGSize,transform:CGAffineTransform,fullRange:Bool) throws {
+        let upright=MediaEngine.normalizedTransform(transform,width:Int(natural.width),height:Int(natural.height))
+        let display=CGRect(origin:.zero,size:natural).applying(upright)
+        // Track transforms and crop coordinates use top-left pixels; CI uses
+        // bottom-left pixels. Flip on both sides of the source orientation.
+        let toTop=CGAffineTransform(a:1,b:0,c:0,d:-1,tx:0,ty:natural.height)
+        let toBottom=CGAffineTransform(a:1,b:0,c:0,d:-1,tx:0,ty:display.height)
+        mapping=toTop.concatenating(upright).concatenating(toBottom)
+            .concatenating(CGAffineTransform(translationX:-crop.minX,y:-(display.height-crop.maxY)))
+            .concatenating(CGAffineTransform(scaleX:CGFloat(width)/crop.width,y:CGFloat(height)/crop.height))
+        bounds=CGRect(x:0,y:0,width:width,height:height)
+        var created:CVPixelBufferPool?
+        let attributes:[String:Any]=[kCVPixelBufferPixelFormatTypeKey as String:fullRange ? kCVPixelFormatType_420YpCbCr8BiPlanarFullRange:kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+            kCVPixelBufferWidthKey as String:width,kCVPixelBufferHeightKey as String:height,
+            kCVPixelBufferIOSurfacePropertiesKey as String:[:]]
+        guard CVPixelBufferPoolCreate(nil,nil,attributes as CFDictionary,&created)==kCVReturnSuccess,let created else { throw EngineError.io("자르기 픽셀 버퍼 생성 실패") }
+        pool=created
+    }
+    func render(_ sample:CMSampleBuffer) throws -> CMSampleBuffer {
+        guard let source=CMSampleBufferGetImageBuffer(sample) else { throw EngineError.io("원본 프레임 읽기 실패") }
+        var pixel:CVPixelBuffer?
+        guard CVPixelBufferPoolCreatePixelBuffer(nil,pool,&pixel)==kCVReturnSuccess,let pixel else { throw EngineError.io("자르기 프레임 메모리 오류") }
+        CVBufferPropagateAttachments(source,pixel)
+        let image=CIImage(cvPixelBuffer:source).transformed(by:mapping).cropped(to:bounds)
+        context.render(image,to:pixel,bounds:bounds,colorSpace:nil)
+        var description:CMVideoFormatDescription?
+        guard CMVideoFormatDescriptionCreateForImageBuffer(allocator:nil,imageBuffer:pixel,formatDescriptionOut:&description)==noErr,let description else { throw EngineError.io("자르기 영상 정보 오류") }
+        var timing=CMSampleTimingInfo(duration:CMSampleBufferGetOutputDuration(sample),presentationTimeStamp:CMSampleBufferGetOutputPresentationTimeStamp(sample),decodeTimeStamp:.invalid)
+        var output:CMSampleBuffer?
+        guard CMSampleBufferCreateReadyWithImageBuffer(allocator:nil,imageBuffer:pixel,formatDescription:description,sampleTiming:&timing,sampleBufferOut:&output)==noErr,let output else { throw EngineError.io("자르기 프레임 생성 실패") }
+        return output
     }
 }

@@ -222,12 +222,13 @@ import CryptoKit
         let originalSamples=try await compressedSamples(source),trimmedSamples=try await compressedSamples(trimmed.url)
         try require(!trimmedSamples.isEmpty && trimmedSamples.allSatisfy { originalSamples.contains($0) },"passthrough changed encoded video samples")
         print("PASS trim",trimmed.detail)
+        // The uncompressed PCM fixture now stays intact instead of becoming AAC.
         for codec in codecs {
-            let compressed=try await RingEngine.shared.run(.init(source:source,operation:.video(.compress(.init(targetBytes:80000,codec:codec)))))
-            try require(try Data(contentsOf:compressed.url).count<=80000,"video target bytes")
+            let compressed=try await RingEngine.shared.run(.init(source:source,operation:.video(.compress(.init(targetBytes:500000,codec:codec)))))
+            try require(try Data(contentsOf:compressed.url).count<=500000,"video target bytes")
             print("PASS video target",compressed.detail)
         }
-        let cropped=try await RingEngine.shared.run(.init(source:source,operation:.video(.compress(.init(targetBytes:240000,codec:.h264,maxDimension:128,crop:VideoCrop(ratio:.square))))))
+        let cropped=try await RingEngine.shared.run(.init(source:source,operation:.video(.compress(.init(targetBytes:500000,codec:.h264,maxDimension:128,crop:VideoCrop(ratio:.square))))))
         let croppedAsset=AVURLAsset(url:cropped.url),croppedTrack=try await croppedAsset.loadTracks(withMediaType:.video)[0],croppedSize=try await croppedTrack.load(.naturalSize)
         try require(croppedSize.width==128 && croppedSize.height==128,"video crop and maximum dimension")
         print("PASS video crop/resize",cropped.detail)
@@ -243,8 +244,7 @@ import CryptoKit
             if ratio == .square { try require(dimensions[0]==dimensions[1] && dimensions[0]<=limit,"\(format) video crop ratio/output dimensions") }
             print("PASS animation",animated.detail)
         }
-        let compressedPreview=VideoCropGeometry.compressedSize(width:abs(shown.width),height:abs(shown.height),crop:VideoCrop(ratio:.square),maxDimension:128,
-            bitrate:Int(min(VideoCropGeometry.videoBitrate(targetBytes:240000,duration:try await AVURLAsset(url:source).load(.duration).seconds,audio:!(try await AVURLAsset(url:source).loadTracks(withMediaType:.audio).isEmpty)),100_000_000)))
+        let compressedPreview=VideoCropGeometry.compressedSize(width:abs(shown.width),height:abs(shown.height),crop:VideoCrop(ratio:.square),maxDimension:128)
         try require(compressedPreview.width==128 && compressedPreview.height==128,"video compress preview")
         // A placed (non-centred) crop keeps exactly the chosen region: the
         // fixture's blue channel is x and green is y in frame 0.
@@ -260,7 +260,7 @@ import CryptoKit
             ctx.draw(image,in:CGRect(x:-x,y:-(image.height-1-y),width:image.width,height:image.height))
             return (image.width,image.height,Int(px[2]),Int(px[1]))
         }
-        let placedVideo=try await RingEngine.shared.run(.init(source:source,operation:.video(.compress(.init(targetBytes:400000,codec:.h264,crop:corner)))))
+        let placedVideo=try await RingEngine.shared.run(.init(source:source,operation:.video(.compress(.init(targetBytes:500000,codec:.h264,crop:corner)))))
         let placedWebP=try await RingEngine.shared.run(.init(source:source,operation:.video(.animation(.init(format:.webp,fps:10,maxDimension:160,start:0,duration:1,crop:corner)))))
         for url in [placedVideo.url,placedWebP.url] {
             let (w,h,blue,green)=try await sample(url,50,60)
@@ -271,7 +271,7 @@ import CryptoKit
         try require(try Data(contentsOf:source)==original,"media source changed")
         let before=Set(try FileManager.default.contentsOfDirectory(atPath:root.path))
         for delay:UInt64 in [0,10_000_000,50_000_000] {
-            let task=Task { try await RingEngine.shared.run(.init(source:source,operation:.video(.compress(.init(targetBytes:100000,codec:.h264))))) }
+            let task=Task { try await RingEngine.shared.run(.init(source:source,operation:.video(.compress(.init(targetBytes:500000,codec:.h264))))) }
             if delay>0 { try await Task.sleep(nanoseconds:delay) };task.cancel()
             do { _=try await task.value;throw EngineError.invalid("TEST: media cancellation ignored") } catch is CancellationError { }
         }

@@ -448,9 +448,8 @@ private struct VideoToolPanel:View {
     @State private var cropPortrait=false
     /// Normalized to the upright frame, top-left origin, as the engine expects.
     @State private var cropRect=CGRect(x:0,y:0,width:1,height:1)
-    /// Upright source size and audio presence, for the output-resolution preview.
+    /// Upright source size for the output-resolution preview.
     @State private var sourceSize:CGSize?
-    @State private var sourceHasAudio=false
     @State private var target=false
     @State private var player:AVPlayer?
     @State private var isPlaying=false
@@ -626,14 +625,16 @@ private struct VideoToolPanel:View {
                 PanelRow(label:"목표") { SizeFields(value:$size,unit:$unit) }
                 PanelRow(label:"긴 변") {
                     HStack(spacing:8) {
-                        TextField("자동",text:$compressionDimension).textFieldStyle(.roundedBorder)
+                        TextField("원본",text:$compressionDimension).textFieldStyle(.roundedBorder)
                             .frame(width:72).accessibilityLabel("비디오 긴 변").accessibilityIdentifier("video.maxDimension")
                         Text("px")
                         Spacer(minLength:4)
-                        DimensionPresets(text:$compressionDimension,values:[720,1280,1920],automatic:true,prefix:"video")
+                        DimensionPresets(text:$compressionDimension,values:[1280,1920,3840].filter { $0 <= Int(max(sourceSize?.width ?? 0,sourceSize?.height ?? 0)) },automatic:true,prefix:"video")
                     }
                 }
                 ResolutionNote(text:compressionResolution)
+                Text("영상만 재압축해요. 목표가 작을수록 화질이 낮아질 수 있어요.")
+                    .font(.system(size:11)).foregroundStyle(.secondary)
                 PanelRow(label:"코덱") { Picker("코덱",selection:$codec) { Text("HEVC · 고효율/작은 용량").tag("HEVC");Text("H.264 · 범용 호환성").tag("H264") }.labelsHidden() }
 
             case .animation(let format):
@@ -692,7 +693,6 @@ private struct VideoToolPanel:View {
                 // Like Photos, presets start in the frame's own orientation.
                 cropPortrait=abs(shown.height)>abs(shown.width)
             }
-            sourceHasAudio = !((try? await asset.loadTracks(withMediaType:.audio))?.isEmpty ?? true)
             let total = d.seconds
             if case .animation = tool {
                 sourceFPS=try? await MediaEngine.sourceFrameRate(asset)
@@ -735,22 +735,21 @@ private struct VideoToolPanel:View {
         return "결과 \(size.width)×\(size.height)" + (target ? " · 목표 용량을 넘으면 줄어들어요":"")
     }
     private var compressionResolution:String? {
-        guard let sourceSize,let duration,duration>0,let bytes=try? ToolSettings.bytes(size,unit:unit) else { return nil }
+        guard let sourceSize else { return nil }
         let text=compressionDimension.trimmingCharacters(in:.whitespaces)
         let limit=text.isEmpty ? nil:Int(text)
-        guard text.isEmpty || (limit.map { (16...8192).contains($0) } ?? false) else { return nil }
-        let rate=VideoCropGeometry.videoBitrate(targetBytes:bytes,duration:duration,audio:sourceHasAudio)
-        guard rate>=100000 else { return nil }
-        let size=VideoCropGeometry.compressedSize(width:sourceSize.width,height:sourceSize.height,crop:videoCrop,maxDimension:limit,bitrate:Int(min(rate,100_000_000)))
-        // A second attempt can lower the bitrate cap when the first file is too large.
-        return "결과 \(size.width)×\(size.height) · 목표 용량을 넘으면 줄어들어요"
+        let maximum=Int(max(sourceSize.width,sourceSize.height))
+        guard text.isEmpty || (limit.map { (16...max(16,maximum)).contains($0) } ?? false) else { return nil }
+        let size=VideoCropGeometry.compressedSize(width:sourceSize.width,height:sourceSize.height,crop:videoCrop,maxDimension:limit)
+        return "결과 \(size.width)×\(size.height) · 원본 프레임·오디오 유지"
     }
 
     private func operation() throws -> EngineOperation {
         guard let duration else { throw EngineError.invalid("영상 정보를 읽는 중이에요.") }
         if case .compress=tool {
             let text=compressionDimension.trimmingCharacters(in:.whitespacesAndNewlines)
-            let maxDimension=text.isEmpty ? nil:try ToolSettings.integer(text,name:"긴 변",range:16...8192)
+            let maximum=Int(max(sourceSize?.width ?? 0,sourceSize?.height ?? 0))
+            let maxDimension=text.isEmpty ? nil:try ToolSettings.integer(text,name:"긴 변",range:16...max(16,maximum))
             return .video(.compress(.init(targetBytes:try ToolSettings.bytes(size,unit:unit),codec:codec == "HEVC" ? .hevc:.h264,maxDimension:maxDimension,crop:videoCrop)))
         }
         let from = startVal
@@ -767,7 +766,7 @@ private struct VideoToolPanel:View {
 }
 
 /// Long-side presets beside a pixel field. `automatic` adds a button that
-/// clears the field (the engine then picks the size).
+/// clears the field (video compression then preserves the source size).
 private struct DimensionPresets:View {
     @Binding var text:String
     let values:[Int]
@@ -776,7 +775,7 @@ private struct DimensionPresets:View {
     var body:some View {
         HStack(spacing:6) {
             if automatic {
-                Button("자동") { text="" }
+                Button(prefix == "video" ? "원본":"자동") { text="" }
                     .buttonStyle(.glass).tint(text.isEmpty ? .accentColor:nil)
                     .accessibilityIdentifier("\(prefix).maxDimension.auto")
             }

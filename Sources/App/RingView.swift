@@ -72,10 +72,6 @@ struct RingScreen: View {
                         Text(model.videoNotice)
                             .font(.system(size: 10)).foregroundStyle(.secondary)
                             .multilineTextAlignment(.center).lineLimit(3)
-                        if model.videoReady {
-                            Text("중앙 클릭 또는 ⌘↩︎로 변환 시작")
-                                .font(.system(size: 10, weight: .medium)).foregroundStyle(.secondary)
-                        }
                     }
                     .frame(width: RingMetrics.canvas - 12)
                     .shadow(color: .black.opacity(0.3), radius: 2, y: 0.5)
@@ -118,7 +114,7 @@ struct RingView: View {
                     .scaleEffect(g)
                     .opacity(model.isCompleting ? 0 : 1)
                     .accessibilityHidden(model.isCompleting)
-                    .allowsHitTesting(model.showsVideoHub && !model.menuFolded && !model.isNavigating && !model.isWorking)
+                    .allowsHitTesting(false)
                 if model.isWorking {
                     HubProgress(model: model)
                         .frame(width: hub, height: hub)

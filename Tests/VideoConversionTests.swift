@@ -54,9 +54,48 @@ import CryptoKit
         player.pause()
         throw EngineError.quality("TEST: player time did not advance")
     }
+    static func compressionChecks(_ source:URL) async throws {
+    for crop in [VideoCrop.full,VideoCrop(ratio:.square)] {
+        let result=try await RingEngine.shared.run(.init(source:source,operation:.video(.compress(.init(targetBytes:520000,codec:.hevc,crop:crop)))))
+        try await playback(result.url)
+        print("PASS compression",crop.isFull ? "original size":"VFR crop",result.detail)
+    }
+    do {
+        _ = try await RingEngine.shared.run(.init(source:source,operation:.video(.compress(.init(targetBytes:1000,codec:.hevc)))))
+        throw EngineError.quality("TEST: impossible unchanged-audio target accepted")
+    } catch let error as EngineError { if case .quality(let reason)=error,reason.hasPrefix("TEST:") { throw error } }
+    }
     static func main() async {
         setbuf(stdout, nil)
         do {
+            if CommandLine.arguments.count == 2,CommandLine.arguments[1] == "--compression" {
+                let path=try String(contentsOfFile:".work/video-conversion/fixture-path.txt",encoding:.utf8)
+                try await compressionChecks(URL(fileURLWithPath:path))
+                return
+            }
+            if CommandLine.arguments.count == 2,CommandLine.arguments[1] == "--desktop" {
+                let paths=try JSONDecoder().decode([String].self,from:Data(contentsOf:URL(fileURLWithPath:".work/video-fidelity/sources.json")))
+                let root=URL(fileURLWithPath:".work/video-fidelity/outputs-"+UUID().uuidString,isDirectory:true)
+                try FileManager.default.createDirectory(at:root,withIntermediateDirectories:true)
+                print("OUTPUTS",root.path)
+                for (index,path) in paths.enumerated() {
+                    let source=URL(fileURLWithPath:path),before=Data(SHA256.hash(data:try Data(contentsOf:source)))
+                    let info=try await VideoSourceInfo.inspect(source)
+                    let container:VideoContainer=info.width>1920 ? .mp4:.mov
+                    let codec:VideoConversionCodec=info.width>1920 ? .hevc:.h264
+                    let conversion=root.appendingPathComponent("convert-\(index).\(container.rawValue)")
+                    print("SOURCE",source.lastPathComponent,info.width,info.height,info.frameRate,info.codecs)
+                    print("PASS real conversion",try await MediaEngine.convertVideo(source,to:conversion,options:.init(container:container,codec:codec)))
+                    try await playback(conversion)
+                    let compressed=root.appendingPathComponent("compress-\(index).mp4")
+                    let target:Int64=info.width>1920 ? 15_000_000:Int64(Double(info.sourceBytes)*0.8)
+                    print("PASS real compression",try await MediaEngine.compress(source,to:compressed,options:.init(targetBytes:target,codec:.hevc)))
+                    try await playback(compressed)
+                    try require(Data(SHA256.hash(data:try Data(contentsOf:source)))==before,"desktop original modified")
+                    print("PASS unchanged original",source.lastPathComponent)
+                }
+                return
+            }
             if CommandLine.arguments.count == 4, CommandLine.arguments[1] == "--remux",
                let container = VideoContainer(rawValue: CommandLine.arguments[3]) {
                 let source = URL(fileURLWithPath: CommandLine.arguments[2])
@@ -74,20 +113,20 @@ import CryptoKit
             let info = try await VideoSourceInfo.inspect(source)
             print("CAPABILITIES",info.codecs,"restriction",info.reencodeRestriction ?? "none")
             try require(info.reencodeRestriction == nil && info.width == 640 && info.height == 360, "source inspection")
-            let estimates = try VideoQuality.allCases.map { try info.plan(.init(container:.mp4,codec:.h264,quality:$0)).estimatedBytes }
-            try require(estimates[0] > estimates[1] && estimates[1] > estimates[2], "quality must change actual bitrate and estimate")
-            let h264 = try info.plan(.init(container:.mp4,codec:.h264,quality:.balanced))
-            let hevc = try info.plan(.init(container:.mp4,codec:.hevc,quality:.balanced))
-            try require(h264.videoBitrate == hevc.videoBitrate && h264.estimatedBytes == hevc.estimatedBytes, "codec-name size discount")
+            let h264 = try info.plan(.init(container:.mp4,codec:.h264))
+            let hevc = try info.plan(.init(container:.mp4,codec:.hevc))
+            try require(h264.videoBitrate == hevc.videoBitrate && abs(Double(h264.videoBitrate)-info.videoBitrate) < 1, "format conversion must keep source bitrate")
+            let originalSize=VideoCropGeometry.compressedSize(width:3840,height:2160,crop:.full,maxDimension:nil)
+            try require(originalSize.width==3840 && originalSize.height==2160,"no implicit FHD limit")
             var mp4: URL?
-            for (container,codec,quality) in [(VideoContainer.mp4,VideoConversionCodec.h264,VideoQuality.balanced),(.mp4,.hevc,.small),(.mov,.h264,.sharp),(.mov,.hevc,.balanced)] {
-                let result = try await RingEngine.shared.run(.init(source:source,operation:.video(.convert(.init(container:container,codec:codec,quality:quality)))))
+            for (container,codec) in [(VideoContainer.mp4,VideoConversionCodec.h264),(.mp4,.hevc),(.mov,.h264),(.mov,.hevc)] {
+                let result = try await RingEngine.shared.run(.init(source:source,operation:.video(.convert(.init(container:container,codec:codec)))))
                 let bytes = try Data(contentsOf: result.url)
                 let brand = String(data:bytes[8..<12],encoding:.ascii) ?? ""
                 try require(result.url.pathExtension == container.rawValue && String(data:bytes[4..<8],encoding:.ascii) == "ftyp" && (container == .mov ? brand == "qt  " : brand != "qt  "), "real container")
                 try await playback(result.url)
                 if container == .mp4 && codec == .h264 { mp4 = result.url }
-                print("PASS",container.title,codec.title,quality.title,"bytes",bytes.count,"playback/VFR/rotation/color/audio")
+                print("PASS",container.title,codec.title,"bytes",bytes.count,"playback/VFR/rotation/color/audio")
             }
             for (input, container) in [(source,VideoContainer.mov),(mp4!,VideoContainer.mp4)] {
                 let inspected = try await VideoSourceInfo.inspect(input)
@@ -96,6 +135,7 @@ import CryptoKit
                 try await playback(result.url)
                 print("PASS lossless remux",container.title,result.detail)
             }
+            try await compressionChecks(source)
             let bad = root.appendingPathComponent("corrupt.mp4")
             try Data("not a video".utf8).write(to:bad)
             do { _ = try await VideoSourceInfo.inspect(bad); throw EngineError.quality("TEST: corrupt input accepted") }
@@ -103,7 +143,7 @@ import CryptoKit
             catch { }
             try require(Data(SHA256.hash(data: try Data(contentsOf: source))) == original, "original modified")
             try require(try FileManager.default.contentsOfDirectory(atPath:root.path).allSatisfy { !$0.hasPrefix(".ring-") }, "staging leak")
-            print("PASS selected video conversions, bitrates/estimates, packet-preserving remux, muted playback, corrupt-input rejection, original preservation")
+            print("PASS selected video conversions, source bitrate, packet-preserving remux, muted playback, corrupt-input rejection, original preservation")
         } catch { print("FAIL",error as NSError); exit(1) }
     }
 }

@@ -126,17 +126,15 @@ enum VideoCropGeometry {
         return CGSize(width: r.width * width / Double(w), height: r.height * height / Double(h))
     }
 
-    /// Video bitrate left after the AAC track, for a whole-file byte target.
-    static func videoBitrate(targetBytes:Int64,duration:Double,audio:Bool) -> Double {
-        Double(targetBytes)*0.94*8/duration-Double(audio ? 96000:0)
+    /// Reserve the unchanged audio payload and a small muxing margin first.
+    static func videoBitrate(targetBytes:Int64,duration:Double,audioBytes:Int64) -> Double {
+        (Double(targetBytes)*0.98-Double(audioBytes)-4096)*8/duration
     }
-    /// Displayed (upright) size of the first compression attempt. The short
-    /// side is capped by bitrate; both sides are even for the encoder.
-    static func compressedSize(width:Double,height:Double,crop:VideoCrop,maxDimension:Int?,bitrate:Int) -> (width:Int,height:Int) {
-        let cap=bitrate<400000 ? 480:bitrate<900000 ? 720:1080
+    /// Only the user's explicit dimension may downscale the source.
+    static func compressedSize(width:Double,height:Double,crop:VideoCrop,maxDimension:Int?) -> (width:Int,height:Int) {
         let size=cropSize(width:width,height:height,crop:crop)
-        let longSide=Double(max(size.width,size.height)),shortSide=Double(min(size.width,size.height))
-        let scale=min(1,min(Double(cap)/max(1,shortSide),Double(maxDimension ?? Int.max)/max(1,longSide)))
+        let longSide=Double(max(size.width,size.height))
+        let scale=min(1,Double(maxDimension ?? Int.max)/max(1,longSide))
         return (max(2,Int((Double(size.width)*scale/2).rounded(.down))*2),max(2,Int((Double(size.height)*scale/2).rounded(.down))*2))
     }
     /// GIF/WebP frame size: the generator fills `extractionSize`, the crop is

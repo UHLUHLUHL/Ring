@@ -22,13 +22,12 @@ final class RingModel: ObservableObject {
     @Published private(set) var menuFolded = false
     @Published private(set) var isNavigating = false
     private var navigationTask: Task<Void, Never>?
-    enum VideoStage { case format, codec, quality }
+    enum VideoStage { case format, codec }
     @Published private(set) var videoStage = VideoStage.format
     @Published private(set) var videoSource: VideoSourceInfo?
     @Published private(set) var videoError: String?
     @Published private(set) var videoContainer: VideoContainer?
     @Published private(set) var videoCodec: VideoConversionCodec?
-    @Published private(set) var videoQuality: VideoQuality?
     private var videoInspectionTask: Task<Void, Never>?
     var frameFormatItems: [RingAction] {
         ["PNG", "JPG", "WEBP"].map { RingAction(id: "frame-" + $0, title: $0, symbol: nil, kind: .convert($0)) }
@@ -330,10 +329,6 @@ final class RingModel: ObservableObject {
         // Everything else belongs to the panels' own controls once a tool is open.
         guard screen == .ring,!isWorking else { return false }
         if isNavigating { return true }
-        if file.kind == .video, event.keyCode == 36 || event.keyCode == 76,
-           event.modifierFlags.contains(.command) {
-            startVideoConversion(); return true
-        }
         switch event.keyCode {
         case 48 where event.modifierFlags.contains(.shift):
             // ⇧tab: start at the top slot, then step clockwise.
@@ -348,7 +343,6 @@ final class RingModel: ObservableObject {
             moveHover(1)
         case 36, 76: // return, enter
             if let i = hovered { activate(i) }
-            else if videoReady { startVideoConversion() }
         default:
             return false
         }
@@ -371,12 +365,12 @@ final class RingModel: ObservableObject {
 extension RingModel {
     var isSubmenu: Bool { choosingFrameFormat || (file.kind == .video && videoStage != .format) }
     var backTitle: String {
-        if file.kind == .video { return videoStage == .quality ? "코덱" : "포맷" }
+        if file.kind == .video { return "포맷" }
         return "뒤로"
     }
     func backMenu() {
         if file.kind == .video, videoStage != .format {
-            transitionMenu { self.videoStage = self.videoStage == .quality ? .codec : .format }
+            transitionMenu { self.videoStage = .format }
         } else { navigateFrameFormats(false) }
     }
     var videoMenuItems: [RingAction] {
@@ -386,8 +380,6 @@ extension RingModel {
             return (videoContainer.flatMap { videoSource?.codecs[$0] } ?? []).map {
                 RingAction(id: "video-codec-" + $0.rawValue, title: $0.title, symbol: $0 == .passthrough ? "arrow.right.arrow.left" : nil, kind: .tool)
             }
-        case .quality:
-            return VideoQuality.allCases.map { RingAction(id: "video-quality-" + $0.rawValue, title: $0.title, symbol: nil, kind: .tool) }
         }
     }
     var highlightedIndex: Int? {
@@ -397,7 +389,6 @@ extension RingModel {
         switch videoStage {
         case .format: id = videoContainer?.title
         case .codec: id = videoCodec.map { "video-codec-" + $0.rawValue }
-        case .quality: id = videoQuality.map { "video-quality-" + $0.rawValue }
         }
         return id.flatMap { id in items.firstIndex { $0.id == id } }
     }
@@ -429,52 +420,30 @@ extension RingModel {
             transitionMenu {
                 self.videoContainer = container
                 if let codec = self.videoCodec, info.codecs[container]?.contains(codec) != true {
-                    self.videoCodec = nil; self.videoQuality = nil
+                    self.videoCodec = nil
                 }
                 self.videoStage = .codec
             }
         } else if videoStage == .codec {
             guard let codec = VideoConversionCodec(rawValue: String(action.id.dropFirst("video-codec-".count))),
                   let container = videoContainer, videoSource?.codecs[container]?.contains(codec) == true else { return true }
-            if codec == .passthrough {
-                withAnimation(.spring(response: 0.24, dampingFraction: 0.82)) { videoCodec = codec; hovered = nil }
-            } else {
-                transitionMenu { self.videoCodec = codec; self.videoStage = .quality }
-            }
-        } else {
-            guard let quality = VideoQuality(rawValue: String(action.id.dropFirst("video-quality-".count))) else { return true }
-            withAnimation(.spring(response: 0.24, dampingFraction: 0.82)) { videoQuality = quality; hovered = nil }
+            videoCodec = codec
+            startVideoConversion()
         }
         return true
-    }
-    var videoReady: Bool {
-        guard file.kind == .video, tab == .convert, videoStage != .format,
-              let container = videoContainer, let codec = videoCodec, let info = videoSource,
-              info.codecs[container]?.contains(codec) == true else { return false }
-        return codec == .passthrough || (videoStage == .quality && videoQuality != nil)
     }
     var videoPreviewOptions: VideoConversionOptions? {
         guard let info = videoSource else { return nil }
         var container = videoContainer ?? VideoContainer.allCases.first { !(info.codecs[$0] ?? []).isEmpty } ?? .mp4
         var codec = videoCodec
-        var quality = videoQuality ?? .balanced
         if let action = hoveredAction {
             if videoStage == .format, let value = VideoContainer(rawValue: action.id.lowercased()) { container = value }
             if videoStage == .codec { codec = VideoConversionCodec(rawValue: String(action.id.dropFirst("video-codec-".count))) }
-            if videoStage == .quality, let value = VideoQuality(rawValue: String(action.id.dropFirst("video-quality-".count))) { quality = value }
         }
         if codec == nil || info.codecs[container]?.contains(codec!) != true { codec = info.codecs[container]?.first }
         guard let codec else { return nil }
-        return VideoConversionOptions(container: container, codec: codec, quality: codec == .passthrough ? nil : quality,
+        return VideoConversionOptions(container: container, codec: codec,
             sourceBytes: info.sourceBytes, sourceModified: info.modified)
-    }
-    var videoPreviewPlan: VideoEncodingPlan? {
-        guard let info = videoSource, let options = videoPreviewOptions else { return nil }
-        return try? info.plan(options)
-    }
-    var videoIsPreview: Bool {
-        guard videoReady, let options = videoPreviewOptions else { return true }
-        return options.container != videoContainer || options.codec != videoCodec || (options.codec != .passthrough && options.quality != videoQuality)
     }
     var videoNotice: String {
         if let error = videoError { return error }
@@ -482,15 +451,13 @@ extension RingModel {
         if let restriction = info.reencodeRestriction { return restriction }
         var text = "원본 해상도·프레임 타이밍 유지"
         if info.colorProperties.isEmpty { text += " · 색상 태그 없음: macOS 기본 해석" }
-        if let plan = videoPreviewPlan, info.hasAudio {
-            text += plan.copyAudio ? " · 음성 원본 유지" : " · 음성 AAC \(plan.audioBitrate / 1000)kbps"
-        }
+        if info.hasAudio { text += " · 음성 원본 유지" }
         return text
     }
     func startVideoConversion() {
-        guard videoReady, !isWorking, !isNavigating, let container = videoContainer, let codec = videoCodec,
-              let info = videoSource else { return }
-        let options = VideoConversionOptions(container: container, codec: codec, quality: codec == .passthrough ? nil : videoQuality,
+        guard !isWorking, !isNavigating, let container = videoContainer, let codec = videoCodec,
+              let info = videoSource, info.codecs[container]?.contains(codec) == true else { return }
+        let options = VideoConversionOptions(container: container, codec: codec,
             sourceBytes: info.sourceBytes, sourceModified: info.modified)
         run(.video(.convert(options)))
     }
