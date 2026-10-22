@@ -162,15 +162,17 @@ final class RingModel: ObservableObject {
         guard !isNavigating, !isWorking else { return }
         isNavigating = true
         let reduced = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
-        let fold = reduced ? 0.12 : 0.38
-        withAnimation(reduced ? .easeInOut(duration: 0.12) : .spring(response: 0.46, dampingFraction: 0.78)) { menuFolded = true }
+        let fold = reduced ? 0.12 : 0.42
+        withAnimation(.easeOut(duration: reduced ? 0.06 : 0.10)) { hovered = nil }
+        withAnimation(reduced ? .easeInOut(duration: 0.12) : .spring(response: 0.46, dampingFraction: 0.82)) { menuFolded = true }
         navigationTask = Task { [weak self] in
             do {
                 try await Task.sleep(for: .seconds(fold))
                 guard let self, self.screen == .ring else { return }
-                self.hovered = nil
-                self.choosingFrameFormat = show
-                withAnimation(.spring(response: reduced ? 0.22 : 0.56, dampingFraction: reduced ? 1 : 0.64)) { self.menuFolded = false }
+                withAnimation(.spring(response: reduced ? 0.22 : 0.56, dampingFraction: reduced ? 1 : 0.74)) {
+                    self.choosingFrameFormat = show
+                    self.menuFolded = false
+                }
                 try await Task.sleep(for: .seconds(reduced ? 0.22 : 0.66))
                 self.isNavigating = false
             } catch { }

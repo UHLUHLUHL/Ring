@@ -51,43 +51,25 @@ struct RingScreen: View {
 
     var body: some View {
         ZStack(alignment: .top) {
-            // Hub and sectors share one glass graph: they fuse as their gap closes,
-            // instead of two independently composited surfaces appearing out of sync.
-            GlassEffectContainer(spacing: 6) {
-                VStack(spacing: 8 * RingMetrics.scale) {
-                    ZStack {
-                        RingView(model: model, layer: .surface)
-                        // Keep both menu surfaces warm. The inactive ring sits
-                        // inside the hub, rather than being created on selection.
-                        if model.file.kind == .animatedImage {
-                            RingView(model: model, layer: .formats)
-                        }
-                        RingView(model: model, layer: .hub)
+            // One persistent glass surface owns both the hub and sectors. At contact
+            // their paths unite, so no hidden lens or selection can remain behind it.
+            VStack(spacing: 8 * RingMetrics.scale) {
+                RingView(model: model, layer: .surface)
+                Group {
+                    if model.choosingFrameFormat || (!model.file.convertActions.isEmpty && !model.file.editActions.isEmpty) {
+                        TabPill(model: model)
                     }
-                    Group {
+                    if showHints {
                         if model.choosingFrameFormat {
-                            BackPill(model: model)
-                        } else if !model.file.convertActions.isEmpty && !model.file.editActions.isEmpty {
-                            TabPill(model: model)
-                        }
-                        if showHints {
-                            if model.choosingFrameFormat {
-                                Text("⇧tab 선택 · return 열기 · esc 뒤로").font(.system(size: 10)).foregroundStyle(.secondary)
-                            } else { ShortcutHints() }
-                        }
+                            Text("⇧tab 선택 · return 열기 · esc 뒤로").font(.system(size: 10)).foregroundStyle(.secondary)
+                        } else { ShortcutHints() }
                     }
-                    .allowsHitTesting(!model.isWorking && !model.isNavigating)
                 }
+                .allowsHitTesting(!model.isWorking && !model.isNavigating)
+                .opacity(model.isWorking ? 0 : 1)
             }
-            // Fade the container itself: harvested glass ignores a child's opacity.
-            .opacity(model.isWorking ? 0 : 1)
             .overlay(alignment: .top) {
-                // Working/completion retains a standalone hub while the entire
-                // navigation glass group fades, including its harvested surfaces.
-                ZStack {
-                    if model.isWorking { RingView(model: model, layer: .hub) }
-                    RingView(model: model, layer: .content)
-                }
+                RingView(model: model, layer: .content)
             }
             if model.isWorking && !model.isCompleting {
                 Button(model.isCancelling ? "취소 중…":"작업 취소") { model.cancelWork() }
@@ -101,7 +83,7 @@ struct RingScreen: View {
 }
 
 struct RingView: View {
-    enum Layer { case surface, formats, hub, content }
+    enum Layer { case surface, content }
     @ObservedObject var model: RingModel
     let layer: Layer
 
@@ -111,33 +93,11 @@ struct RingView: View {
     var body: some View {
         let items = model.items
         let settled = model.tabProgress == (model.tab == .edit ? 1 : 0)
-        // Open/close: everything grows out of (and back into) the ring centre. Sizes change
-        // instead of a scale effect so the glass keeps its final tone from the first frame.
-        let g = model.appeared ? 1 : RingMetrics.closedGrow
-        let hub = RingMetrics.hubDiameter * g * (model.menuFolded ? 1.09 : 1)
+        let g: CGFloat = model.appeared ? 1 : 0
+        let hub = RingMetrics.hubDiameter
         ZStack {
             if layer == .surface {
-                // Clear glass needs a darker backdrop to stay legible (Apple's guidance for the
-                // clear variant). The glass refracts this soft shadow together with the desktop.
-                // While a job runs it folds in with the wedges and fades out, otherwise it was left
-                // as a soft round halo around the lone hub.
-                let backdrop = (model.isWorking || model.menuFolded) ? RingMetrics.hubDiameter : RingMetrics.outer * 2 + 10
-                Circle()
-                    .fill(.black.opacity(0.18))
-                    .frame(width: backdrop * g, height: backdrop * g)
-                    .blur(radius: 22)
-                    .allowsHitTesting(false)
-                // While a job runs the wedges fold into the hub and fade; only the hub stays.
                 wedges(grow: g, settled: settled, labelsOnly: false)
-            } else if layer == .formats {
-                wedges(grow: g, settled: settled, labelsOnly: false)
-            } else if layer == .hub {
-                FrostLayer()
-                    .frame(width: hub, height: hub)
-                    .clipShape(Circle())
-                Color.clear
-                    .frame(width: hub, height: hub)
-                    .glassEffect(RingMetrics.glass.interactive(), in: Circle())
             } else {
                 wedges(grow: g, settled: settled, labelsOnly: true)
                     .opacity(model.isWorking ? 0 : 1)
@@ -191,14 +151,12 @@ struct RingView: View {
     }
 
     private func wedges(grow: CGFloat, settled: Bool, labelsOnly: Bool) -> RingWedges {
-        let formats = layer == .formats
-        let convert = labelsOnly ? model.convertItems : formats ? model.frameFormatItems : model.file.convertActions
-        let edit = labelsOnly ? model.editItems : formats ? model.frameFormatItems : model.file.editActions
-        let active = labelsOnly || formats == model.choosingFrameFormat
-        let size: CGFloat = model.menuFolded || !active ? 0.25 : model.isWorking ? 0.62 : 1
+        let convert = model.convertItems, edit = model.editItems
+        let size: CGFloat = model.menuFolded || model.isWorking || model.screen != .ring ? 0 : 1
         return RingWedges(progress: model.tabProgress, grow: grow * size,
+                   appearance: grow, hubScale: model.menuFolded ? 1.06 : 1,
                    convert: convert, edit: edit,
-                   lifts: LiftVector((0..<max(convert.count, edit.count)).map { active && settled && $0 == model.hovered ? 1 : 0 }),
+                   lifts: LiftVector((0..<max(convert.count, edit.count)).map { settled && $0 == model.hovered ? 1 : 0 }),
                    side: side, labelsOnly: labelsOnly)
     }
 }
@@ -214,15 +172,29 @@ struct RingWedges: View, Animatable {
     var progress: Double
     /// Ring size relative to full, about the centre (open/close animation).
     var grow: CGFloat
+    var appearance: CGFloat
+    var hubScale: CGFloat
     let convert: [RingAction]
     let edit: [RingAction]
     var lifts: LiftVector
     let side: CGFloat
     let labelsOnly: Bool
 
-    var animatableData: AnimatablePair<AnimatablePair<Double, CGFloat>, LiftVector> {
-        get { AnimatablePair(AnimatablePair(progress, grow), lifts) }
-        set { progress = newValue.first.first; grow = newValue.first.second; lifts = newValue.second }
+    var animatableData: AnimatablePair<AnimatablePair<Double, CGFloat>, AnimatablePair<AnimatablePair<CGFloat, CGFloat>, LiftVector>> {
+        get { AnimatablePair(AnimatablePair(progress, grow), AnimatablePair(AnimatablePair(appearance, hubScale), lifts)) }
+        set {
+            progress = newValue.first.first; grow = newValue.first.second
+            appearance = newValue.second.first.first; hubScale = newValue.second.first.second
+            lifts = newValue.second.second
+        }
+    }
+
+    // The hub stays in place until the last sector has entered its surface. Only
+    // then does the hub itself shrink on dismissal; opening reverses the same path.
+    private var hubRadius: CGFloat { RingMetrics.hubDiameter / 2 * min(1, max(0, appearance * 2.5)) * hubScale }
+    private func smooth(_ value: CGFloat) -> CGFloat {
+        let t = min(1, max(0, value))
+        return t * t * (3 - 2 * t)
     }
 
     struct Wedge {
@@ -271,15 +243,24 @@ struct RingWedges: View, Animatable {
         // (it appears and disappears), so the selection jumped from wedge to wedge.
         ZStack {
             if !labelsOnly {
-                let all = SectorSet(sectors: wedges.map { ($0.start, $0.end, $0.outer, shift($0)) }, grow: grow)
+                let all = SectorSet(sectors: wedges.map { ($0.start, $0.end, $0.outer, shift($0)) }, grow: grow, hubRadius: hubRadius)
+                let exposed = smooth((RingMetrics.outer * grow - hubRadius) / (RingMetrics.outer - RingMetrics.hubDiameter / 2))
+                Circle()
+                    .fill(.black.opacity(0.18 * Double(exposed)))
+                    .frame(width: max(hubRadius * 2, (RingMetrics.outer * 2 + 10) * grow),
+                           height: max(hubRadius * 2, (RingMetrics.outer * 2 + 10) * grow))
+                    .blur(radius: 22)
                 // A faint, light frosted layer under the glass: clear glass alone looked too bare.
                 // The glass still refracts it, so the lensing stays visible.
                 FrostLayer().frame(width: side, height: side).clipShape(all)
                 // The selection colour, under the glass so the glass refracts it like a tint;
                 // it fades with the lift instead of switching on and off.
                 ForEach(wedges.filter { lift($0.index) > 0.001 }, id: \.index) { w in
-                    SectorShape(start: w.start, end: w.end, outer: w.outer, grow: grow, shift: shift(w))
-                        .fill(Color.accentColor.opacity(0.9 * min(Double(lift(w.index)), 1)))
+                    SectorShape(start: w.start, end: w.end, outer: w.outer, grow: grow, shift: shift(w), hubRadius: hubRadius)
+                        .subtracting(Circle().size(width: hubRadius * 2, height: hubRadius * 2)
+                            .offset(x: side / 2 - hubRadius, y: side / 2 - hubRadius))
+                        .fill(Color.accentColor.opacity(0.9 * min(Double(lift(w.index)), 1)
+                            * Double(smooth((RingMetrics.inner * grow - hubRadius + 2) / 10))))
                         .frame(width: side, height: side)
                 }
                 // One glass surface for all wedges (a multi-part shape): the glass is computed once
@@ -287,7 +268,6 @@ struct RingWedges: View, Animatable {
                 Color.clear
                     .frame(width: side, height: side)
                     .glassEffect(RingMetrics.glass.interactive(), in: all)
-
             } else {
                 ForEach(wedges, id: \.index) { w in
                     labels(w)
@@ -300,6 +280,7 @@ struct RingWedges: View, Animatable {
 
     @ViewBuilder private func labels(_ w: Wedge) -> some View {
         let labelR = (w.outer + RingMetrics.inner) / 2 * grow
+        let visible = Double(smooth((labelR - hubRadius - 8) / 20))
         let la = (w.mid - 90) * .pi / 180
         let lift = shift(w)
         let lit = min(max(Double(self.lift(w.index)), 0), 1)
@@ -310,13 +291,13 @@ struct RingWedges: View, Animatable {
         if w.index < convert.count {
             SlotLabel(action: convert[w.index], lit: lit)
                 .scaleEffect((0.85 + 0.15 * w.fromOpacity) * grow)
-                .opacity(w.fromOpacity)
+                .opacity(w.fromOpacity * visible)
                 .position(point)
         }
         if w.index < edit.count {
             SlotLabel(action: edit[w.index], lit: lit)
                 .scaleEffect((0.85 + 0.15 * w.toOpacity) * grow)
-                .opacity(w.toOpacity)
+                .opacity(w.toOpacity * visible)
                 .position(point)
         }
     }
@@ -347,11 +328,14 @@ struct LiftVector: VectorArithmetic {
 struct SectorSet: Shape {
     let sectors: [(Double, Double, CGFloat, CGSize)]
     var grow: CGFloat = 1
+    var hubRadius: CGFloat = 0
 
     func path(in rect: CGRect) -> Path {
-        var p = Path()
+        var p = Path(ellipseIn: CGRect(x: rect.midX - hubRadius, y: rect.midY - hubRadius,
+                                      width: hubRadius * 2, height: hubRadius * 2))
         for (start, end, outer, shift) in sectors {
-            p.addPath(SectorShape(start: start, end: end, outer: outer, grow: grow, shift: shift).path(in: rect))
+            let sector = SectorShape(start: start, end: end, outer: outer, grow: grow, shift: shift, hubRadius: hubRadius).path(in: rect)
+            p = p.union(sector)
         }
         return p
     }
@@ -479,33 +463,16 @@ struct HubContent: View {
     }
 }
 
-/// Same capsule track, inset and type treatment as the convert/edit control.
-struct BackPill: View {
-    @ObservedObject var model: RingModel
-    var body: some View {
-        Button { model.navigateFrameFormats(false) } label: {
-            Label("뒤로", systemImage: "chevron.left")
-                .font(.system(size: max(10.5, 13 * RingMetrics.scale), weight: .medium))
-                .foregroundStyle(Color.black.opacity(0.85))
-                .frame(width: 84 * RingMetrics.scale, height: 30 * RingMetrics.scale)
-                .background(.white.opacity(0.92), in: Capsule())
-                .padding(3)
-                .glassEffect(.regular.interactive(), in: Capsule())
-                .hitTestableGlass(Capsule())
-        }
-        .buttonStyle(.plain).focusEffectDisabled().disabled(model.isNavigating)
-        .accessibilityIdentifier("ring.back")
-    }
-}
-
-/// 변환/편집 switch. The white knob is one view moving between the two slots with a
-/// springy slide that stays inside the track.
+/// One continuous capsule: the two tabs contract into the back button, sharing
+/// the same glass track and white knob in both directions.
 struct TabPill: View {
     @ObservedObject var model: RingModel
     private let s = RingMetrics.scale
     private var chipW: CGFloat { 84 * s }
     private var chipH: CGFloat { 30 * s }
     private let spacing: CGFloat = 3
+    private var back: Bool { model.choosingFrameFormat }
+    private var trackW: CGFloat { back ? chipW : chipW * 2 + spacing }
 
     // The knob's two ends move on separate springs: the leading end sets off first and the
     // trailing end catches up, so the knob stretches and snaps back — always inside the track.
@@ -513,7 +480,7 @@ struct TabPill: View {
     @State private var rightEdge: CGFloat = 0
 
     private func edges(for tab: RingModel.Tab) -> (CGFloat, CGFloat) {
-        tab == .convert ? (0, chipW) : (chipW + spacing, chipW * 2 + spacing)
+        back || tab == .convert ? (0, chipW) : (chipW + spacing, chipW * 2 + spacing)
     }
 
     var body: some View {
@@ -523,11 +490,29 @@ struct TabPill: View {
                 .shadow(color: .black.opacity(0.14), radius: 3, y: 1)
                 .frame(width: max(chipH, rightEdge - leftEdge), height: chipH)
                 .offset(x: leftEdge)
-            HStack(spacing: spacing) {
+            HStack(spacing: back ? 0 : spacing) {
                 chip("변환", .convert)
                 chip("편집", .edit)
             }
+            .opacity(back ? 0 : 1)
+            .animation(.easeInOut(duration: 0.10).delay(back ? 0 : 0.12), value: back)
+            .allowsHitTesting(!back)
+            .accessibilityHidden(back)
+            Button { model.navigateFrameFormats(false) } label: {
+                Label("뒤로", systemImage: "chevron.left")
+                    .font(.system(size: max(10.5, 13 * s), weight: .medium))
+                    .foregroundStyle(Color.black.opacity(0.85))
+                    .frame(width: chipW, height: chipH)
+                    .contentShape(Capsule())
+            }
+            .buttonStyle(.plain).focusEffectDisabled()
+            .opacity(back ? 1 : 0)
+            .animation(.easeInOut(duration: 0.10).delay(back ? 0.12 : 0), value: back)
+            .allowsHitTesting(back)
+            .accessibilityHidden(!back)
+            .accessibilityIdentifier("ring.back")
         }
+        .frame(width: trackW, height: chipH, alignment: .leading)
         // The bouncy knob may overshoot a pixel or two; never let it leave the track.
         .clipShape(Capsule())
         .padding(3)
@@ -546,6 +531,13 @@ struct TabPill: View {
                 withAnimation(follow) { rightEdge = r }
             }
         }
+        .onChange(of: back) { _, _ in
+            let (l, r) = edges(for: model.tab)
+            withAnimation(.spring(response: NSWorkspace.shared.accessibilityDisplayShouldReduceMotion ? 0.22 : 0.56,
+                                  dampingFraction: 0.82)) {
+                leftEdge = l; rightEdge = r
+            }
+        }
     }
 
     private func chip(_ title: String, _ tab: RingModel.Tab) -> some View {
@@ -557,7 +549,7 @@ struct TabPill: View {
                 .font(.system(size: max(10.5, 13 * s), weight: on ? .bold : .medium))
                 // The knob is always white, so the selected label stays dark in Dark Mode too.
                 .foregroundStyle(on ? AnyShapeStyle(Color.black.opacity(0.85)) : AnyShapeStyle(.secondary))
-                .frame(width: chipW, height: chipH)
+                .frame(width: back ? chipW / 2 : chipW, height: chipH)
                 .contentShape(Capsule())
                 .animation(.easeInOut(duration: 0.18), value: on)
         }

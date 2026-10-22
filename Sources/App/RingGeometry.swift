@@ -63,30 +63,39 @@ struct SectorShape: Shape {
     var grow: CGFloat = 1
     /// Offset of a lifted (selected) wedge, applied after `grow`.
     var shift: CGSize = .zero
+    /// The receiving glass surface. A sector is consumed at this radius instead
+    /// of continuing to shrink behind the hub as a second lens.
+    var hubRadius: CGFloat = 0
 
     init(slot: RingSlot) { start = slot.start; end = slot.end }
-    init(start: Double, end: Double, outer: CGFloat, grow: CGFloat = 1, shift: CGSize = .zero) {
-        self.start = start; self.end = end; self.outer = outer; self.grow = grow; self.shift = shift
+    init(start: Double, end: Double, outer: CGFloat, grow: CGFloat = 1, shift: CGSize = .zero, hubRadius: CGFloat = 0) {
+        self.start = start; self.end = end; self.outer = outer; self.grow = grow; self.shift = shift; self.hubRadius = hubRadius
     }
 
     func path(in rect: CGRect) -> Path {
-        guard grow > 0.01 else { return Path() }
+        guard grow > 0.01, outer * grow + hypot(shift.width, shift.height) > hubRadius + 0.1 else { return Path() }
         let full = fullPath(in: rect)
         let moved = CGAffineTransform(translationX: shift.width, y: shift.height)
-        guard grow != 1 else { return shift == .zero ? full : full.applying(moved) }
-        // The outline itself is scaled, not the view: a scaled view made the glass render
-        // lighter until the scale settled back to 1.
-        let c = CGPoint(x: rect.midX, y: rect.midY)
-        return full.applying(CGAffineTransform(translationX: c.x, y: c.y).scaledBy(x: grow, y: grow).translatedBy(x: -c.x, y: -c.y).concatenating(moved))
+        return shift == .zero ? full : full.applying(moved)
     }
 
     private func fullPath(in rect: CGRect) -> Path {
         let c = CGPoint(x: rect.midX, y: rect.midY)
-        let R = outer, r = RingMetrics.inner
-        let half = RingMetrics.gap / 2
+        let R = outer * grow
+        var r = RingMetrics.inner * grow
+        if hubRadius > 0 {
+            // A short meniscus reaches toward the hub only within six points of
+            // contact. After contact its inner edge stays at the surface while
+            // the outer edge drains into it; no ring travels underneath.
+            let gap = max(0, r - hubRadius)
+            let t = min(1, max(0, 1 - gap / 6))
+            let contact = t * t * (3 - 2 * t)
+            r = max(hubRadius - 3, r - (gap + 3) * contact)
+        }
+        let half = RingMetrics.gap / 2 * grow
         let span = (end - start) * .pi / 180
         // A wedge folding away (span → 0) simply disappears once it is thinner than the gap.
-        guard R - r > 4, span * Double(r) > Double(RingMetrics.gap) + 3 else { return Path() }
+        guard R - r > 0.1, r > 0.1, span * Double(r) > Double(half * 2) + 3 * Double(grow) else { return Path() }
         func rad(_ deg: Double) -> Double { (deg - 90) * .pi / 180 }
         let a0o = rad(start) + Double(half / R), a1o = rad(end) - Double(half / R)
         let a0i = rad(start) + Double(half / r), a1i = rad(end) - Double(half / r)
@@ -94,8 +103,8 @@ struct SectorShape: Shape {
             CGPoint(x: c.x + radius * CGFloat(Foundation.cos(a)), y: c.y + radius * CGFloat(Foundation.sin(a)))
         }
         // Corners shrink with the wedge so thin or short wedges keep a valid outline.
-        let co = min(RingMetrics.outerCorner, CGFloat(a1o - a0o) * R * 0.3, (R - r) * 0.42)
-        let ci = min(RingMetrics.innerCorner, CGFloat(a1i - a0i) * r * 0.3, (R - r) * 0.42)
+        let co = min(RingMetrics.outerCorner * grow, CGFloat(a1o - a0o) * R * 0.3, (R - r) * 0.42)
+        let ci = min(RingMetrics.innerCorner * grow, CGFloat(a1i - a0i) * r * 0.3, (R - r) * 0.42)
         let oS = pt(R, a0o), oE = pt(R, a1o), iE = pt(r, a1i), iS = pt(r, a0i)
         let dO = Double(co / R), dI = Double(ci / r)
 
