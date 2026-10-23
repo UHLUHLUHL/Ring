@@ -14,8 +14,6 @@
 
 </div>
 
-<p align="center"><img src="docs/ring-demo.webp" width="720" alt="Ring 데모: Finder에서 영상을 우클릭해 WebP로 변환"></p>
-
 <p align="center">파일을 우클릭하고 링에서 형식을 고르면 같은 폴더에 새 파일로 저장돼요.</p>
 
 1. DMG를 열고 **Ring을 Applications로 드래그**하세요.
