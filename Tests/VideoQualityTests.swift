@@ -33,6 +33,15 @@ import CryptoKit
         try require(floorOnly.acceptable && !floorOnly.preferredForAutomatic && clean.preferredForAutomatic,
             "automatic fidelity must exceed the explicit-limit safety floor")
         try require(clean.distortion<floorOnly.distortion,"rank fidelity rather than file size")
+        try require(clean.rateMargin(preferred:true)>0 && floorOnly.rateMargin(preferred:true)<0 &&
+            colorDamage.rateMargin(preferred:false)<0 && flash.rateMargin(preferred:false)<0,"search coordinate respects every quality guard")
+        try require(MediaEngine.preferVideoCandidate(floorOnly,bytes:950,over:clean,previousBytes:400,limit:1000,automatic:false),
+            "a passing result in the byte band must win over an underfilled fallback")
+        try require(!MediaEngine.preferVideoCandidate(clean,bytes:400,over:floorOnly,previousBytes:950,limit:1000,automatic:false),
+            "higher fidelity must not silently replace an in-band target with an underfilled result")
+        try require(MediaEngine.preferVideoCandidate(clean,bytes:900,over:clean,previousBytes:950,limit:1000,automatic:true) &&
+            !MediaEngine.preferVideoCandidate(floorOnly,bytes:800,over:clean,previousBytes:950,limit:1000,automatic:true),
+            "auto minimizes actual passing bytes and never relaxes its quality floor")
         let edgeWidth=17,edgeHeight=9
         var edge=[UInt8](repeating:100,count:edgeWidth*edgeHeight),edgeResult=RingVideoPlaneQuality()
         edge[edge.count-1]=200
@@ -50,7 +59,7 @@ import CryptoKit
         let shown=natural.applying(transform),size=VideoCropGeometry.compressedSize(width:abs(shown.width),height:abs(shown.height),crop:crop,maxDimension:maxDimension)
         let region=crop.isFull ? nil:crop.pixelRect(width:Int(abs(shown.width)),height:Int(abs(shown.height)))
         let swaps=region == nil && abs(transform.b)>0.5
-        return try VideoQuality.compare(source:asset,video:track,output:result,track:out,
+        return try await VideoQuality.compare(source:asset,video:track,output:result,track:out,
             width:swaps ? size.height:size.width,height:swaps ? size.width:size.height,natural:natural,transform:transform,
             crop:region,fullRange:info.fullRange,duration:info.duration)
     }
@@ -102,6 +111,22 @@ import CryptoKit
                 } catch let error as EngineError { if case .quality(let reason)=error,reason.hasPrefix("TEST:") { throw error } }
             }
             print("PASS native VFR identity, dropped/retimed frame rejection")
+            // A nonzero first picture creates an empty movie edit. The native
+            // decoder can emit a synthetic black placeholder for that gap;
+            // encoding it would add a picture, while coarse movie timescales
+            // would shift every real presentation timestamp.
+            let delayed=root.appendingPathComponent("delayed.mp4"),delayedOut=root.appendingPathComponent("delayed-out.mp4")
+            try await MediaFixture.write(delayed,width:640,height:360,times:times.map{$0+0.0297666667},duration:2.64,bitrate:20_000_000)
+            let delayedAsset=AVURLAsset(url:delayed),delayedTrack=try await delayedAsset.loadTracks(withMediaType:.video)[0]
+            let delayedInfo=try await VideoSourceInfo.inspect(delayed)
+            try await MediaEngine.encode(delayedAsset,to:delayedOut,video:delayedTrack,audio:nil,duration:try await delayedAsset.load(.duration),
+                width:640,height:360,transform:.identity,natural:CGSize(width:640,height:360),crop:nil,bitrate:20_000_000,codec:.hevc,
+                colorProperties:delayedInfo.colorProperties,fullRange:delayedInfo.fullRange)
+            let delayedResult=AVURLAsset(url:delayedOut),delayedResultTrack=try await delayedResult.loadTracks(withMediaType:.video)[0]
+            try MediaEngine.verifyFrameTiming(source:delayedAsset,video:delayedTrack,output:delayedResult,track:delayedResultTrack)
+            let delayedQuality=try await compare(delayed,delayedOut)
+            try require(delayedQuality.frames==times.count && delayedQuality.acceptable,"empty edits must not add pictures or shift VFR times")
+            print("PASS empty movie edit and nonzero first-picture timing")
             for (crop,limit,codec) in [(VideoCrop.full,Optional<Int>.none,VideoCodec.hevc),(.init(ratio:.square),320,.hevc),(.full,nil,.h264)] {
                 let output=root.appendingPathComponent(UUID().uuidString+".mp4")
                 let detail=try await MediaEngine.compress(source,to:output,options:.init(codec:codec,maxDimension:limit,crop:crop))

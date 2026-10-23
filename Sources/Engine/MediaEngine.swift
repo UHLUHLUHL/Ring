@@ -68,89 +68,85 @@ enum MediaEngine {
         let scratch=try StagingWorkspace(beside:output),workspace=scratch.directory
         defer { scratch.cleanup() }
         let automatic=targetBytes == nil
-        let best=workspace.appendingPathComponent("best.mp4"),maximumAttempts=automatic ? 6:5
-        // Requested bitrate can greatly exceed the measured rate on sparse VFR
-        // sources. Bound actual file bytes, not the request, when raising quality.
+        let best=workspace.appendingPathComponent("best.mp4")
         let maximumRate=Int(Int32.max)
-        var upperRate:Int?,lowerRate=0,bestQuality:VideoQualityReport?,bestBytes=0,attempts=0
+        var bestQuality:VideoQualityReport?,bestBytes=0,attempts=0
         let fps=info.frameRate.isFinite && info.frameRate>0 ? info.frameRate:30
-        // Only a starting point for the search, not an asserted codec saving.
-        // Actual decoded quality and bytes decide every accepted result.
         let initial=automatic ? Double(width)*Double(height)*fps*(codec == .hevc ? 0.06:0.10):budget
         var rate=Int(max(100000,min(Double(maximumRate),budget,initial)))
         let progress=EngineProgress.handler
-        // Calibrate the starting rate on short, distributed motion windows.
-        // This only schedules work: the published file still passes the full
-        // frame-by-frame quality, timing and original-audio checks below.
-        // Skip short clips, already budget-limited rates, and the higher-rate
-        // H.264 starting profile where a probe often just adds a second pass.
-        if automatic, codec == .hevc, duration.seconds >= 8, Double(rate)*1.05 < budget {
-            rate = try await calibratedVideoRate(track: track, duration: duration.seconds,
-                workspace: workspace, rate: rate, maximumRate: min(maximumRate, Int(budget)),
-                width: width, height: height, natural: natural, transform: transform, crop: region,
-                codec: codec, colors: info.colorProperties, fullRange: info.fullRange)
+        var calibration=VideoRateCalibration(rate:rate,samples:[],constrained:automatic)
+        if duration.seconds>=1 {
+            calibration=try await calibratedVideoRate(track:track,duration:duration.seconds,workspace:workspace,
+                rate:rate,maximumRate:maximumRate,width:width,height:height,natural:natural,transform:transform,
+                crop:region,codec:codec,colors:info.colorProperties,fullRange:info.fullRange,
+                targetVideoBytes:automatic ? nil:max(1,Double(byteLimit)-Double(info.audioBytes)-4096),
+                maximumVideoBytes:max(1,Double(byteLimit)-Double(info.audioBytes)-4096))
+            rate=calibration.rate
         }
-        for attempt in 0..<maximumAttempts {
+        // Short probes choose requests; only fully measured and independently
+        // verified full-file outputs can be published. At most two full encodes.
+        for attempt in 0..<2 {
             try Task.checkCancellation()
             attempts+=1
             let candidate=workspace.appendingPathComponent("candidate-\(attempt).mp4")
-            let base=0.05+0.85*Double(attempt)/Double(maximumAttempts),span=0.85/Double(maximumAttempts)
-            try await EngineProgress.$handler.withValue({ value in
-                progress?(base+span*0.6*value)
-            }) {
+            let base=0.05+0.40*Double(attempt),span=0.40
+            try await EngineProgress.$handler.withValue({ value in progress?(base+span*0.75*value) }) {
                 try await encode(asset,to:candidate,video:track,audio:audio.first,duration:duration,width:width,height:height,
                     transform:transform,natural:natural,crop:region,bitrate:rate,codec:codec,
-                    colorProperties:info.colorProperties,fullRange:info.fullRange)
+                    colorProperties:info.colorProperties,fullRange:info.fullRange,constrainedRate:calibration.constrained)
             }
             let bytes=try candidate.resourceValues(forKeys:[.fileSizeKey]).fileSize ?? 0
             guard bytes>0 else { throw EngineError.quality("비디오 인코딩 결과가 비어 있어요.") }
-            var next=rate,finished=false
-            let available=Double(byteLimit)-Double(info.audioBytes)-4096
+            let available=max(1,Double(byteLimit)-Double(info.audioBytes)-4096)
             let measured=max(1,Double(bytes)-Double(info.audioBytes)-4096)
-            if Int64(bytes)>byteLimit {
-                upperRate=min(upperRate ?? maximumRate,rate)
-                // Correct only the measured video payload, keeping copied audio.
-                next=max(100000,Int(Double(rate)*min(0.95,available/measured*0.985)))
-            } else {
+            var fullQuality:VideoQualityReport?
+            if Int64(bytes)<=byteLimit {
                 let encoded=AVURLAsset(url:candidate),outTrack=try await encoded.loadTracks(withMediaType:.video)[0]
-                let quality=try EngineProgress.$handler.withValue({ value in
-                    progress?(base+span*(0.6+0.4*value))
-                }) {
-                    try VideoQuality.compare(source:asset,video:track,output:encoded,track:outTrack,width:width,height:height,
+                let quality=try await EngineProgress.$handler.withValue({ value in progress?(base+span*(0.75+0.25*value)) }) {
+                    try await VideoQuality.compare(source:asset,video:track,output:encoded,track:outTrack,width:width,height:height,
                         natural:natural,transform:transform,crop:region,fullRange:info.fullRange,duration:duration.seconds)
                 }
-                if automatic ? quality.preferredForAutomatic:quality.acceptable {
-                    if bestQuality == nil || quality.distortion<bestQuality!.distortion ||
-                       (quality.distortion==bestQuality!.distortion && bytes<bestBytes) {
-                        if FileManager.default.fileExists(atPath:best.path) { try FileManager.default.removeItem(at:best) }
-                        try FileManager.default.moveItem(at:candidate,to:best)
-                        bestQuality=quality;bestBytes=bytes
-                    }
+                fullQuality=quality
+                if preferVideoCandidate(quality,bytes:bytes,over:bestQuality,previousBytes:bestBytes,limit:byteLimit,automatic:automatic) {
+                    if FileManager.default.fileExists(atPath:best.path) { try FileManager.default.removeItem(at:best) }
+                    try FileManager.default.moveItem(at:candidate,to:best)
+                    bestQuality=quality;bestBytes=bytes
                 }
-                lowerRate=max(lowerRate,rate)
-                // Automatic: stop at the preferred fidelity, never search down
-                // toward the smallest file that barely meets the safety floor.
-                // Explicit limit: spend the available budget on higher quality.
-                finished=automatic ? quality.preferredForAutomatic:
-                    quality.acceptable && Double(bytes)>=Double(byteLimit)*0.90
-                // Stay inside the measured video budget. A quality deficit is
-                // not a reason to schedule a predictably oversized full pass.
-                let room = available / measured * 0.99
-                let increase = automatic ? min(quality.rateIncreaseFactor(preferred:true), room) : room
-                if increase <= 1.02 { finished = true }
-                next=Int(min(Double(maximumRate),ceil(Double(rate)*min(4,increase))))
             }
             if FileManager.default.fileExists(atPath:candidate.path) { try FileManager.default.removeItem(at:candidate) }
             progress?(base+span)
-            if finished { break }
-            if let upper=upperRate {
-                if upper-lowerRate<=1000 || (lowerRate>0 && Double(upper)/Double(lowerRate)<1.03) { break }
-                if next<=lowerRate || next>=upper {
-                    next=lowerRate>0 ? Int(sqrt(Double(lowerRate)*Double(upper))):max(100000,upper/2)
+            if automatic ? bestQuality != nil:bestQuality != nil && Double(bestBytes)>=Double(byteLimit)*0.90 { break }
+            guard attempt==0 else { break }
+            if automatic {
+                if let quality=fullQuality {
+                    // Learn optimism from this full encode rather than applying
+                    // the old unconditional >=1.4 jump to every quality miss.
+                    let nearby=calibration.samples.min { abs(log(Double($0.rate)/Double(rate))) < abs(log(Double($1.rate)/Double(rate))) }
+                    let bias=max(0,(nearby?.quality.rateMargin(preferred:true) ?? 0)-quality.rateMargin(preferred:true))
+                    let full=VideoRateSample(rate:rate,bytesPerSecond:measured/duration.seconds,quality:quality)
+                    var corrected=calibration.samples.map { VideoRateSample(rate:$0.rate,bytesPerSecond:$0.bytesPerSecond,quality:$0.quality,bias:bias) }
+                    corrected.removeAll { $0.rate==rate };corrected.append(full)
+                    rate=qualityVideoRate(corrected,target:0.35,maximumRate:maximumRate,explore:false)
+                    if rate<=full.rate { rate=Int(min(Double(maximumRate),ceil(Double(full.rate)*min(4,max(1.1,pow(10,-quality.rateMargin(preferred:true)/10)))))) }
+                    rate=min(rate,Int(min(Double(maximumRate),Double(full.rate)*available/measured*0.98)))
+                } else {
+                    rate=max(100000,Int(Double(rate)*available/measured*0.98))
                 }
+            } else {
+                // Correct the measured video payload, never copied audio. For
+                // sparse/VFR material a single linear correction can miss a
+                // bitrate-control jump; nearby probes resolve that cheaply.
+                let desired=Int(max(100000,min(Double(maximumRate),Double(rate)*available/measured*0.975)))
+                if duration.seconds>=1 {
+                    let calibrated=try await calibratedVideoRate(track:track,duration:duration.seconds,workspace:workspace,
+                        rate:desired,maximumRate:maximumRate,width:width,height:height,natural:natural,transform:transform,
+                        crop:region,codec:codec,colors:info.colorProperties,fullRange:info.fullRange,
+                        targetVideoBytes:available,fullRate:rate,fullVideoBytes:measured,fullConstrained:calibration.constrained)
+                    calibration=calibrated
+                    rate=calibrated.rate
+                } else { rate=desired }
             }
-            if next==rate || next<100000 { break }
-            rate=next
         }
         guard let quality=bestQuality else {
             throw EngineError.quality(targetBytes == nil || targetBytes!>=savingLimit
@@ -190,50 +186,185 @@ enum MediaEngine {
         return "\(codec == .hevc ? "HEVC":"H.264") · \(shown.width)×\(shown.height) · 원본 프레임·오디오 유지 · \(bestBytes)바이트 · \(automatic ? "자동 화질 우선":"상한 내 화질 우선") · \(quality.summary) · 후보 \(attempts)회"
     }
 
-    /// Probe at most 2.25 seconds, not an entire second candidate. New keyframes
-    /// and unobserved scenes can make a probe optimistic, so never publish or
-    /// reject a source based on this estimate alone.
-    private static func calibratedVideoRate(track: AVAssetTrack, duration: Double,
-        workspace: URL, rate: Int, maximumRate: Int, width: Int, height: Int, natural: CGSize,
-        transform: CGAffineTransform, crop: CGRect?, codec: VideoCodec, colors: [String: Any], fullRange: Bool) async throws -> Int {
-        let composition = AVMutableComposition()
-        guard let sampled = composition.addMutableTrack(withMediaType: .video, preferredTrackID: kCMPersistentTrackID_Invalid) else { return rate }
-        sampled.preferredTransform = transform
-        let url = workspace.appendingPathComponent("rate-probe.mp4")
-        defer { try? FileManager.default.removeItem(at: url) }
+    static func preferVideoCandidate(_ quality:VideoQualityReport,bytes:Int,over previous:VideoQualityReport?,
+        previousBytes:Int,limit:Int64,automatic:Bool) -> Bool {
+        guard bytes>0,Int64(bytes)<=limit,automatic ? quality.preferredForAutomatic:quality.acceptable else { return false }
+        guard let previous else { return true }
+        if automatic { return bytes<previousBytes }
+        // First stay within the requested 90-100% band, then maximize actual
+        // measured quality. Keep an underfilled safe fallback if no result fits.
+        let fills=Double(bytes)>=Double(limit)*0.90,previousFills=Double(previousBytes)>=Double(limit)*0.90
+        if fills != previousFills { return fills }
+        return quality.distortion<previous.distortion || (quality.distortion==previous.distortion && bytes<previousBytes)
+    }
+
+    private struct VideoRateSample {
+        let rate:Int,bytesPerSecond:Double,quality:VideoQualityReport
+        var bias:Double=0
+        var constrained:Bool=true
+        var margin:Double { quality.rateMargin(preferred:true)-bias }
+    }
+    private struct VideoRateCalibration {
+        let rate:Int,samples:[VideoRateSample]
+        var constrained:Bool=true
+    }
+
+    /// Interpolate only a locally improving measured pair. A reversal cannot
+    /// turn a failed probe into a pass: every candidate is decoded and measured.
+    private static func qualityVideoRate(_ samples:[VideoRateSample],target:Double,maximumRate:Int,explore:Bool) -> Int {
+        func bounded(_ value:Double) -> Int { Int(max(100000,min(Double(maximumRate),value.isFinite ? value:Double(maximumRate)))) }
+        let passing=samples.filter { $0.margin>=target }.min { $0.bytesPerSecond<$1.bytesPerSecond }
+        if let pass=passing {
+            if let low=samples.filter({ $0.rate<pass.rate && $0.margin<target }).max(by:{ $0.rate<$1.rate }) {
+                let weight=max(0,min(1,(target-low.margin)/(pass.margin-low.margin)))
+                return bounded(exp(log(Double(low.rate))+(log(Double(pass.rate))-log(Double(low.rate)))*weight))
+            }
+            if !explore,let higher=samples.filter({ $0.rate>pass.rate && $0.margin>pass.margin+0.05 }).min(by:{ $0.rate<$1.rate }) {
+                let slope=(higher.margin-pass.margin)/log(Double(higher.rate)/Double(pass.rate))
+                return bounded(Double(pass.rate)*max(0.75,exp((target-pass.margin)/slope)))
+            }
+            return explore ? bounded(Double(pass.rate)*0.55):pass.rate
+        }
+        guard let best=samples.max(by:{ $0.margin<$1.margin }) else { return 100000 }
+        if let lower=samples.filter({ $0.rate<best.rate && $0.margin<best.margin-0.05 }).max(by:{ $0.rate<$1.rate }) {
+            let slope=(best.margin-lower.margin)/log(Double(best.rate)/Double(lower.rate))
+            let factor=exp(min(log(4),max(log(1.1),(target-best.margin)/slope)))
+            return bounded(Double(best.rate)*factor)
+        }
+        return bounded(Double(best.rate)*max(1.15,min(4,pow(10,(target-best.margin)/10))))
+    }
+
+    /// Distributed native-resolution windows also cover short clips and H.264.
+    /// These are scheduling hints; the original quality policy is applied to
+    /// every displayed picture of the selected full file, never to a prediction.
+    private static func calibratedVideoRate(track:AVAssetTrack,duration:Double,workspace:URL,rate:Int,
+        maximumRate:Int,width:Int,height:Int,natural:CGSize,transform:CGAffineTransform,crop:CGRect?,
+        codec:VideoCodec,colors:[String:Any],fullRange:Bool,targetVideoBytes:Double? = nil,
+        fullRate:Int? = nil,fullVideoBytes:Double? = nil,fullConstrained:Bool = true,
+        maximumVideoBytes:Double? = nil) async throws -> VideoRateCalibration {
+        let composition=AVMutableComposition()
+        guard let sampled=composition.addMutableTrack(withMediaType:.video,preferredTrackID:kCMPersistentTrackID_Invalid) else {
+            return .init(rate:rate,samples:[],constrained:targetVideoBytes == nil)
+        }
+        sampled.preferredTransform=transform
+        var observations=[VideoRateSample](),next=fullRate ?? rate,constrained=targetVideoBytes == nil || fullRate != nil && fullConstrained
+        var scales=[Bool:Double]()
+        func bounded(_ value:Double)->Int { Int(max(100000,min(Double(maximumRate),value.isFinite ? value:Double(maximumRate)))) }
+        func predicted(_ point:VideoRateSample)->Double { point.bytesPerSecond*(scales[point.constrained] ?? 1)*duration }
         do {
-            let window = 0.75
-            var position = CMTime.zero
-            for start in [0.0, (duration - window) / 2, duration - window] {
+            let count=4,window=min(0.75,duration*0.45/Double(count))
+            var position=CMTime.zero
+            for index in 0..<count {
                 try Task.checkCancellation()
-                let range = CMTimeRange(start: CMTime(seconds: start, preferredTimescale: 600000),
-                    duration: CMTime(seconds: window, preferredTimescale: 600000))
-                try sampled.insertTimeRange(range, of: track, at: position)
-                position = CMTimeAdd(position, range.duration)
+                let start=(duration-window)*Double(index)/Double(count-1)
+                let range=CMTimeRange(start:CMTime(seconds:start,preferredTimescale:600000),duration:CMTime(seconds:window,preferredTimescale:600000))
+                try sampled.insertTimeRange(range,of:track,at:position);position=CMTimeAdd(position,range.duration)
             }
-            return try await EngineProgress.$handler.withValue(nil) {
-                try await encode(composition, to: url, video: sampled, audio: nil, duration: position,
-                    width: width, height: height, transform: transform, natural: natural, crop: crop,
-                    bitrate: rate, codec: codec, colorProperties: colors, fullRange: fullRange)
-                let encoded = AVURLAsset(url: url), outputTrack = try await encoded.loadTracks(withMediaType: .video)[0]
-                let quality = try VideoQuality.compare(source: composition, video: sampled, output: encoded, track: outputTrack,
-                    width: width, height: height, natural: natural, transform: transform, crop: crop,
-                    fullRange: fullRange, duration: position.seconds)
-                if quality.preferredForAutomatic { return rate }
-                return max(rate, min(maximumRate, Int(ceil(Double(rate) * quality.rateIncreaseFactor(preferred: true)))))
+            for index in 0..<3 {
+                try Task.checkCancellation()
+                let url=workspace.appendingPathComponent("rate-probe-\(index)-\(UUID().uuidString).mp4")
+                defer { try? FileManager.default.removeItem(at:url) }
+                let observation:VideoRateSample=try await EngineProgress.$handler.withValue(nil) {
+                    try await encode(composition,to:url,video:sampled,audio:nil,duration:position,width:width,height:height,
+                        transform:transform,natural:natural,crop:crop,bitrate:next,codec:codec,colorProperties:colors,
+                        fullRange:fullRange,constrainedRate:constrained)
+                    let encoded=AVURLAsset(url:url),out=try await encoded.loadTracks(withMediaType:.video)[0]
+                    let quality=try await VideoQuality.compare(source:composition,video:sampled,output:encoded,track:out,
+                        width:width,height:height,natural:natural,transform:transform,crop:crop,fullRange:fullRange,duration:position.seconds)
+                    let bytes=try url.resourceValues(forKeys:[.fileSizeKey]).fileSize ?? 0
+                    return .init(rate:next,bytesPerSecond:Double(max(1,bytes))/position.seconds,quality:quality,constrained:constrained)
+                }
+                observations.append(observation)
+                if let target=targetVideoBytes {
+                    if index==0,let fullVideoBytes { scales[constrained]=(fullVideoBytes/duration)/observation.bytesPerSecond }
+                    let size=predicted(observation)
+                    // The distributed sample's rate can differ from the full
+                    // file by about 10%. Near the budget, keep the measured
+                    // request instead of scaling it into an encoder plateau.
+                    // Only actual full-file bytes decide the 90-100% result.
+                    if size>=target*0.85,size<=target*1.05,observation.quality.acceptable,
+                       index>0 || observation.quality.preferredForAutomatic { break }
+                    if index==0,fullRate==nil {
+                        // Compare real outputs from the two hardware rate-control
+                        // modes. A burst cap is efficient for some camera clips
+                        // but is not universally better for screen recordings.
+                        constrained=true;next=rate
+                    } else if index==0 {
+                        next=rate
+                        if next==observation.rate { constrained = !constrained }
+                    } else {
+                        let fitting=observations.filter { predicted($0)<=target*0.98 }
+                        let basis=(fitting.isEmpty ? observations:fitting).min { $0.quality.distortion<$1.quality.distortion }!
+                        constrained=basis.constrained
+                        let desired=target*0.955
+                        if let other=observations.filter({ $0.constrained==constrained && $0.rate != basis.rate &&
+                            (predicted($0)-predicted(basis))*Double($0.rate-basis.rate)>0 }).min(by:{ abs(predicted($0)-desired)<abs(predicted($1)-desired) }) {
+                            let fraction=max(-1,min(2,(desired-predicted(basis))/(predicted(other)-predicted(basis))))
+                            next=bounded(exp(log(Double(basis.rate))+fraction*log(Double(other.rate)/Double(basis.rate))))
+                        } else { next=bounded(Double(basis.rate)*max(0.5,min(4,desired/predicted(basis)))) }
+                    }
+                } else {
+                    // Observed optimism was about 0.28 dB with these windows.
+                    // The extra 0.35 is a scheduling guard, not a policy change.
+                    if index==1,observations.allSatisfy({$0.margin>=0.35}) {
+                        next=qualityVideoRate(observations,target:0.35,maximumRate:maximumRate,explore:false)
+                        break
+                    }
+                    next=qualityVideoRate(observations,target:0.35,maximumRate:maximumRate,explore:index<2)
+                }
+                if observations.contains(where:{ $0.rate==next && $0.constrained==constrained }) { break }
             }
+            if let target=targetVideoBytes {
+                let eligible=observations.filter { predicted($0)>=target*0.85 && predicted($0)<=target*1.05 && $0.quality.acceptable }
+                if let best=eligible.min(by:{$0.quality.distortion<$1.quality.distortion}) {
+                    next=best.rate;constrained=best.constrained
+                } else {
+                    let fitting=observations.filter { predicted($0)<=target*0.98 }
+                    let basis=(fitting.isEmpty ? observations:fitting).min(by:{$0.quality.distortion<$1.quality.distortion})!
+                    constrained=basis.constrained
+                    // Use a locally increasing measured size pair when possible;
+                    // a flat/descending response cannot justify interpolation.
+                    let desired=target*0.955
+                    if let other=observations.filter({ $0.constrained==constrained && $0.rate != basis.rate &&
+                        (predicted($0)-predicted(basis))*Double($0.rate-basis.rate)>0 }).min(by:{ abs(predicted($0)-desired)<abs(predicted($1)-desired) }) {
+                        let fraction=max(-1,min(2,(desired-predicted(basis))/(predicted(other)-predicted(basis))))
+                        next=bounded(exp(log(Double(basis.rate))+fraction*log(Double(other.rate)/Double(basis.rate))))
+                    } else { next=bounded(Double(basis.rate)*max(0.5,min(4,desired/predicted(basis)))) }
+                }
+            } else if let limit=maximumVideoBytes {
+                // Do not spend a full encode on a probe-predicted file larger
+                // than the source. This is only a request bound, never a quality
+                // rejection: the bounded full file is still actually measured.
+                if let closest=observations.min(by:{abs(log(Double($0.rate)/Double(next)))<abs(log(Double($1.rate)/Double(next)))}) {
+                    let size=closest.bytesPerSecond*duration*Double(next)/Double(closest.rate)
+                    if size>limit*0.98 { next=bounded(Double(next)*limit*0.98/size) }
+                }
+            }
+            return .init(rate:next,samples:observations,constrained:constrained)
         } catch is CancellationError { throw CancellationError() }
         catch {
-            // Unusual edit lists can prevent a representative short composition.
-            // The ordinary verified full-file search remains the fallback.
             try Task.checkCancellation()
-            return rate
+            return .init(rate:rate,samples:[],constrained:targetVideoBytes == nil)
         }
     }
 
     static func encode(_ asset:AVAsset,to output:URL,video:AVAssetTrack,audio:AVAssetTrack?,duration:CMTime,width:Int,height:Int,transform:CGAffineTransform,natural:CGSize,crop:CGRect?,bitrate:Int,codec:VideoCodec,
-                       fileType:AVFileType = .mp4,colorProperties:[String:Any] = [:],fullRange:Bool = false) async throws {
+                       fileType:AVFileType = .mp4,colorProperties:[String:Any] = [:],fullRange:Bool = false,constrainedRate:Bool = false) async throws {
         let reader=try AVAssetReader(asset:asset),writer=try AVAssetWriter(outputURL:output,fileType:fileType)
+        // Movie edit offsets otherwise default to a coarse timescale (often
+        // 600), even when mediaTimeScale preserves individual sample intervals.
+        var movieScale: Int64 = 1
+        var scales = [duration.timescale, try await video.load(.naturalTimeScale)]
+        if let audio { scales.append(try await audio.load(.naturalTimeScale)) }
+        for scale in scales where scale > 0 {
+            var a=movieScale,b=Int64(scale)
+            while b != 0 { (a,b)=(b,a%b) }
+            let combined=movieScale/a*Int64(scale)
+            guard combined<=Int32.max else { throw EngineError.unsupported("원본 시간 정밀도를 유지하는 출력 시간 단위를 지원하지 않아요.") }
+            movieScale=combined
+        }
+        writer.movieTimeScale=CMTimeScale(movieScale)
+        let emptyEdits=try await emptyVideoEdits(video)
         let pixels=[kCVPixelBufferPixelFormatTypeKey as String:fullRange ? kCVPixelFormatType_420YpCbCr8BiPlanarFullRange:kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange]
         // One decoded sample in, one encoded sample out. A video composition
         // would resample VFR onto a fixed cadence when cropping.
@@ -248,11 +379,23 @@ enum MediaEngine {
             AVVideoCompressionPropertiesKey:[AVVideoAverageBitRateKey:bitrate,AVVideoAllowFrameReorderingKey:true,
                 AVVideoMaxKeyFrameIntervalDurationKey:2,
                 AVVideoProfileLevelKey:codec == .hevc ? kVTProfileLevel_HEVC_Main_AutoLevel as String:AVVideoProfileLevelH264HighAutoLevel]]
+        if constrainedRate {
+            var compression=settings[AVVideoCompressionPropertiesKey] as! [String:Any]
+            // AverageBitRate is a soft target. A bounded one-second reservoir
+            // also avoids the inefficient low-rate ABR path on tested hardware.
+            // This limits bursts, not the final muxed file; check actual bytes.
+            compression[kVTCompressionPropertyKey_DataRateLimits as String]=[ceil(Double(bitrate)*1.4/8),1.0]
+            settings[AVVideoCompressionPropertiesKey]=compression
+            if !writer.canApply(outputSettings:settings,forMediaType:.video) {
+                compression.removeValue(forKey:kVTCompressionPropertyKey_DataRateLimits as String)
+                settings[AVVideoCompressionPropertiesKey]=compression
+            }
+        }
         if !colorProperties.isEmpty { settings[AVVideoColorPropertiesKey]=colorProperties }
         guard writer.canApply(outputSettings:settings,forMediaType:.video) else { throw EngineError.unsupported("선택한 출력 설정을 지원하지 않아요.") }
         let videoInput=AVAssetWriterInput(mediaType:.video,outputSettings:settings)
         videoInput.expectsMediaDataInRealTime=false
-        videoInput.mediaTimeScale=try await video.load(.naturalTimeScale)
+        videoInput.mediaTimeScale=CMTimeScale(movieScale)
         videoInput.transform=crop == nil ? normalizedTransform(transform,width:width,height:height):.identity
         guard writer.canAdd(videoInput) else { throw EngineError.unsupported("하드웨어 비디오 인코딩을 지원하지 않아요.") };writer.add(videoInput)
         var pairs:[(AVAssetReaderOutput,AVAssetWriterInput)]=[(videoOutput,videoInput)]
@@ -283,6 +426,7 @@ enum MediaEngine {
                                 }
                                 let hasSample:Bool=try autoreleasepool {
                                     guard let sample=out.copyNextSampleBuffer() else { return false }
+                                    if input.mediaType == .video,isEmptyVideoEdit(sample,ranges:emptyEdits) { return true }
                                     let written = input.mediaType == .video ? try cropper?.render(sample) ?? sample : sample
                                     guard input.append(written) else { throw writer.error ?? EngineError.io("비디오 샘플 쓰기 실패") }
                                     let time=CMSampleBufferGetOutputPresentationTimeStamp(sample).seconds
@@ -302,6 +446,15 @@ enum MediaEngine {
                 guard writer.status == .completed else { throw writer.error ?? EngineError.io("비디오 마감 실패") }
             } catch { reader.cancelReading();writer.cancelWriting();throw error }
         } catch { reader.cancelReading();writer.cancelWriting();throw error }
+    }
+
+    static func emptyVideoEdits(_ track:AVAssetTrack) async throws -> [CMTimeRange] {
+        try await track.load(.segments).filter(\.isEmpty).map { $0.timeMapping.target }
+    }
+
+    static func isEmptyVideoEdit(_ sample:CMSampleBuffer,ranges:[CMTimeRange]) -> Bool {
+        let time=CMSampleBufferGetOutputPresentationTimeStamp(sample)
+        return ranges.contains { CMTimeRangeContainsTime($0,time:time) }
     }
 
     static func frameRenderer(crop:CGRect?,width:Int,height:Int,natural:CGSize,transform:CGAffineTransform,fullRange:Bool) throws -> VideoCropRenderer? {

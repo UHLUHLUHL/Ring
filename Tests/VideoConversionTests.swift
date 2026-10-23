@@ -63,7 +63,7 @@ import CryptoKit
         } catch let error as EngineError {
             // Original PCM consumes 460800 bytes. An old byte-only test could
             // silently sacrifice video quality in the tiny remaining budget.
-            if case .quality(let reason)=error,reason.contains("화질 기준을 함께 지킬 수 없어요") {
+            if case .quality(let reason)=error,reason.contains("목표 용량과 화질 기준을 함께 만족하는 결과를 찾지 못했어요") {
                 print("PASS unchanged-audio target rejected at quality floor",crop.isFull ? "original":"crop")
             } else { throw error }
         }

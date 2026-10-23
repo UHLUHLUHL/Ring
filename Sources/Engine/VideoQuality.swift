@@ -31,21 +31,26 @@ struct VideoQualityReport {
         psnr >= Self.averageErrorFloor && worstPSNR >= Self.frameErrorFloor &&
         chromaPSNR >= Self.averageErrorFloor && worstChromaPSNR >= Self.frameErrorFloor && worstTailSSIM >= 0.920
     }
-    /// Automatic compression stops at this more conservative quality goal;
+    /// Automatic compression uses this more conservative quality goal;
     /// `acceptable` remains the safety floor for an explicit byte limit.
     var preferredForAutomatic: Bool {
         acceptable && psnr>=48 && chromaPSNR>=48 && worstPSNR>=44 && worstChromaPSNR>=44
     }
     /// Mean squared error over the actual 4:2:0 pixel counts. Lower means a
-    /// closer decoded result; file size never wins over measured fidelity.
+    /// closer decoded result. Used to rank candidates under an explicit cap.
     var distortion: Double { (2*sumMSE+sumChromaMSE)/Double(3*max(1,frames)) }
-    /// Use the measured error deficit to move out of a clearly bad region
-    /// quickly, then bracket passing/failing rates. This is a search hint;
-    /// every new candidate is measured again, never accepted by prediction.
-    func rateIncreaseFactor(preferred:Bool) -> Double {
+    /// A search coordinate, not an acceptance test. Log error ratios let the
+    /// most restrictive structural or pixel-error guard drive the next probe.
+    /// No monotonic rate/quality relationship is assumed by the final gate.
+    func rateMargin(preferred:Bool) -> Double {
+        guard frames>0 else { return -99 }
+        func structure(_ value:Double,_ floor:Double) -> Double {
+            10*log10((1-floor)/max(1e-12,1-value))
+        }
         let average=preferred ? 48:Self.averageErrorFloor,minimum=preferred ? 44:Self.frameErrorFloor
-        let deficit=max(average-psnr,average-chromaPSNR,minimum-worstPSNR,minimum-worstChromaPSNR)
-        return min(4,max(preferred && acceptable ? 1.4:1.8,pow(10,max(0,deficit)/20)))
+        return min(psnr-average,chromaPSNR-average,worstPSNR-minimum,worstChromaPSNR-minimum,
+            structure(meanSSIM,0.985),structure(fifthPercentileSSIM,0.980),
+            structure(worstSSIM,0.970),structure(worstTailSSIM,0.920))
     }
     var summary: String {
         String(format: "SSIM %.5f · 하위 5%% %.3f · 최저 %.5f · PSNR %.2f/%.2f dB · %d프레임", meanSSIM, fifthPercentileSSIM, worstSSIM, psnr, chromaPSNR, frames)
@@ -63,7 +68,9 @@ struct VideoQualityReport {
 enum VideoQuality {
     private final class Frames {
         let reader: AVAssetReader, output: AVAssetReaderTrackOutput
-        init(asset: AVAsset, track: AVAssetTrack, fullRange: Bool) throws {
+        let emptyEdits: [CMTimeRange]
+        init(asset: AVAsset, track: AVAssetTrack, fullRange: Bool) async throws {
+            emptyEdits = try await MediaEngine.emptyVideoEdits(track)
             reader = try AVAssetReader(asset: asset)
             output = AVAssetReaderTrackOutput(track: track, outputSettings: [kCVPixelBufferPixelFormatTypeKey as String:
                 fullRange ? kCVPixelFormatType_420YpCbCr8BiPlanarFullRange : kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange])
@@ -77,6 +84,10 @@ enum VideoQuality {
             while let sample = output.copyNextSampleBuffer() {
                 try Task.checkCancellation()
                 guard CMSampleBufferGetNumSamples(sample) > 0 else { continue }
+                // The decoder emits a black placeholder for an empty movie edit.
+                // It is not a compressed picture; compare every actual picture
+                // and let the independent compressed-timeline check verify gaps.
+                if MediaEngine.isEmptyVideoEdit(sample, ranges: emptyEdits) { continue }
                 let attachments = CMSampleBufferGetSampleAttachmentsArray(sample, createIfNecessary: false) as? [[String: Any]]
                 if (attachments?.first?[kCMSampleAttachmentKey_DoNotDisplay as String] as? NSNumber)?.boolValue == true { continue }
                 guard CMSampleBufferGetImageBuffer(sample) != nil else { throw EngineError.quality("검증 중 영상 프레임을 읽지 못했어요.") }
@@ -89,9 +100,9 @@ enum VideoQuality {
 
     static func compare(source: AVAsset, video: AVAssetTrack, output: AVAsset, track: AVAssetTrack,
                         width: Int, height: Int, natural: CGSize, transform: CGAffineTransform,
-                        crop: CGRect?, fullRange: Bool, duration: Double) throws -> VideoQualityReport {
-        let reference = try Frames(asset: source, track: video, fullRange: fullRange)
-        let encoded = try Frames(asset: output, track: track, fullRange: fullRange)
+                        crop: CGRect?, fullRange: Bool, duration: Double) async throws -> VideoQualityReport {
+        let reference = try await Frames(asset: source, track: video, fullRange: fullRange)
+        let encoded = try await Frames(asset: output, track: track, fullRange: fullRange)
         // Match the exact crop/resampling used before encoding, so a user's
         // intentional geometry change is not counted as codec damage.
         let renderer = try MediaEngine.frameRenderer(crop: crop, width: width, height: height,
