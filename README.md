@@ -23,5 +23,3 @@
 첫 실행이 차단되면 [**시스템 설정 → 개인정보 보호 및 보안 → 그래도 열기**](https://support.apple.com/ko-kr/102445)를 선택하세요. 현재 Apple 공증 전 버전입니다.
 
 이미지 압축·변환·크기 조절 / PDF 병합·분할 / 문서 렌더링 / 영상 트림·압축·움짤 / GIF·WebP 움짤 자르기·크기 조절·한 장 저장.
-
-[Lottie 원본](docs/demo/ring-demo.json) · [로컬 미리보기 HTML](docs/demo/index.html) · [데모 제작 정보](docs/demo/README.md)
