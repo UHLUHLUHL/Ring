@@ -2,6 +2,8 @@
 #define RING_CODEC_BRIDGE_H
 #include <stddef.h>
 #include <stdint.h>
+#include "ModernImageBridge.h"
+#include "SoftwareVideo.h"
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -28,7 +30,7 @@ void *ring_webp_image_decoder_create(const uint8_t *bytes,size_t size,int thread
 int ring_webp_image_decoder_next(void *decoder,const uint8_t **pixels);
 void ring_webp_image_decoder_reset(void *decoder);
 void ring_webp_image_decoder_destroy(void *decoder);
-int ring_webp_mux_append(void *mux,const uint8_t *bytes,size_t size,int duration_ms);
+int ring_webp_mux_append(void *mux,const uint8_t *bytes,size_t size,int duration_ms,const int *durations,int frame_count);
 int ring_webp_mux_finish(void *mux,uint8_t **output,size_t *size);
 void ring_webp_mux_destroy(void *mux);
 int ring_inflate_raw(const uint8_t *source,size_t size,uint8_t *output,size_t output_size);

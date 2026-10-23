@@ -9,6 +9,6 @@ source "$ROOT/Tools/engine-build-env.sh"
 compile_engine_bridge "$ARCH" ".work/CodecBridge-animation-$ARCH.o"
 xcrun swiftc -swift-version 5 -O -parse-as-library -target "$ARCH-apple-macos26.0" \
   -import-objc-header Sources/Engine/CodecBridge.h -module-cache-path .work/module-cache \
-  -Xlinker -dead_strip Sources/Engine/*.swift Tests/AnimationTests.swift \
+  -Xlinker -dead_strip Sources/Engine/*.swift Tests/MediaFixture.swift Tests/AnimationTests.swift \
   ".work/CodecBridge-animation-$ARCH.o" "${ENGINE_LIBS[@]}" -o ".work/animation-tests-$ARCH"
 /usr/bin/arch -"$ARCH" ".work/animation-tests-$ARCH" "$@"

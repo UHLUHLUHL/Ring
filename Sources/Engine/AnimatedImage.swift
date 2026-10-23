@@ -12,8 +12,10 @@ struct AnimatedImageInfo {
     /// Total plays, matching WebP; zero means forever. GIF stores repeats after the first play.
     let loopCount: Int
     let orientation: Int
+    var exactTicks: [Int]? = nil
+    var timeScale: Int = 1000
 
-    var duration: Double { Double(durationsMS.reduce(0, +)) / 1000 }
+    var duration: Double { Double((exactTicks ?? durationsMS).reduce(0, +)) / Double(timeScale) }
     var size: CGSize { orientation >= 5 ? CGSize(width: height, height: width) : CGSize(width: width, height: height) }
     var summary: String { String(format: "%@ 움짤 · %.2f초 · %d프레임", format, duration, frameCount) }
     var editingIssue: String? {
@@ -22,11 +24,17 @@ struct AnimatedImageInfo {
         if durationsMS.count != frameCount || durationsMS.contains(where: { $0 <= 0 || $0 > 0xffffff }) {
             return "재생 시간이 없거나 너무 긴 프레임이 있어요. 현재는 이 움짤의 재생 시간을 보존할 수 없어요."
         }
-        if !(0...65535).contains(loopCount) { return "이 움짤의 반복 횟수는 WebP로 보존할 수 없어요." }
+        if !(0...Int(UInt32.max)).contains(loopCount) { return "이 움짤의 반복 횟수를 보존할 수 없어요." }
         return nil
     }
 
     static func inspect(_ url: URL) -> AnimatedImageInfo? {
+        if let data = try? Data(contentsOf: url, options: .mappedIfSafe), ModernImageReader.sniff(data) != nil {
+            guard let reader = try? ModernImageReader(data: data), reader.isAnimated else { return nil }
+            return AnimatedImageInfo(format: reader.format.uppercased(), width: reader.width, height: reader.height,
+                frameCount: reader.frameCount, durationsMS: reader.durationTicks.map { max(1, Int((Double($0)*1000/Double(reader.timeScale)).rounded())) },
+                loopCount: reader.loops, orientation: reader.orientation, exactTicks: reader.durationTicks, timeScale: reader.timeScale)
+        }
         guard let source = CGImageSourceCreateWithURL(url as CFURL, [kCGImageSourceShouldCache: false] as CFDictionary) else { return nil }
         return inspect(source)
     }
@@ -55,13 +63,14 @@ struct AnimatedImageInfo {
                                  durationsMS: durations, loopCount: plays, orientation: first[kCGImagePropertyOrientation] as? Int ?? 1)
     }
 
-    func time(at frame: Int) -> Double { Double(durationsMS.prefix(max(0, frame)).reduce(0, +)) / 1000 }
+    func time(at frame: Int) -> Double { Double((exactTicks ?? durationsMS).prefix(max(0, frame)).reduce(0, +)) / Double(timeScale) }
 }
 
 /// One composited frame at a time: ImageIO for GIF, libwebp's animation decoder
 /// for WebP, whose partial frames must be blended onto the preceding canvas.
 final class AnimatedImageDecoder {
-    private var source: CGImageSource
+    private var source: CGImageSource?
+    private var modern: ModernImageReader?
     private let url: URL
     private var lastIndex = -1
     private var previewMode: Bool?
@@ -69,6 +78,13 @@ final class AnimatedImageDecoder {
     private var webpSpace: CGColorSpace?
     let info: AnimatedImageInfo
     init(_ url: URL) throws {
+        if let data = try? Data(contentsOf: url, options: .mappedIfSafe), ModernImageReader.sniff(data) != nil {
+            let reader = try ModernImageReader(data: data)
+            guard reader.isAnimated, let info = AnimatedImageInfo.inspect(url) else { throw EngineError.invalid("정지 이미지예요. 이미지 편집 경로를 이용해 주세요.") }
+            if let issue = info.editingIssue { throw EngineError.unsupported(issue) }
+            self.url = url; self.info = info; self.modern = reader; self.source = nil
+            return
+        }
         guard let source = CGImageSourceCreateWithURL(url as CFURL, [kCGImageSourceShouldCache: false] as CFDictionary),
               let info = AnimatedImageInfo.inspect(source) else { throw EngineError.invalid("움직이는 GIF 또는 WebP를 선택해 주세요.") }
         if let issue = info.editingIssue { throw EngineError.unsupported(issue) }
@@ -93,6 +109,10 @@ final class AnimatedImageDecoder {
     func frame(_ index: Int, preview: Bool = false) throws -> CGImage {
         try Task.checkCancellation()
         guard (0..<info.frameCount).contains(index) else { throw EngineError.invalid("프레임 번호를 확인해 주세요.") }
+        if let modern {
+            let image = try PDFEngine.oriented(modern.frame(index), info.orientation)
+            return preview ? try ImageResampler.fit(image, maxDimension: 840) : image
+        }
         if let native = webpDecoder { return try webpFrame(index, preview: preview, native: native) }
         // Start GIF composition from a fresh canvas when seeking backwards.
         if index <= lastIndex || (previewMode != nil && previewMode != preview) {
@@ -105,11 +125,11 @@ final class AnimatedImageDecoder {
         previewMode = preview
         func decode(_ frame: Int) -> CGImage? {
             if preview {
-                return CGImageSourceCreateThumbnailAtIndex(source, frame, [kCGImageSourceCreateThumbnailFromImageAlways: true,
+                return CGImageSourceCreateThumbnailAtIndex(source!, frame, [kCGImageSourceCreateThumbnailFromImageAlways: true,
                     kCGImageSourceThumbnailMaxPixelSize: 840, kCGImageSourceCreateThumbnailWithTransform: true,
                     kCGImageSourceShouldCacheImmediately: true] as CFDictionary)
             }
-            return CGImageSourceCreateImageAtIndex(source, frame, [kCGImageSourceShouldCacheImmediately: true] as CFDictionary)
+            return CGImageSourceCreateImageAtIndex(source!, frame, [kCGImageSourceShouldCacheImmediately: true] as CFDictionary)
         }
         // Disposal can depend on earlier frames. Decode intervening frames
         // without retaining their rasters when seeking forwards.
@@ -166,7 +186,13 @@ final class AnimatedImageDecoder {
 
 enum AnimatedImageEdit {
     case webp, crop(CGRect), resize(width: Int, height: Int), speed(Double), frame(Int, format: ImageFormat = .png)
-    var fileExtension: String { if case .frame(_, let format) = self { return format.rawValue }; return "webp" }
+    /// Backend-only output selection, with an optional frame range and the same crop/resize transforms.
+    indirect case output(format: AnimationFormat, edit: AnimatedImageEdit, frames: Range<Int>? = nil)
+    var fileExtension: String {
+        if case .frame(_, let format) = self { return format.rawValue }
+        if case .output(let format, _, _) = self { return format.rawValue }
+        return "webp"
+    }
 }
 
 enum AnimatedImageEngine {
@@ -229,14 +255,19 @@ enum AnimatedImageEngine {
                 throw EngineError.io("크기 조절한 프레임의 픽셀 버퍼를 만들 수 없어요.")
             }
             return result
+        case .output(_, let edit, _): return try transform(image, edit: edit)
         case .webp, .speed, .frame: return image
         }
     }
 
     static func run(_ source: URL, to output: URL, edit: AnimatedImageEdit) throws -> String {
+        if case .output(let format, let transform, let range) = edit {
+            guard format.isModern else { throw EngineError.unsupported("이 출력 선택 경로는 AVIF/JPEG XL용이에요. 기존 WebP 편집은 해당 작업을 사용해 주세요.") }
+            return try modern(source, to: output, format: format, edit: transform, frames: range)
+        }
         let decoder = try AnimatedImageDecoder(source), info = decoder.info
         if case .frame(let index, let format) = edit {
-            guard [.png, .jpg, .webp].contains(format) else { throw EngineError.invalid("지원하지 않는 한 장 저장 형식이에요.") }
+            guard [.png, .jpg, .webp, .avif, .jxl].contains(format) else { throw EngineError.invalid("지원하지 않는 한 장 저장 형식이에요.") }
             let image = try decoder.frame(index)
             let props: [CFString: Any] = [kCGImagePropertyOrientation: 1]
             if format == .png {
@@ -249,11 +280,15 @@ enum AnimatedImageEngine {
                 // TIFF keeps this decoded 8-bit raster and alpha without PNG's
                 // deliberate 16-bit alpha promotion in the shared writer.
                 try ImageCodec.write(raster, properties: props, format: .tiff, to: intermediate)
-                if format == .webp { _ = try ExternalCodecs.convert(intermediate, to: output, format: .webp) }
+                if format == .webp || format.isModern { _ = try ImageCodec.convert(intermediate, to: output, format: format) }
                 else { _ = try TargetSizeCodec.encode(intermediate, to: output, format: .jpg, intent: .quality(1)) }
             }
             return "\(index + 1)번째 프레임 · \(format.rawValue.uppercased()) · \(format == .jpg ? "최고 품질·투명 영역은 흰색" : "무손실·저장 픽셀 일치")"
         }
+        if let ticks = info.exactTicks, ticks.contains(where: { ($0*1000) % info.timeScale != 0 }) {
+            throw EngineError.unsupported("WebP의 밀리초 단위로 원본 프레임 시각을 정확히 보존할 수 없어요. AVIF 또는 JPEG XL로 저장해 주세요.")
+        }
+        guard info.loopCount <= 65535 else { throw EngineError.unsupported("원본 반복 횟수가 WebP 한도를 넘어요. AVIF 또는 JPEG XL로 저장해 주세요.") }
         if case .webp = edit, info.format == "WEBP" {
             try FileIntegrity.copy(source, to: output)
             return "움직이는 WebP · 원본 바이트 그대로"
@@ -306,6 +341,65 @@ enum AnimatedImageEngine {
         try Task.checkCancellation()
         try Data(bytes: buffer, count: count).write(to: output)
         return try verify(source, output: output, edit: edit, info: info, durations: durations)
+    }
+
+    private static func modern(_ source: URL, to output: URL, format: AnimationFormat,
+                               edit: AnimatedImageEdit, frames: Range<Int>?) throws -> String {
+        let decoder = try AnimatedImageDecoder(source), info = decoder.info
+        let range = frames ?? 0..<info.frameCount
+        guard !range.isEmpty, range.lowerBound >= 0, range.upperBound <= info.frameCount else { throw EngineError.invalid("저장할 프레임 구간을 확인해 주세요.") }
+        if case .frame = edit { throw EngineError.invalid("한 장 저장에는 frame 작업을 사용해 주세요.") }
+        if case .output = edit { throw EngineError.invalid("중첩된 출력 형식은 지원하지 않아요.") }
+        var ticks = Array((info.exactTicks ?? info.durationsMS)[range])
+        if case .speed(let rate) = edit {
+            guard rate.isFinite, (0.25...4).contains(rate) else { throw EngineError.invalid("재생 속도 범위 오류") }
+            var sum = 0, end = 0
+            ticks = try ticks.map { value in
+                sum += value; let next = Int((Double(sum)/rate).rounded()); defer { end = next }
+                guard next > end else { throw EngineError.unsupported("원본 시간 단위로 이 재생 속도를 보존할 수 없어요.") }
+                return next-end
+            }
+        }
+        let first = try transform(decoder.frame(range.lowerBound), edit: edit)
+        let icc = first.colorSpace?.copyICCData() as Data? ?? Data()
+        var exif = Data()
+        if ["AVIF", "JXL"].contains(info.format) {
+            let original = try ModernImageReader(source)
+            if !original.exif.isEmpty {
+                let carrier = NSMutableData()
+                guard let destination = CGImageDestinationCreateWithData(carrier, ImageFormat.tiff.uti as CFString, 1, nil) else { throw EngineError.io("메타데이터 직렬화 실패") }
+                let tiny = try PDFEngine.bitmap(width: 1, height: 1, space: first.colorSpace!)
+                var properties = original.properties; properties[kCGImagePropertyOrientation] = 1
+                CGImageDestinationAddImage(destination, tiny.makeImage()!, properties as CFDictionary)
+                guard CGImageDestinationFinalize(destination) else { throw EngineError.io("메타데이터 직렬화 실패") }
+                exif = try TIFFMetadataEnvelope.sanitize(carrier as Data, width: first.width, height: first.height)
+            }
+        }
+        let writer = try ModernImageWriter(format: format == .avif ? .avif : .jxl, width: first.width, height: first.height,
+            frameCount: range.count, timeScale: info.timeScale, loops: info.loopCount, icc: icc, exif: exif, quality: 100, isAnimated: true)
+        for (offset, index) in range.enumerated() {
+            try Task.checkCancellation()
+            try autoreleasepool {
+                let frame = try transform(decoder.frame(index), edit: edit)
+                guard frame.colorSpace?.copyICCData() == first.colorSpace?.copyICCData() else { throw EngineError.unsupported("프레임별 색상 프로필이 달라요.") }
+                try writer.add(frame, durationTicks: ticks[offset])
+            }
+            EngineProgress.report(0.05+0.55*Double(offset+1)/Double(range.count))
+        }
+        let bytes = try writer.finish(), result = try ModernImageReader(data: bytes)
+        guard result.isAnimated, result.frameCount == range.count, result.timeScale == info.timeScale,
+              result.durationTicks == ticks, result.loops == info.loopCount else { throw EngineError.quality("움짤 프레임·시각·반복 횟수가 달라요.") }
+        for (offset, index) in range.enumerated() {
+            try Task.checkCancellation()
+            try autoreleasepool {
+                let reference = try transform(decoder.frame(index), edit: edit), actual = try result.frame(offset)
+                guard actual.colorSpace?.copyICCData() == reference.colorSpace?.copyICCData(),
+                      try PixelCheck.compare(reference, actual).exact else { throw EngineError.quality("움짤 픽셀·투명도·색상 보존 검증 실패") }
+            }
+            EngineProgress.report(0.60+0.30*Double(offset+1)/Double(range.count))
+        }
+        try Task.checkCancellation(); try bytes.write(to: output)
+        return "\(format.rawValue.uppercased()) 무손실 움짤 · \(range.count)프레임 · 픽셀·시각·반복 검증"
     }
 
     private static func verify(_ source: URL, output: URL, edit: AnimatedImageEdit, info: AnimatedImageInfo, durations: [Int]) throws -> String {

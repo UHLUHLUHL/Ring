@@ -217,13 +217,20 @@ void *ring_webp_mux_create(int width,int height) {
     }
     return mux;
 }
-int ring_webp_mux_append(void *opaque,const uint8_t *bytes,size_t size,int duration_ms) {
-    if(!opaque || !bytes || !size || duration_ms<=0) return 0;
+int ring_webp_mux_append(void *opaque,const uint8_t *bytes,size_t size,int duration_ms,const int *durations,int frame_count) {
+    if(!opaque || !bytes || !size || duration_ms<=0 || !durations || frame_count<1) return 0;
     WebPMux *mux=opaque;
     WebPData data={bytes,size};
     WebPMux *part=WebPMuxCreate(&data,0);
     if(!part) return 0;
-    int w,h,pw,ph,n=0,total=0;
+    int w,h,pw,ph,n=0,total=0,position=0;
+    int expected=0;
+    for(int i=0;i<frame_count;i++) {
+        if(durations[i]<=0 || durations[i]>duration_ms-expected) { WebPMuxDelete(part);return 0; }
+        expected+=durations[i];
+    }
+    if(expected!=duration_ms) { WebPMuxDelete(part);return 0; }
+    uint8_t *noop=NULL;size_t noop_size=0;
     int ok=WebPMuxGetCanvasSize(mux,&w,&h)==WEBP_MUX_OK &&
            WebPMuxGetCanvasSize(part,&pw,&ph)==WEBP_MUX_OK && w==pw && h==ph &&
            WebPMuxNumChunks(part,WEBP_CHUNK_ANMF,&n)==WEBP_MUX_OK;
@@ -240,12 +247,35 @@ int ring_webp_mux_append(void *opaque,const uint8_t *bytes,size_t size,int durat
             frame.blend_method=WEBP_MUX_NO_BLEND;
         }
         if(ok) {
-            if(frame.duration<0 || frame.duration>duration_ms-total) ok=0;
-            else { total+=frame.duration;ok=WebPMuxPushFrame(mux,&frame,1)==WEBP_MUX_OK; }
+            int remaining=frame.duration,first=1;
+            if(remaining<=0 || remaining>duration_ms-total) ok=0;
+            // The animation encoder merges unchanged/near-identical frames.
+            // Retain the requested cadence using transparent 1px hold frames;
+            // this neither re-encodes pixels nor repeats large full canvases.
+            while(ok && remaining>0) {
+                if(position>=frame_count || durations[position]>remaining) { ok=0;break; }
+                int delay=durations[position++];remaining-=delay;total+=delay;
+                WebPMuxFrameInfo timed=frame;
+                if(!first && !(remaining==0 && frame.dispose_method==WEBP_MUX_DISPOSE_BACKGROUND)) {
+                    if(!noop) {
+                        const uint8_t transparent[4]={0,0,0,0};
+                        noop_size=WebPEncodeLosslessRGBA(transparent,1,1,4,&noop);
+                    }
+                    if(!noop_size) { ok=0;break; }
+                    timed.bitstream.bytes=noop;timed.bitstream.size=noop_size;
+                    timed.x_offset=timed.y_offset=0;
+                    timed.blend_method=WEBP_MUX_BLEND;
+                    timed.dispose_method=WEBP_MUX_DISPOSE_NONE;
+                }
+                timed.duration=delay;
+                if(remaining>0) timed.dispose_method=WEBP_MUX_DISPOSE_NONE;
+                ok=WebPMuxPushFrame(mux,&timed,1)==WEBP_MUX_OK;
+                first=0;
+            }
         }
         WebPDataClear(&frame.bitstream);
     }
-    WebPMuxDelete(part);return ok && total==duration_ms;
+    WebPFree(noop);WebPMuxDelete(part);return ok && total==duration_ms && position==frame_count;
 }
 struct RingWebPDecoder { WebPData data;WebPAnimDecoder *decoder; };
 void ring_webp_image_decoder_destroy(void *opaque) {

@@ -20,6 +20,13 @@ struct JPEGSampling {
 enum MetadataEnvelope {
     static func exif(_ url:URL,input:ImageInput,dimensions:CGSize? = nil) throws -> Data {
         let data=try Data(contentsOf:url,options:.mappedIfSafe)
+        if ModernImageReader.sniff(data) != nil {
+            let reader = try ModernImageReader(data: data)
+            if !reader.exif.isEmpty {
+                if let dimensions { return try TIFFMetadataEnvelope.sanitize(reader.exif, width: Int(dimensions.width), height: Int(dimensions.height)) }
+                return reader.exif
+            }
+        }
         if dimensions == nil,input.type == ImageFormat.jpg.uti {
             var index=2
             while index+4 <= data.count {
@@ -60,6 +67,14 @@ enum ExternalCodecs {
             let prepared=try autoreleasepool { try prepare(source,format:format) }
             EngineProgress.report(0.35)
             let rgba=prepared.rgba,icc=prepared.icc,exif=prepared.exif,image=prepared.image
+            if format.isModern {
+                let writer = try ModernImageWriter(format: format, width: image.width, height: image.height,
+                    frameCount: 1, timeScale: 1, loops: 1, icc: icc, exif: exif,
+                    orientation: prepared.properties[kCGImagePropertyOrientation] as? Int ?? 1)
+                try writer.addRGBA(rgba, durationTicks: 1)
+                try writer.finish().write(to: output)
+                return (image, prepared.properties)
+            }
             var error=[CChar](repeating:0,count:512)
             let ok=rgba.withUnsafeBytes { pixels in icc.withUnsafeBytes { profile in exif.withUnsafeBytes { metadata in
                 output.path.withCString { path in
@@ -143,16 +158,18 @@ enum ExternalCodecs {
     }
     static func compress(_ source:URL,to output:URL) throws -> String {
         let header=CGImageSourceCreateWithURL(source as CFURL,nil)
-        let type=header.flatMap{CGImageSourceGetType($0)} as String?
-        if ![ImageFormat.jpg.uti,ImageFormat.png.uti,ImageFormat.tiff.uti,ImageFormat.webp.uti,ImageFormat.avif.uti].contains(type ?? "") {
+        let content = try Data(contentsOf: source, options: .mappedIfSafe)
+        let modern = ModernImageReader.sniff(content)
+        let type = modern == "avif" ? ImageFormat.avif.uti : modern == "jxl" ? ImageFormat.jxl.uti : header.flatMap{CGImageSourceGetType($0)} as String?
+        if ![ImageFormat.jpg.uti,ImageFormat.png.uti,ImageFormat.tiff.uti,ImageFormat.webp.uti,ImageFormat.avif.uti,ImageFormat.jxl.uti].contains(type ?? "") {
             try FileIntegrity.copy(source,to:output)
             return "무손실 압축 · 절감 없음 · 원본 바이트 그대로"
         }
         let input=try ImageInput(source)
         if input.type == ImageFormat.jpg.uti { return try jpeg(source,to:output,crop:nil) }
         let format=ImageFormat.allCases.first{$0.uti==input.type}
-        if let format,[ImageFormat.png,.tiff,.webp,.avif].contains(format) {
-            if format == .webp || format == .avif { _ = try convert(source,to:output,format:format) }
+        if let format,[ImageFormat.png,.tiff,.webp,.avif,.jxl].contains(format) {
+            if format == .webp || format.isModern { _ = try convert(source,to:output,format:format) }
             else { try ImageCodec.write(input.image,properties:input.properties,format:format,to:output);try ImageCodec.verify(input.image,properties:input.properties,output:output,exact:true) }
             let before=try source.resourceValues(forKeys:[.fileSizeKey]).fileSize ?? 0
             let after=try output.resourceValues(forKeys:[.fileSizeKey]).fileSize ?? 0

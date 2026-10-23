@@ -30,9 +30,9 @@ for ARCH in arm64 x86_64; do
     -DWEBP_BUILD_LIBWEBPMUX=ON -DWEBP_BUILD_LIBWEBPDEMUX=ON -DWEBP_BUILD_EXTRAS=OFF -DWEBP_ENABLE_SIMD=ON
   configure_build aom "$ROOT/Vendor/build/source/aom" \
     -DAOM_TARGET_CPU=$ARCH -DENABLE_TESTS=OFF -DENABLE_DOCS=OFF -DENABLE_TOOLS=OFF -DENABLE_EXAMPLES=OFF \
-    -DCONFIG_AV1_DECODER=0 -DCONFIG_AV1_ENCODER=1 -DCONFIG_AV1_HIGHBITDEPTH=1 -DCONFIG_RUNTIME_CPU_DETECT=1
+    -DCONFIG_AV1_DECODER=1 -DCONFIG_AV1_ENCODER=1 -DCONFIG_AV1_HIGHBITDEPTH=1 -DCONFIG_RUNTIME_CPU_DETECT=1
   configure_build avif "$ROOT/Vendor/build/source/avif/libavif-1.4.2" \
-    -DCMAKE_PREFIX_PATH=$PREFIX -DAVIF_CODEC_AOM=SYSTEM -DAVIF_CODEC_AOM_DECODE=OFF -DAVIF_CODEC_AOM_ENCODE=ON \
+    -DCMAKE_PREFIX_PATH=$PREFIX -DAVIF_CODEC_AOM=SYSTEM -DAVIF_CODEC_AOM_DECODE=ON -DAVIF_CODEC_AOM_ENCODE=ON \
     -DAVIF_CODEC_DAV1D=OFF -DAVIF_CODEC_LIBGAV1=OFF -DAVIF_CODEC_RAV1E=OFF -DAVIF_CODEC_SVT=OFF \
     -DAVIF_LIBYUV=OFF -DAVIF_JPEG=OFF -DAVIF_ZLIBPNG=OFF -DAVIF_BUILD_APPS=OFF -DAVIF_BUILD_TESTS=OFF
   configure_build jpeg "$ROOT/Vendor/build/source/jpeg/libjpeg-turbo-3.2.0" \
@@ -42,3 +42,5 @@ mkdir -p Vendor/build/universal
 for LIB in webp webpmux webpdemux sharpyuv aom avif turbojpeg jpeg; do
   lipo -create "Vendor/build/arm64/install/lib/lib$LIB.a" "Vendor/build/x86_64/install/lib/lib$LIB.a" -output "Vendor/build/universal/lib$LIB.a"
 done
+zsh "$ROOT/Tools/build-modern-image-codecs.sh"
+zsh "$ROOT/Tools/build-video-codecs.sh"

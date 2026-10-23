@@ -1,0 +1,15 @@
+{
+  "seconds": 24,
+  "width": 1440,
+  "height": 960,
+  "exportFPS": 24,
+  "lottieFPS": 30,
+  "browserErrors": [],
+  "sourceCommit": "4f3ae6d6937f29bbd41c0b7844ecf3666ddc61ec",
+  "renderedFrames": 576,
+  "encodedFrames": 348,
+  "decodedDurationMS": 24000,
+  "loop": 0,
+  "bytes": 1187366,
+  "sha256": "1f23a0e7bb98ff8d4a6179289d98e2c52436d6519ff3701c9155a75747850100"
+}

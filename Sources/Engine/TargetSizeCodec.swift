@@ -10,7 +10,7 @@ enum TargetSizeCodec {
             return try ImageCodec.convert(source, to: output, format: format)
         }
         let input = try ImageInput(source)
-        guard [.jpg, .webp, .heic, .png].contains(format) else { throw EngineError.unsupported("이 형식은 목표 용량 압축을 지원하지 않아요.") }
+        guard [.jpg, .webp, .heic, .png, .avif, .jxl].contains(format) else { throw EngineError.unsupported("이 형식은 목표 용량 압축을 지원하지 않아요.") }
         let target: Int64?
         let quality: Double
         switch intent {
@@ -29,15 +29,22 @@ enum TargetSizeCodec {
         // the written file is decoded again for verification.
         let bytes: Data = try { () throws -> Data in
             let rgba: Data
-            if [.jpg, .webp].contains(format) {
+            if [.jpg, .webp, .avif, .jxl].contains(format) {
                 guard image.colorSpace?.model == .rgb else { throw EngineError.unsupported("JPEG/WebP 압축은 RGB 입력을 사용해 주세요.") }
                 guard format != .webp || max(image.width, image.height) <= 16383 else { throw EngineError.unsupported("WebP 최대 크기는 16,383px예요.") }
                 rgba = try ExternalCodecs.straightRGBA8(image)
             } else { rgba = Data() }
             let icc = image.colorSpace?.copyICCData() as Data? ?? Data()
-            let exif = [.jpg, .webp].contains(format) ? try MetadataEnvelope.exif(source, input: input) : Data()
+            let exif = [.jpg, .webp, .avif, .jxl].contains(format) ? try MetadataEnvelope.exif(source, input: input) : Data()
             func candidate(_ q: Int, nativeTarget: Int = 0) throws -> Data {
                 try Task.checkCancellation()
+                if format.isModern {
+                    let writer = try ModernImageWriter(format: format, width: image.width, height: image.height,
+                        frameCount: 1, timeScale: 1, loops: 1, icc: icc, exif: exif, quality: q,
+                        orientation: input.orientation)
+                    try writer.addRGBA(rgba, durationTicks: 1)
+                    return try writer.finish()
+                }
                 if format == .jpg || format == .webp {
                     return try memoryEncode(rgba, width: image.width, height: image.height, icc: icc, exif: exif,
                                             webp: format == .webp, quality: q, target: nativeTarget)

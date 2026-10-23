@@ -131,6 +131,39 @@ import CryptoKit
         try require(try AdaptivePalette.sRGB(CGImageSourceCreateImageAtIndex(decoded,1,nil)!) == AdaptivePalette.sRGB(CGImageSourceCreateImageAtIndex(expected,0,nil)!),"GIF delta final scanline changed")
         print("PASS GIF delta odd-width crop retains the final row and column exactly")
     }
+    static func webPHoldTiming() throws {
+        let width=32,height=24
+        var rgba=Data(count:width*height*4)
+        rgba.withUnsafeMutableBytes { bytes in
+            let p=bytes.bindMemory(to:UInt8.self)
+            for i in stride(from:0,to:p.count,by:4) { p[i]=120;p[i+1]=80;p[i+2]=210;p[i+3]=255 }
+        }
+        let still=try TargetSizeCodec.memoryEncode(rgba,width:width,height:height,webp:true,quality:90)
+        let mux=ring_webp_mux_create(Int32(width),Int32(height))!
+        defer { ring_webp_mux_destroy(mux) }
+        let delays:[Int32]=[5,33,4]
+        let ok=delays.withUnsafeBufferPointer { d in still.withUnsafeBytes {
+            ring_webp_mux_append(mux,$0.bindMemory(to:UInt8.self).baseAddress!,still.count,42,d.baseAddress!,3)
+        } }
+        try require(ok==1,"WebP hold mux")
+        var bytes:UnsafeMutablePointer<UInt8>?,count=0
+        try require(ring_webp_mux_finish(mux,&bytes,&count)==1,"WebP hold finish")
+        defer { ring_buffer_free(bytes) }
+        let data=Data(bytes:bytes!,count:count)
+        let source=CGImageSourceCreateWithData(data as CFData,nil)!
+        let reference=CGImageSourceCreateWithData(still as CFData,nil)!
+        let expected=try AdaptivePalette.sRGB(CGImageSourceCreateImageAtIndex(reference,0,nil)!)
+        try require(CGImageSourceGetCount(source)==3,"WebP merged requested hold frames")
+        for i in 0..<3 {
+            let image=CGImageSourceCreateImageAtIndex(source,i,nil)!
+            try require(try AdaptivePalette.sRGB(image)==expected,"WebP hold cleared/changed canvas")
+            let properties=CGImageSourceCopyPropertiesAtIndex(source,i,nil) as! [CFString:Any]
+            let webp=properties[kCGImagePropertyWebPDictionary] as! [CFString:Any]
+            let delay=webp[kCGImagePropertyWebPUnclampedDelayTime] as! Double
+            try require(abs(delay-Double(delays[i])/1000)<0.00001,"WebP hold time changed")
+        }
+        print("PASS WebP merged-frame holds preserve each delay, count and exact decoded canvas")
+    }
     static func timing() throws {
         for format in [AnimationFormat.gif, .webp] {
             for fps in [15.0, 24, 29.97, 30, 59.94, 60] {
@@ -149,15 +182,44 @@ import CryptoKit
         try require(AnimationOptions.frameRateText(60.000001) == "60", "integer label")
         print("PASS cumulative GIF/WebP timing, fractional FPS, short final frames")
     }
+    static func sourceTiming(_ root:URL) async throws {
+        let times=[0.0,0.0048,0.03817,0.0715,0.12,0.18,0.216,0.25,0.34,0.346]
+        let source=root.appendingPathComponent("irregular.mp4")
+        try await MediaFixture.write(source,times:times,duration:0.35)
+        let asset=AVURLAsset(url:source),fps=try await MediaEngine.sourceFrameRate(asset)!
+        for format in [AnimationFormat.gif,.webp] {
+            let plan=try await AnimationPlan.source(asset:asset,start:0,duration:0.35,fps:fps,format:format)
+            try require(plan.frames.count==times.count,"VFR source frames removed")
+            for i in times.indices { try require(abs(plan.frames[i].offset-times[i])<0.00002,"VFR source time changed") }
+            try require(abs(plan.duration-0.35)<0.001,"VFR duration changed")
+            let result=try await RingEngine.shared.run(.init(source:source,operation:.video(.animation(.init(format:format,fps:fps,maxDimension:160,duration:0.35)))))
+            try inspect(result.url,expectedDuration:0.35,frames:times.count,width:160,height:90)
+        }
+        let sequential=try await SequentialAnimationReader.make(asset:asset)!
+        let reference=AVAssetImageGenerator(asset:asset)
+        reference.requestedTimeToleranceBefore = .zero;reference.requestedTimeToleranceAfter = .zero
+        for time in times {
+            let a=try AdaptivePalette.sRGB(sequential.image(at:time))
+            let b=try AdaptivePalette.sRGB(await reference.image(at:CMTime(seconds:time+0.00002,preferredTimescale:600000)).image)
+            let mse=a.withUnsafeBytes { ar in b.withUnsafeBytes { br -> Double in
+                let x=ar.bindMemory(to:UInt8.self),y=br.bindMemory(to:UInt8.self)
+                return (0..<x.count).reduce(0.0) { sum,i in let d=Double(x[i])-Double(y[i]);return sum+d*d }/Double(x.count)
+            } }
+            try require(mse<2.1,"sequential reader color/frame mismatch at \(time): MSE \(mse)")
+        }
+        print("PASS VFR retains every displayed frame and duration; sequential reader matches generator colors/order")
+    }
     static func main() async {
         setbuf(stdout, nil)
         do {
             try timing()
             try paletteSIMD()
             try gifDeltaEdges()
+            try webPHoldTiming()
             if CommandLine.arguments.contains("--palette") { return }
             let root = URL(fileURLWithPath: ".work/animation-tests-" + UUID().uuidString, isDirectory: true)
             try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+            try await sourceTiming(root)
             if CommandLine.arguments.contains("--dimensions") {
                 let source = try await fixture(root,name:"wide",kind:0,width:2048,height:64)
                 for format in [AnimationFormat.webp,.gif] {
@@ -196,7 +258,7 @@ import CryptoKit
                 print("PASS", format.rawValue, "15/24/30/60fps, rotation, fractional FPS/trim, sampled target", limited.detail)
             }
             let frozen = try await RingEngine.shared.run(.init(source: still, operation: .video(.animation(.init(format: .webp, fps: 60, maxDimension: 160, duration: 1)))))
-            try inspect(frozen.url, expectedDuration: 1)
+            try inspect(frozen.url, expectedDuration: 1, frames:60)
             let frozenGIF = try await RingEngine.shared.run(.init(source: still, operation: .video(.animation(.init(format: .gif, fps: 30, maxDimension: 160, duration: 1)))))
             try inspect(frozenGIF.url,expectedDuration:1,frames:30,width:160,height:90)
             let frozenFrames=CGImageSourceCreateWithURL(frozenGIF.url as CFURL,nil)!

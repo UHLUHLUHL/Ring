@@ -68,16 +68,6 @@ struct RingScreen: View {
                 }
                 .allowsHitTesting(!model.isWorking && !model.isNavigating)
                 .opacity(model.isWorking ? 0 : 1)
-                if model.file.kind == .video && model.tab == .convert && !model.isWorking {
-                    VStack(spacing: 4) {
-                        Text(model.videoNotice)
-                            .font(.system(size: 10)).foregroundStyle(.secondary)
-                            .multilineTextAlignment(.center).lineLimit(3)
-                    }
-                    .frame(width: RingMetrics.canvas - 12, height: 36)
-                    .opacity(model.showsVideoHub ? 1 : 0)
-                    .shadow(color: .black.opacity(0.3), radius: 2, y: 0.5)
-                }
             }
             .overlay(alignment: .top) {
                 RingView(model: model, layer: .content)
@@ -120,6 +110,10 @@ struct RingView: View {
                 if model.isWorking {
                     HubProgress(model: model)
                         .frame(width: hub, height: hub)
+                        // The labels layer's painted hit area is hidden during
+                        // work. Keep the hub opaque to window-server hit testing
+                        // so dragging its glass reaches RingPanel, not Finder.
+                        .hitTestableGlass(Circle())
                         .opacity(model.isCompleting ? 0 : 1)
                         .accessibilityHidden(model.isCompleting)
                         .allowsHitTesting(false)

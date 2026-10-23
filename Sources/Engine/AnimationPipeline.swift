@@ -17,7 +17,7 @@ struct AnimationPlan {
     var duration: Double { Double(ticks) / Double(scale) }
 
     init(duration: Double, fps: Double, format: AnimationFormat) {
-        scale = format == .gif ? 100 : 1000
+        scale = format.isModern ? 1_000_000 : format == .gif ? 100 : 1000
         let total = max(format == .gif ? 1 : 2, Int((duration * Double(scale)).rounded()))
         var result: [Frame] = []
         let count = max(1, Int(ceil(duration * fps)))
@@ -31,6 +31,24 @@ struct AnimationPlan {
     }
 
     private init(scale: Int, frames: [Frame]) { self.scale = scale; self.frames = frames }
+
+    init(sourceOffsets: [Double], duration: Double, format: AnimationFormat) throws {
+        scale = format.isModern ? 1_000_000 : format == .gif ? 100 : 1000
+        let total = Int((duration * Double(scale)).rounded())
+        guard !sourceOffsets.isEmpty, total >= sourceOffsets.count else {
+            throw EngineError.unsupported("이 포맷의 시간 단위로 모든 프레임을 유지할 수 없어요. WebP나 동영상으로 저장해 주세요.")
+        }
+        var result: [Frame] = [], tick = 0
+        for i in sourceOffsets.indices {
+            // Quantize cumulative boundaries, reserving one tick for every
+            // remaining frame. Never discard a short first/last VFR frame.
+            let end = i == sourceOffsets.count-1 ? total : max(tick+1,
+                min(total-(sourceOffsets.count-i-1), Int((sourceOffsets[i+1]*Double(scale)).rounded())))
+            result.append(Frame(offset: sourceOffsets[i], start: tick, end: end))
+            tick = end
+        }
+        frames = result
+    }
 
     /// Three short windows retain local motion; a single opening scene is not
     /// representative enough to predict the size of an entire animation.
@@ -60,7 +78,12 @@ final class AnimationResources: @unchecked Sendable {
     private var jobs: Int { lock.lock(); defer { lock.unlock() }; return max(1, active) }
     var workers: Int { max(1,ThermalPolicy.threads/jobs) }
     func frameCapacity(width: Int, height: Int, bytesPerPixel: Int = 4) -> Int {
-        max(1, (128 * 1024 * 1024 / jobs) / max(1, width * height * bytesPerPixel))
+        // 128MiB made a 4K GIF a one-worker job and disabled WebP segments.
+        // Bound by RAM and concurrent jobs, with a hard 256MiB pixel allowance.
+        // Codec working buffers are additional; high-resolution jobs use at
+        // most two encoders instead of multiplying those buffers four times.
+        let budget = min(256 * 1024 * 1024, Int(ProcessInfo.processInfo.physicalMemory / 32))
+        return max(1, (budget / jobs) / max(1, width * height * bytesPerPixel))
     }
 }
 
@@ -77,6 +100,8 @@ private final class AnimationFrameReader {
     private var timing: (offset: Double, latest: Double)?
     private var sampleTrack: AVAssetTrack?
     private var sampleMapping: CMTimeMapping?
+    private var sequential: SequentialAnimationReader?
+    private var triedSequential = false
     init(asset: AVAsset, start: Double, fps: Double, dimension: Int, maximumSize: CGSize, crop: VideoCrop) {
         self.start = start; self.dimension = dimension; self.crop = crop; self.asset = asset; self.fps = fps
         generator = AVAssetImageGenerator(asset: asset)
@@ -157,6 +182,19 @@ private final class AnimationFrameReader {
 
     func read(_ frames: ArraySlice<AnimationPlan.Frame>) async throws -> [CGImage] {
         try Task.checkCancellation()
+        if !triedSequential {
+            triedSequential = true
+            if dimension > 1280 { sequential = try await SequentialAnimationReader.make(asset: asset) }
+        }
+        if let sequential {
+            return try frames.map { frame in
+                try autoreleasepool {
+                    let image = try sequential.image(at: start + frame.offset)
+                    let extracted = try ImageResampler.fit(image, maxDimension: Int(max(generator.maximumSize.width, generator.maximumSize.height).rounded()))
+                    return try fitted(extracted)
+                }
+            }
+        }
         let timing = try await prepareTiming()
         // Near the end the shifted time may pass the last frame; keep t there.
         let times = try frames.map { frame -> CMTime in
@@ -236,9 +274,12 @@ private final class WebPAnimationMux {
         pointer = value
     }
     deinit { ring_webp_mux_destroy(pointer) }
-    func append(_ data: Data, duration: Int) throws {
+    func append(_ data: Data, frames: ArraySlice<AnimationPlan.Frame>) throws {
         try Task.checkCancellation()
-        let ok = data.withUnsafeBytes { ring_webp_mux_append(pointer, $0.bindMemory(to: UInt8.self).baseAddress!, data.count, Int32(duration)) }
+        let durations=frames.map { Int32($0.end-$0.start) },duration=durations.reduce(0,+)
+        let ok = durations.withUnsafeBufferPointer { timing in data.withUnsafeBytes {
+            ring_webp_mux_append(pointer, $0.bindMemory(to: UInt8.self).baseAddress!, data.count, duration,timing.baseAddress!,Int32(durations.count))
+        } }
         guard ok == 1 else { throw EngineError.io("WebP 구간 결합 실패") }
     }
     func finish() throws -> Data {
@@ -277,10 +318,41 @@ enum AnimationPipeline {
 
     static func encode(asset: AVAsset, start: Double, fps: Double, dimension: Int, extractionSize:CGSize? = nil,
                        crop: VideoCrop = .full, plan: AnimationPlan, format: AnimationFormat, quality: Int,
-                       allowParallelWebP: Bool, progress: (Double) -> Void) async throws -> AnimationEncoding {
+                       allowParallelWebP: Bool, maximumBytes: Int? = nil, progress: (Double) -> Void) async throws -> AnimationEncoding {
         let resources = AnimationResources.shared
         let reader = AnimationFrameReader(asset: asset, start: start, fps: fps, dimension: dimension,
                                           maximumSize:extractionSize ?? CGSize(width:dimension,height:dimension),crop: crop)
+        if format.isModern {
+            let first = try await reader.read(plan.frames[0..<1])[0]
+            let writer = try ModernImageWriter(format: format == .avif ? .avif : .jxl,
+                width: first.width, height: first.height, frameCount: plan.frames.count,
+                timeScale: plan.scale, loops: 0, icc: first.colorSpace?.copyICCData() as Data? ?? Data(),
+                exif: Data(), quality: 100, isAnimated: true)
+            for index in plan.frames.indices {
+                try Task.checkCancellation()
+                let image = index == 0 ? first : try await reader.read(plan.frames[index..<(index+1)])[0]
+                try writer.add(image, durationTicks: plan.frames[index].end-plan.frames[index].start)
+                progress(Double(index+1)/Double(plan.frames.count))
+            }
+            let bytes = try writer.finish()
+            if let maximumBytes, bytes.count > maximumBytes { throw EngineError.quality("움짤 결과가 허용한 용량을 넘어요. 크기·프레임은 자동으로 낮추지 않았어요.") }
+            let decoded = try ModernImageReader(data: bytes)
+            guard decoded.frameCount == plan.frames.count, decoded.timeScale == plan.scale,
+                  decoded.durationTicks == plan.frames.map({ $0.end-$0.start }), decoded.loops == 0 else {
+                throw EngineError.quality("움짤의 프레임·재생 시각·반복 검증 실패")
+            }
+            // Lossless encoding is checked against each actual extracted raster.
+            let reference = AnimationFrameReader(asset: asset, start: start, fps: fps, dimension: dimension,
+                maximumSize: extractionSize ?? CGSize(width:dimension,height:dimension), crop: crop)
+            for index in plan.frames.indices {
+                try Task.checkCancellation()
+                let image = try await reference.read(plan.frames[index..<(index+1)])[0]
+                let actual = try decoded.frame(index)
+                guard actual.colorSpace?.copyICCData() == image.colorSpace?.copyICCData(),
+                      try PixelCheck.compare(image, actual).exact else { throw EngineError.quality("움짤 프레임의 픽셀·색상·투명도 보존 검증 실패") }
+            }
+            return AnimationEncoding(bytes: bytes, width: first.width, height: first.height, parallelWebP: false)
+        }
         let initialLimit = format == .gif ? resources.workers : 4
         let initialCount = min(plan.frames.count, min(initialLimit, max(1, resources.frameCapacity(width: dimension, height: dimension, bytesPerPixel: format == .gif ? 12 : 4) / 2)))
         var images = try await reader.read(plan.frames[0..<initialCount])
@@ -299,19 +371,22 @@ enum AnimationPipeline {
         let mux = format == .webp ? try WebPAnimationMux(width: width, height: height) : nil
         var continuous: WebPAnimationWriter?
         var continuousOrigin = 0
+        var continuousPosition = 0
         var usedParallelWebP = false
         var previousGIF: GIFDeltaFrame?
         var gifRegions: [CGRect] = []
         var position = 0
         while position < plan.frames.count {
             try Task.checkCancellation()
-            let capacity = max(1, resources.frameCapacity(width: width, height: height, bytesPerPixel: format == .gif ? 12 : 4) / 2)
-            let workers = min(resources.workers, capacity)
+            let prefetchEnabled = width * height <= 1280 * 720
+            let capacity = max(1, resources.frameCapacity(width: width, height: height, bytesPerPixel: format == .gif ? 12 : 4) / (prefetchEnabled ? 2 : 1))
+            let workers = min(resources.workers, capacity, width*height>1920*1080 ? 2:Int.max)
             let chunkSize = 4
             // Decode ahead within the byte budget. Tiny extraction requests
             // repeatedly restart AVFoundation's batch decoder and lose most of
             // the parallel encoder's gain, especially on low-motion clips.
-            let desired = gif != nil ? min(workers * 4, capacity) : (parallelWebP ? min(workers * 8,capacity) : min(32, capacity))
+            let desired = gif != nil ? min(workers * 4, capacity) :
+                (parallelWebP ? min(workers * (prefetchEnabled ? 8:chunkSize),capacity) : min(32, capacity))
             let count = min(plan.frames.count - position, max(images.count, desired))
             if images.count < count {
                 images += try await reader.read(plan.frames[(position + images.count)..<(position + count)])
@@ -325,21 +400,22 @@ enum AnimationPipeline {
                 if parallelWebP {
                     if let writer = continuous {
                         let end = plan.frames[position].start
-                        try mux!.append(writer.finish(at:end-continuousOrigin),duration:end-continuousOrigin)
+                        try mux!.append(writer.finish(at:end-continuousOrigin),frames:plan.frames[continuousPosition..<position])
                         continuous = nil
                     }
                     usedParallelWebP = true
                 } else if continuous == nil {
                     continuous = try WebPAnimationWriter(width:width,height:height)
                     continuousOrigin = plan.frames[position].start
+                    continuousPosition = position
                 }
             }
             // One reader owns the generator; it prepares the next bounded
             // window while the current window is encoded. Both windows share
-            // the 128MiB pixel-buffer allowance across active animation jobs.
+            // the RAM-bounded pixel allowance across active animation jobs.
             let nextPosition = position + count
             let nextCount = min(desired, plan.frames.count - nextPosition)
-            let prefetch: Task<[CGImage], Error>? = nextCount > 0 ? Task {
+            let prefetch: Task<[CGImage], Error>? = prefetchEnabled && nextCount > 0 ? Task {
                 try await reader.read(plan.frames[nextPosition..<(nextPosition + nextCount)])
             } : nil
             try await withTaskCancellationHandler {
@@ -369,6 +445,7 @@ enum AnimationPipeline {
                             let delta = try prepared.cropped(to:region)
                             gifRegions.append(region)
                             CGImageDestinationAddImage(gif, delta, [kCGImagePropertyGIFDictionary: [kCGImagePropertyGIFDelayTime: delay, kCGImagePropertyGIFUnclampedDelayTime: delay]] as CFDictionary)
+                            if let maximumBytes, memory.length > maximumBytes { throw EngineError.quality("GIF가 250MB를 넘어 중단했어요. 크기·구간을 줄이거나 큰 파일 저장을 직접 허용해 주세요.") }
                             previousGIF = prepared
                         }
                     } else if let continuous {
@@ -377,6 +454,9 @@ enum AnimationPipeline {
                         }
                     } else if let mux {
                         let base = position
+                        // Two 4K encoders may each use the codec's two-thread
+                        // path, within the same four-worker thermal allowance.
+                        let encoderThreads = width*height>1920*1080 ? max(1,resources.workers/workers):1
                         let parts = try await withThrowingTaskGroup(of: (Int, Data, Int).self) { group in
                             let offsets = Array(stride(from: 0, to: batch.count, by: chunkSize))
                             func submit(_ offset: Int) {
@@ -386,7 +466,7 @@ enum AnimationPipeline {
                                     let writer = try WebPAnimationWriter(width: width, height: height)
                                     let origin = timing[0].start
                                     for (i, image) in chunk.enumerated() {
-                                        try writer.add(image, timestamp: timing[i].start - origin, quality: quality, threads: 1)
+                                        try writer.add(image, timestamp: timing[i].start - origin, quality: quality, threads: encoderThreads)
                                     }
                                     let duration = timing.last!.end - origin
                                     return (offset, try writer.finish(at: duration), duration)
@@ -400,7 +480,9 @@ enum AnimationPipeline {
                             }
                             return values.sorted { $0.0 < $1.0 }
                         }
-                        for (_, bytes, duration) in parts { try mux.append(bytes, duration: duration) }
+                        for (offset, bytes, _) in parts {
+                            try mux.append(bytes, frames:plan.frames[(base+offset)..<min(base+offset+chunkSize,base+count)])
+                        }
                     }
                     position = nextPosition
                     images = try await prefetch?.value ?? []
@@ -418,10 +500,11 @@ enum AnimationPipeline {
             guard CGImageDestinationFinalize(gif) else { throw EngineError.io("GIF 마감 실패") }
             bytes = try opaqueGIF(memory as Data,regions:gifRegions)
         } else if let mux {
-            if let continuous { try mux.append(continuous.finish(at: plan.ticks-continuousOrigin), duration: plan.ticks-continuousOrigin) }
+            if let continuous { try mux.append(continuous.finish(at: plan.ticks-continuousOrigin), frames:plan.frames[continuousPosition..<plan.frames.count]) }
             bytes = try mux.finish()
         } else { throw EngineError.io("애니메이션 인코더 없음") }
         try Task.checkCancellation()
+        if let maximumBytes, bytes.count > maximumBytes { throw EngineError.quality("움짤이 250MB를 넘어 저장하지 않았어요. 크기·구간을 줄이거나 큰 파일 저장을 직접 허용해 주세요.") }
         return AnimationEncoding(bytes: bytes, width: width, height: height, parallelWebP: usedParallelWebP)
     }
 
@@ -538,9 +621,19 @@ enum AnimationPipeline {
     }
 
     static func verify(_ encoded: AnimationEncoding, plan: AnimationPlan, format: AnimationFormat) throws {
+        if format.isModern {
+            let reader = try ModernImageReader(data: encoded.bytes)
+            guard reader.frameCount == plan.frames.count, reader.width == encoded.width,
+                  reader.height == encoded.height, reader.timeScale == plan.scale,
+                  reader.durationTicks == plan.frames.map({ $0.end-$0.start }) else { throw EngineError.quality("움짤 크기·타이밍 검증 실패") }
+            return
+        }
         guard let source = CGImageSourceCreateWithData(encoded.bytes as CFData, nil), CGImageSourceGetStatus(source) == .statusComplete else { throw EngineError.quality("애니메이션 디코딩 검사 실패") }
         let count = CGImageSourceGetCount(source)
-        guard count > 0, format != .gif || count == plan.frames.count else { throw EngineError.quality("애니메이션 프레임 수 검사 실패") }
+        // A one-frame WebP needs two identical holds to prevent libwebp's mux
+        // from converting it to a still image and discarding its duration.
+        let singleWebPHold = format == .webp && plan.frames.count == 1 && count == 2
+        guard count == plan.frames.count || singleWebPHold else { throw EngineError.quality("애니메이션 프레임 수 검사 실패 (\(count)/\(plan.frames.count))") }
         var duration = 0.0
         for index in 0..<count {
             try Task.checkCancellation()

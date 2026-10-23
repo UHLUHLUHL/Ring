@@ -9,6 +9,31 @@ struct ImageInput {
     let type: String
     let orientation: Int
     init(_ url: URL) throws {
+        let content = try Data(contentsOf: url, options: .mappedIfSafe)
+        if ModernImageReader.sniff(content) != nil {
+            let reader = try ModernImageReader(data: content)
+            guard !reader.isAnimated, reader.frameCount == 1 else {
+                throw EngineError.unsupported("여러 프레임이 포함된 이미지예요. 움짤 전용 편집 메뉴를 이용해 주세요.")
+            }
+            image = try reader.frame(0); properties = reader.properties
+            type = reader.format == "avif" ? ImageFormat.avif.uti : ImageFormat.jxl.uti
+            orientation = reader.orientation
+            if let original = CGImageSourceCreateWithData(content as CFData, nil) { source = original }
+            else {
+                // Compatibility metadata source for consumers of ImageInput.source.
+                // Modern pixels and properties above always come from the bundled decoder.
+                let proxy = NSMutableData()
+                let context = try PDFEngine.bitmap(width: 1, height: 1, space: image.colorSpace!)
+                guard let destination = CGImageDestinationCreateWithData(proxy, ImageFormat.png.uti as CFString, 1, nil),
+                      let placeholder = context.makeImage() else { throw EngineError.io("메타데이터 소스 생성 실패") }
+                CGImageDestinationAddImage(destination, placeholder, properties as CFDictionary)
+                guard CGImageDestinationFinalize(destination), let metadataSource = CGImageSourceCreateWithData(proxy, nil) else {
+                    throw EngineError.io("메타데이터 소스 생성 실패")
+                }
+                source = metadataSource
+            }
+            return
+        }
         guard let source = CGImageSourceCreateWithURL(url as CFURL, [kCGImageSourceShouldCache:false] as CFDictionary) else {
             throw EngineError.unsupported("이미지를 읽을 수 없어요. 파일이 손상되었거나 지원하지 않는 형식이에요.")
         }
@@ -47,13 +72,26 @@ struct ImageInput {
 }
 
 enum ImageCodec {
+    static func preview(_ url: URL, maxDimension: Int = 840) throws -> CGImage {
+        let input = try ImageInput(url)
+        return try ImageResampler.fit(PDFEngine.oriented(input.image, input.orientation), maxDimension: maxDimension)
+    }
     static func convert(_ input: URL, to output: URL, format: ImageFormat) throws -> String {
-        if let header=CGImageSourceCreateWithURL(input as CFURL,nil),CGImageSourceGetCount(header)>0,
+        let content = try Data(contentsOf: input, options: .mappedIfSafe)
+        if let detected = ModernImageReader.sniff(content) {
+            let reader = try ModernImageReader(data: content)
+            guard !reader.isAnimated, reader.frameCount == 1 else { throw EngineError.unsupported("움짤 전용 변환 경로를 사용해 주세요.") }
+            if detected == format.rawValue {
+                try FileIntegrity.copy(input, to: output)
+                return "원본 바이트 그대로 · 복사 검증 완료"
+            }
+        }
+        if ModernImageReader.sniff(content) == nil, let header=CGImageSourceCreateWithURL(input as CFURL,nil),CGImageSourceGetCount(header)>0,
            CGImageSourceGetType(header) as String? == format.uti,CGImageSourceGetStatus(header) == .statusComplete {
             try FileIntegrity.copy(input,to:output)
             return "원본 바이트 그대로 · 복사 검증 완료"
         }
-        if format == .webp || format == .avif { return try ExternalCodecs.convert(input,to:output,format:format) }
+        if format == .webp || format.isModern { return try ExternalCodecs.convert(input,to:output,format:format) }
         guard [.png,.jpg,.heic,.tiff,.bmp].contains(format) else { throw EngineError.unsupported("이 변환 엔진은 아직 연결되지 않았어요.") }
         let value = try ImageInput(input)
         if value.type == format.uti {
@@ -91,6 +129,23 @@ enum ImageCodec {
     }
     static func write(_ providedImage: CGImage, properties: [CFString:Any], format: ImageFormat, to output: URL) throws {
         let image = format == .png ? try promoteAlpha(providedImage) : providedImage
+        if format.isModern {
+            guard image.bitsPerComponent <= 8, let space = image.colorSpace, space.model == .rgb,
+                  !space.isHDR(), !CGColorSpaceUsesExtendedRange(space) else {
+                throw EngineError.unsupported("AVIF/JPEG XL 출력은 현재 SDR RGB 8비트 보존 경로를 사용해 주세요.")
+            }
+            let metadata = NSMutableData()
+            guard let carrier = CGImageDestinationCreateWithData(metadata, ImageFormat.tiff.uti as CFString, 1, nil) else {
+                throw EngineError.io("EXIF 직렬화 실패")
+            }
+            let context = try PDFEngine.bitmap(width: 1, height: 1, space: space)
+            CGImageDestinationAddImage(carrier, context.makeImage()!, properties as CFDictionary)
+            guard CGImageDestinationFinalize(carrier) else { throw EngineError.io("EXIF 직렬화 실패") }
+            let exif = try TIFFMetadataEnvelope.sanitize(metadata as Data, width: image.width, height: image.height)
+            try ModernImageCodec.encode(image, format: format, icc: space.copyICCData() as Data? ?? Data(),
+                exif: exif, orientation: properties[kCGImagePropertyOrientation] as? Int ?? 1).write(to: output)
+            return
+        }
         if format == .bmp { try BMPWriter.write(image,to:output); return }
         guard let destination = CGImageDestinationCreateWithURL(output as CFURL, format.uti as CFString, 1, nil) else {
             throw EngineError.unsupported("이 OS에서 \(format.rawValue.uppercased()) 저장을 지원하지 않아요.")
@@ -119,6 +174,9 @@ enum ImageCodec {
     }
     static func removeLocation(_ input: URL, to output: URL) throws -> String {
         let value = try ImageInput(input)
+        if [ImageFormat.avif.uti, ImageFormat.jxl.uti].contains(value.type) {
+            throw EngineError.unsupported("AVIF/JPEG XL 무재압축 GPS 편집은 아직 보존 검증 경로가 없어요.")
+        }
         if value.type == ImageFormat.png.uti {
             try PNGMetadata.stripLocation(input, to:output)
             let result = try ImageInput(output)

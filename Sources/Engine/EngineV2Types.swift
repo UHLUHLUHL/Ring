@@ -18,7 +18,7 @@ struct DocumentRenderOptions {
     var dpi: Double = 200
 }
 
-enum VideoCodec { case hevc, h264 }
+enum VideoCodec { case hevc, h264, av1 }
 /// Aspect presets offered beside the crop frame, following Photos. `units`
 /// are landscape; `VideoCrop.portrait` swaps them.
 enum VideoCropRatio: String, CaseIterable, Hashable {
@@ -171,7 +171,10 @@ struct VideoCompressionOptions {
     var crop: VideoCrop = .full
 }
 
-enum AnimationFormat: String { case gif, webp }
+enum AnimationFormat: String {
+    case gif, webp, avif, jxl
+    var isModern: Bool { self == .avif || self == .jxl }
+}
 struct AnimationOptions {
     static let maximumFPS: Double = 60
     static let maximumFrames = 1800
@@ -189,6 +192,7 @@ struct AnimationOptions {
         if text.last == "." { text.removeLast() }
         return text
     }
+    var preserveSourceTiming = true
 }
 enum VideoOperation {
     case convert(VideoConversionOptions)

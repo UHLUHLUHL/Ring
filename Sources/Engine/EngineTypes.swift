@@ -10,8 +10,16 @@ enum EngineError: LocalizedError {
     }
 }
 
+/// A valid automatic attempt can find no smaller file at the unchanged quality
+/// floor. The transaction is discarded; this is an informational UI outcome.
+struct NoCompressionSavings: LocalizedError {
+    let reason: String
+    var errorDescription: String? { reason }
+}
+
 enum ImageFormat: String, CaseIterable {
-    case png, jpg, heic, tiff, bmp, webp, avif, pdf, docx, txt
+    case png, jpg, heic, tiff, bmp, webp, avif, jxl, pdf, docx, txt
+    var isModern: Bool { self == .avif || self == .jxl }
     var uti: String {
         switch self {
         case .png: return "public.png"
@@ -21,6 +29,7 @@ enum ImageFormat: String, CaseIterable {
         case .bmp: return "com.microsoft.bmp"
         case .webp: return "org.webmproject.webp"
         case .avif: return "public.avif"
+        case .jxl: return "public.jpeg-xl"
         case .pdf: return "com.adobe.pdf"
         case .docx: return "org.openxmlformats.wordprocessingml.document"
         case .txt: return "public.plain-text"

@@ -1,0 +1,20 @@
+Ring additional codec configuration
+
+JPEG XL: libjxl (BSD-3-Clause), Highway (Apache-2.0), Brotli (MIT), bundled statically.
+AVIF: existing libavif (BSD-2-Clause) and libaom (BSD-2-Clause / patent grant),
+with AV1 decoding enabled. Exact notices accompany these libraries.
+
+Video: library-only FFmpeg configured with --enable-gpl, statically linked with
+x264 and x265 (GPL version 2 or later), SVT-AV1 (BSD-3-Clause-Clear), and Opus
+(BSD-3-Clause). FFmpeg's resulting configuration is GPL version 2 or later;
+it must not be described or distributed as an LGPL-only build. Distribution
+of the combined application must satisfy the applicable GPL source and license
+obligations, or use separately obtained compatible commercial codec licenses.
+No external FFmpeg executable, Homebrew installation, or codec download is
+required at runtime. Runtime capability checks reflect the linked encoders.
+
+Reproducible source versions and SHA-256 checksums are recorded in
+Vendor/modern-image-dependencies.lock.json and Vendor/video-dependencies.lock.json.
+Local libavif animation-transform and FFmpeg timestamp patches are retained in
+Vendor/patches and Tools/patches respectively. The accompanying build scripts
+reproduce the static libraries. These changes have not been released.

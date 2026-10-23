@@ -4,24 +4,31 @@ import VideoToolbox
 import CryptoKit
 
 enum VideoContainer: String, CaseIterable, Hashable {
-    case mp4, mov
+    case mp4, mov, webm
+    // Keep the existing UI list until these engines are connected to it.
+    static let allCases: [VideoContainer] = [.mp4, .mov]
+    static let engineCases: [VideoContainer] = [.mp4, .mov, .webm]
     var title: String { rawValue.uppercased() }
-    var fileType: AVFileType { self == .mp4 ? .mp4 : .mov }
+    var fileType: AVFileType { self == .mp4 ? .mp4 : self == .mov ? .mov : AVFileType(rawValue: "org.webmproject.webm") }
 }
 
 enum VideoConversionCodec: String, Hashable {
-    case h264, hevc, passthrough
+    case h264, hevc, av1, passthrough
     var title: String {
-        switch self { case .h264: return "H.264"; case .hevc: return "HEVC"; case .passthrough: return "원본 유지" }
+        switch self { case .h264: return "H.264"; case .hevc: return "HEVC"; case .av1: return "AV1"; case .passthrough: return "원본 유지" }
     }
-    var encodingCodec: VideoCodec { self == .hevc ? .hevc : .h264 }
+    var encodingCodec: VideoCodec { self == .hevc ? .hevc : self == .av1 ? .av1 : .h264 }
 }
+
+enum VideoAudioPolicy { case preserve, convertToOpus }
 
 struct VideoConversionOptions {
     var container: VideoContainer
     var codec: VideoConversionCodec
     var sourceBytes: Int64? = nil
     var sourceModified: Date? = nil
+    /// The default never changes audio. WebM conversion requires an explicit opt-in.
+    var audioPolicy: VideoAudioPolicy = .preserve
 }
 
 struct VideoEncodingPlan {
@@ -203,6 +210,35 @@ struct VideoSourceInfo {
 
 extension MediaEngine {
     static func convertVideo(_ source: URL, to output: URL, options: VideoConversionOptions) async throws -> String {
+        if options.container == .webm || options.codec == .av1 { return try SoftwareVideo.convert(source, to: output, options: options) }
+        if options.codec != .passthrough {
+            // Existing Apple inputs may contain auxiliary tracks or codecs that
+            // the deliberately small bundled demuxer does not accept.
+            let info: VideoSourceInfo
+            do { info = try await VideoSourceInfo.inspect(source) }
+            catch {
+                try Task.checkCancellation()
+                let original = error
+                let readable: RingSoftwareVideoInfo
+                do { readable = try SoftwareVideo.inspect(source, allFrames: true) }
+                catch { try Task.checkCancellation(); throw original }
+                guard readable.restricted == 0 else { throw original }
+                return try SoftwareVideo.convert(source, to: output, options: options)
+            }
+            if !SoftwareVideo.appleAvailable(options.codec.encodingCodec, width: info.width, height: info.height) {
+                return try SoftwareVideo.convert(source, to: output, options: options)
+            }
+        }
+        guard !FileManager.default.fileExists(atPath: output.path) else { throw EngineError.io("기존 결과를 덮어쓰지 않아요.") }
+        do { return try await convertVideoApple(source, to: output, options: options) }
+        catch {
+            guard !Task.isCancelled, options.codec != .passthrough, SoftwareVideo.isEncoderFailure(error),
+                  SoftwareVideo.supported(options.codec.encodingCodec) else { throw error }
+            if FileManager.default.fileExists(atPath: output.path) { try FileManager.default.removeItem(at: output) }
+            return try SoftwareVideo.convert(source, to: output, options: options)
+        }
+    }
+    private static func convertVideoApple(_ source: URL, to output: URL, options: VideoConversionOptions) async throws -> String {
         let info = try await VideoSourceInfo.inspect(source)
         if let bytes = options.sourceBytes, bytes != info.sourceBytes { throw EngineError.invalid("원본이 바뀌었어요. 링을 다시 열어 주세요.") }
         if let date = options.sourceModified, date != info.modified { throw EngineError.invalid("원본이 바뀌었어요. 링을 다시 열어 주세요.") }

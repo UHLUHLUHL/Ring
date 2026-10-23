@@ -231,6 +231,12 @@ final class RingModel: ObservableObject {
                 withAnimation(RingMotion.sCurve(RingMotion.fold)) { isWorking=false;isCancelling=false;resetProgress() }
                 engineTask=nil
                 showToast("취소했어요 · 결과를 저장하지 않았어요",closeAfter:false)
+            } catch let outcome as NoCompressionSavings {
+                DebugLog.write("job unchanged \(outcome.reason)")
+                withAnimation(RingMotion.sCurve(RingMotion.fold)) { isWorking = false }
+                engineTask = nil
+                isCancelling = false
+                showToast("화질을 지키며 더 줄이기 어려워요 · 원본 유지", closeAfter: false)
             } catch {
                 DebugLog.write("job failed \(error)")
                 withAnimation(RingMotion.sCurve(RingMotion.fold)) { isWorking = false }
@@ -440,15 +446,6 @@ extension RingModel {
         guard let codec else { return nil }
         return VideoConversionOptions(container: container, codec: codec,
             sourceBytes: info.sourceBytes, sourceModified: info.modified)
-    }
-    var videoNotice: String {
-        if let error = videoError { return error }
-        guard let info = videoSource else { return "영상 정보를 확인하고 있어요" }
-        if let restriction = info.reencodeRestriction { return restriction }
-        var text = "원본 해상도·프레임 타이밍 유지"
-        if info.colorProperties.isEmpty { text += " · 색상 태그 없음: macOS 기본 해석" }
-        if info.hasAudio { text += " · 음성 원본 유지" }
-        return text
     }
     func startVideoConversion() {
         guard !isWorking, !isNavigating, let container = videoContainer, let codec = videoCodec,

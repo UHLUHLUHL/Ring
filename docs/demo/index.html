@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="ko"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Ring — 사용 예시</title>
+<style>
+*{box-sizing:border-box}body{margin:0;background:#0c121b;color:#edf4ff;font:15px -apple-system,BlinkMacSystemFont,sans-serif}main{max-width:1440px;margin:auto}#animation{width:100%;aspect-ratio:3/2}footer{display:flex;gap:16px;align-items:center;padding:16px 28px;color:#abb9ca}button,a{color:#d9eaff}button{border:1px solid #34455c;background:#182434;padding:8px 16px;border-radius:8px;cursor:pointer}input{flex:1;min-width:60px}small{margin-left:auto}canvas,svg{display:block}
+@media(prefers-reduced-motion:reduce){#motion-note{display:inline}}
+</style>
+<main><div id="animation" aria-label="마우스로 PNG를 JPG로, 영상을 480px WebP로 변환하는 Ring 사용 예시"></div>
+<footer><button id="play">일시정지</button><button id="restart">처음부터</button><input id="seek" aria-label="재생 위치" type="range" min="0" max="719" value="0"><span id="time">0 / 24초</span><a href="ring-demo.json" download>Lottie JSON</a><a href="ring-demo.webp" download>WebP</a></footer></main>
+<script src="vendor/lottie.min.js"></script><script src="animation-data.js"></script>
+<script>
+const reduced=matchMedia('(prefers-reduced-motion: reduce)').matches;
+const anim=lottie.loadAnimation({container:document.getElementById('animation'),renderer:new URLSearchParams(location.search).has('canvas')?'canvas':'svg',loop:true,autoplay:!reduced,animationData:window.RING_DEMO,rendererSettings:{clearCanvas:true,progressiveLoad:false}});
+window.demoAnimation=anim;window.demoReady=false;
+anim.addEventListener('DOMLoaded',()=>{window.demoReady=true});
+const play=document.getElementById('play'),seek=document.getElementById('seek');
+play.textContent=reduced?'재생':'일시정지';
+play.onclick=()=>{anim.togglePause();play.textContent=anim.isPaused?'재생':'일시정지'};
+document.getElementById('restart').onclick=()=>{anim.goToAndPlay(0,true);play.textContent='일시정지'};
+seek.oninput=()=>{anim.goToAndStop(+seek.value,true);play.textContent='재생'};
+anim.addEventListener('enterFrame',()=>{seek.value=Math.round(anim.currentFrame);document.getElementById('time').textContent=Math.floor(anim.currentFrame/30)+' / 24초'});
+window.renderDemoFrame=(frame)=>{anim.goToAndStop(frame,true);return document.querySelector('#animation canvas')?.toDataURL('image/png')};
+</script></html>

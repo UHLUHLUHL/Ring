@@ -37,6 +37,35 @@ enum MediaEngine {
     }
 
     static func compress(_ source:URL,to output:URL,options:VideoCompressionOptions) async throws -> String {
+        // AV1/WebM may have no AVFoundation reader. Select its bundled path
+        // before asking the Apple framework to inspect the source.
+        if options.codec == .av1 { return try SoftwareVideo.compress(source, to: output, options: options) }
+        let info: VideoSourceInfo
+        do { info = try await VideoSourceInfo.inspect(source) }
+        catch {
+            try Task.checkCancellation()
+            guard SoftwareVideo.supported(options.codec), options.crop.isFull, options.maxDimension == nil else { throw error }
+            // A framework read failure alone does not authorize an encoder
+            // retry. First prove the alternate decoder can read every frame
+            // and that the source passes its preservation restrictions.
+            let originalError = error
+            let readable: RingSoftwareVideoInfo
+            do { readable = try SoftwareVideo.inspect(source, allFrames: true) }
+            catch { try Task.checkCancellation(); throw originalError }
+            guard readable.restricted == 0 else { throw originalError }
+            return try SoftwareVideo.compress(source, to: output, options: options)
+        }
+        guard SoftwareVideo.appleAvailable(options.codec, width: info.width, height: info.height) else {
+            return try SoftwareVideo.compress(source, to: output, options: options)
+        }
+        do { return try await compressApple(source, to: output, options: options) }
+        catch {
+            guard !Task.isCancelled, SoftwareVideo.isEncoderFailure(error), SoftwareVideo.supported(options.codec),
+                  options.crop.isFull, options.maxDimension == nil else { throw error }
+            return try SoftwareVideo.compress(source, to: output, options: options)
+        }
+    }
+    private static func compressApple(_ source:URL,to output:URL,options:VideoCompressionOptions) async throws -> String {
         let targetBytes = options.targetBytes, codec = options.codec
         if let targetBytes, !(1...1_000_000_000_000).contains(targetBytes) { throw EngineError.invalid("목표 비디오 용량 오류") }
         let info=try await VideoSourceInfo.inspect(source)
@@ -149,6 +178,20 @@ enum MediaEngine {
             }
         }
         guard let quality=bestQuality else {
+            if automatic, options.crop.isFull, options.maxDimension == nil {
+                let descriptions=try await track.load(.formatDescriptions)
+                let expected=codec == .hevc ? kCMVideoCodecType_HEVC:kCMVideoCodecType_H264
+                if !descriptions.isEmpty, descriptions.allSatisfy({CMFormatDescriptionGetMediaSubType($0)==expected}) {
+                    let current=try source.resourceValues(forKeys:[.fileSizeKey,.contentModificationDateKey])
+                    guard Int64(current.fileSize ?? 0)==info.sourceBytes,current.contentModificationDate==info.modified else {
+                        throw EngineError.invalid("작업 중 원본이 바뀌었어요. 새 원본으로 다시 열어 주세요.")
+                    }
+                    try Task.checkCancellation()
+                    // No candidate passed; retaining the source is a normal
+                    // no-op, not a saved compressed file or an optimality claim.
+                    throw NoCompressionSavings(reason:"화질을 지키며 더 줄이기 어려워요 · 원본 유지")
+                }
+            }
             throw EngineError.quality(targetBytes == nil || targetBytes!>=savingLimit
                 ? "원본 프레임·해상도·오디오와 화질 기준을 지키면서 줄일 수 있는 결과가 없어요. 원본을 유지했어요."
                 : "목표 용량과 화질 기준을 함께 만족하는 결과를 찾지 못했어요. 원본은 유지했어요. 목표를 높이거나 비워 주세요.")

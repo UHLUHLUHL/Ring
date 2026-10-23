@@ -1,0 +1,13 @@
+--- a/src/write.c
++++ b/src/write.c
+@@ -791,6 +791,10 @@
+                                                            avifItemPropertyAssociationArray * associations,
+                                                            avifItemPropertyDedup * dedup)
+ {
++    // Track properties have no deduplication stream; write directly to the track.
++    if (!dedupStream) {
++        dedupStream = outputStream;
++    }
+     if (imageMetadata->transformFlags & AVIF_TRANSFORM_CLAP) {
+         if (dedup) {
+             avifItemPropertyDedupStart(dedup);

@@ -15,6 +15,10 @@ extension MediaEngine {
     static func animate(_ source: URL, to output: URL, options: AnimationOptions) async throws -> String {
         let asset = AVURLAsset(url: source, options: [AVURLAssetPreferPreciseDurationAndTimingKey: true])
         let assetDuration = try await asset.load(.duration)
+        if options.format.isModern {
+            let info = try await VideoSourceInfo.inspect(source)
+            if let issue = info.reencodeRestriction { throw EngineError.unsupported(issue) }
+        }
         let duration = options.duration ?? (assetDuration.seconds - options.start)
         guard options.start.isFinite, duration.isFinite, options.start >= 0, duration > 0,
               options.start + duration <= assetDuration.seconds + 0.001,
@@ -30,11 +34,26 @@ extension MediaEngine {
             VideoCropGeometry.extractionSize(width:abs(Double(displaySize.width)),height:abs(Double(displaySize.height)),crop:options.crop,maxDimension:dimension)
         }
         let resources = AnimationResources.shared
-        resources.enter(); defer { resources.leave() }
         let fps = options.fps
         var dimension = options.maxDimension, lastSize = 0
         var previousSize: (pixels: Int, bytes: Int)?
-        let initial = AnimationPlan(duration: duration, fps: fps, format: options.format)
+        let initial = options.preserveSourceTiming
+            ? try await AnimationPlan.source(asset:asset,start:options.start,duration:duration,fps:fps,format:options.format)
+            : AnimationPlan(duration:duration,fps:fps,format:options.format)
+        if options.format.isModern {
+            resources.enter(); defer { resources.leave() }
+            let encoded = try await AnimationPipeline.encode(asset: asset, start: options.start, fps: fps, dimension: dimension,
+                extractionSize: extractionSize(for: dimension), crop: options.crop, plan: initial, format: options.format,
+                quality: 100, allowParallelWebP: false,
+                maximumBytes: nil) { EngineProgress.report(0.05+0.85*$0) }
+            if let target = options.targetBytes, encoded.bytes.count > target {
+                throw EngineError.quality("무손실 결과가 목표 용량을 넘어요. 프레임·해상도·품질을 자동으로 낮추지 않았어요.")
+            }
+            try Task.checkCancellation()
+            try encoded.bytes.write(to: output)
+            return "\(options.format.rawValue.uppercased()) 무손실 움짤 · \(encoded.width)×\(encoded.height) · \(initial.frames.count)프레임 · 픽셀·타이밍 검증"
+        }
+        resources.enter(); defer { resources.leave() }
         if let target = options.targetBytes, initial.frames.count >= 48,
            target < Int64(initial.frames.count) * Int64(dimension * dimension) * 2 {
             let sample = initial.sample
@@ -48,9 +67,10 @@ extension MediaEngine {
         }
         for _ in 0..<4 {
             try Task.checkCancellation()
-            let plan = AnimationPlan(duration: duration, fps: fps, format: options.format)
+            let plan = initial
             let encoded = try await AnimationPipeline.encode(asset: asset, start: options.start, fps: fps, dimension: dimension,
-                extractionSize:extractionSize(for:dimension),crop: options.crop, plan: plan, format: options.format, quality: 90, allowParallelWebP: true) {
+                extractionSize:extractionSize(for:dimension),crop: options.crop, plan: plan, format: options.format, quality: 90, allowParallelWebP: true,
+                maximumBytes: nil) {
                     EngineProgress.report(0.10 + 0.80 * $0)
                 }
             EngineProgress.report(0.92)
@@ -84,6 +104,32 @@ extension MediaEngine {
             EngineProgress.report(0.10)
         }
         throw EngineError.quality("지정한 FPS와 인코딩 품질 설정으로 목표 용량을 맞추지 못했어요 (\(lastSize)바이트). 목표를 높여 주세요.")
+    }
+
+    /// Measured encode of twelve frames in three windows, at the requested
+    /// geometry/quality. This is a size estimate, never a quality or FPS change.
+    static func animationEstimate(_ source:URL,options:AnimationOptions) async throws -> Int {
+        let asset=AVURLAsset(url:source)
+        let length=try await asset.load(.duration).seconds
+        let duration=options.duration ?? length-options.start
+        guard options.start.isFinite,options.start>=0,duration.isFinite,duration>0,
+              options.start+duration<=length+0.001,options.fps.isFinite,(1...AnimationOptions.maximumFPS).contains(options.fps),
+              duration*options.fps<=Double(AnimationOptions.maximumFrames),
+              (2...(options.format == .webp ? 16383:65535)).contains(options.maxDimension) else {
+            throw EngineError.invalid("구간·FPS·크기를 확인해 주세요.")
+        }
+        guard let track=try await asset.loadTracks(withMediaType:.video).first else { throw EngineError.invalid("영상 트랙 없음") }
+        let natural=try await track.load(.naturalSize),transform=try await track.load(.preferredTransform)
+        let shown=natural.applying(transform)
+        let plan=options.preserveSourceTiming
+            ? try await AnimationPlan.source(asset:asset,start:options.start,duration:duration,fps:options.fps,format:options.format)
+            : AnimationPlan(duration:duration,fps:options.fps,format:options.format)
+        AnimationResources.shared.enter();defer { AnimationResources.shared.leave() }
+        let sample=plan.sample
+        let encoded=try await AnimationPipeline.encode(asset:asset,start:options.start,fps:options.fps,dimension:options.maxDimension,
+            extractionSize:VideoCropGeometry.extractionSize(width:abs(shown.width),height:abs(shown.height),crop:options.crop,maxDimension:options.maxDimension),
+            crop:options.crop,plan:sample,format:options.format,quality:90,allowParallelWebP:true) { _ in }
+        return Int(Double(encoded.bytes.count)*Double(plan.frames.count)/Double(sample.frames.count)*1.03)
     }
 }
 

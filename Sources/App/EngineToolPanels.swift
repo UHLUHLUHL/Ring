@@ -457,6 +457,9 @@ private struct VideoToolPanel:View {
     @State private var currentTime=0.0
     @State private var timeObserver:Any?
     @State private var thumbnails:[NSImage]=[]
+    @State private var animationEstimate:Int?
+    @State private var animationEstimateError:String?
+    @State private var animationEstimateKey=""
 
     private var title:String {
         switch tool {
@@ -614,7 +617,7 @@ private struct VideoToolPanel:View {
     }
 
     var body:some View {
-        ToolForm(model:model,title:title,width:500,ready:duration != nil,operation:operation) {
+        ToolForm(model:model,title:title,width:500,ready:canSave,operation:operation) {
             switch tool {
             case .trim:
                 trimTimelineSection(videoMaxHeight: 380, middlePrefix: "선택 구간")
@@ -632,7 +635,7 @@ private struct VideoToolPanel:View {
                 PanelRow(label:"코덱") { Picker("코덱",selection:$codec) { Text("HEVC · 고효율/작은 용량").tag("HEVC");Text("H.264 · 범용 호환성").tag("H264") }.labelsHidden() }
 
             case .animation(let format):
-                trimTimelineSection(videoMaxHeight: 270, middlePrefix: "구간")
+                trimTimelineSection(videoMaxHeight:270, middlePrefix: "구간")
                 cropControls
                 PanelRow(label:"프레임") {
                     TextField("원본",text:$fps).textFieldStyle(.roundedBorder)
@@ -664,9 +667,35 @@ private struct VideoToolPanel:View {
                 }
                 dimensionControls
                 ResolutionNote(text:animationResolution)
+                if needsAnimationEstimate {
+                    VStack(alignment:.leading,spacing:5) {
+                        if animationEstimateKey == animationSettingsKey, let bytes=animationEstimate {
+                            Text("샘플 기준 약 \(ByteCountFormatter.string(fromByteCount:Int64(bytes),countStyle:.file)) · 장면에 따라 달라져요")
+                        } else if animationEstimateKey == animationSettingsKey, let animationEstimateError {
+                            Text(animationEstimateError).foregroundStyle(.red)
+                        } else { Text("선택한 크기로 샘플 용량 확인 중…") }
+                    }.font(.system(size:11)).foregroundStyle(.secondary).lineLimit(1).frame(height:14,alignment:.leading)
+                } else { Color.clear.frame(height:14) }
                 Toggle("목표 용량 지정",isOn:$target)
-                if target { PanelRow(label:"용량") { SizeFields(value:$size,unit:$unit) } }
+                PanelRow(label:"용량") {
+                    if target { SizeFields(value:$size,unit:$unit) }
+                    else { Color.clear.frame(height:28) }
+                }
             }
+        }.task(id:animationSettingsKey) {
+            animationEstimate=nil;animationEstimateError=nil
+            let key=animationSettingsKey
+            animationEstimateKey=key
+            guard needsAnimationEstimate else { return }
+            do {
+                try await Task.sleep(for:.milliseconds(600))
+                guard case .video(.animation(let options))=try operation() else { return }
+                let bytes=try await MediaEngine.animationEstimate(model.file.url,options:options)
+                try Task.checkCancellation()
+                guard key==animationSettingsKey else { return }
+                animationEstimate=bytes
+            } catch is CancellationError { }
+            catch { if !Task.isCancelled && key==animationSettingsKey { animationEstimateError=error.localizedDescription } }
         }.task {
             let url = model.file.url
             let asset=AVURLAsset(url:url)
@@ -677,7 +706,6 @@ private struct VideoToolPanel:View {
                 sourceSize=CGSize(width:abs(shown.width),height:abs(shown.height))
                 // Like Photos, presets start in the frame's own orientation.
                 cropPortrait=abs(shown.height)>abs(shown.width)
-                if isAnimation { compressionDimension="640" }
                 refreshCompressionDimensions()
             }
             let total = d.seconds
@@ -727,7 +755,7 @@ private struct VideoToolPanel:View {
                         Button("원본") { compressionDimension="";refreshCompressionDimensions() }
                             .buttonStyle(.glass).tint(compressionDimension.isEmpty ? .accentColor:nil)
                             .accessibilityIdentifier("video.dimensions.original")
-                        ForEach([1280,1920,3840].filter { $0<=compressionBase.width },id:\.self) { width in
+                        ForEach([1280,1920,3840].filter { $0<compressionBase.width },id:\.self) { width in
                             Button(String(width)) { updateCompressionDimension(String(width),horizontal:true) }
                                 .buttonStyle(.glass).tint(Int(compressionWidth)==width ? .accentColor:nil)
                                 .accessibilityIdentifier("video.width.\(width)")
@@ -746,6 +774,17 @@ private struct VideoToolPanel:View {
         }
     }
     private var isAnimation:Bool { if case .animation = tool { return true };return false }
+    private var animationSettingsKey:String {
+        "\(isAnimation)-\(compressionDimension)-\(fps)-\(startVal)-\(endVal)-\(cropRect)-\(target)-\(duration ?? 0)"
+    }
+    private var needsAnimationEstimate:Bool {
+        guard isAnimation,!target,duration != nil,let fps=Double(fps),fps.isFinite else { return false }
+        let dimensions=outputDimensions(Int(compressionDimension))
+        return Double(dimensions.width)*Double(dimensions.height)*max(0,endVal-startVal)*fps>150_000_000
+    }
+    private var canSave:Bool {
+        duration != nil
+    }
     private func outputDimensions(_ limit:Int?) -> (width:Int,height:Int) {
         guard let sourceSize else { return (0,0) }
         if isAnimation {
@@ -792,7 +831,7 @@ private struct VideoToolPanel:View {
         if horizontal { compressionHeight=String(result.height) } else { compressionWidth=String(result.width) }
     }
     private func refreshCompressionDimensions() {
-        guard let sourceSize else { return }
+        guard sourceSize != nil else { return }
         let result=outputDimensions(Int(compressionDimension))
         compressionWidth=String(result.width);compressionHeight=String(result.height)
     }
