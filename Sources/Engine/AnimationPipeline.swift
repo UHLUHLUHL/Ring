@@ -53,7 +53,10 @@ struct AnimationPlan {
     /// Three short windows retain local motion; a single opening scene is not
     /// representative enough to predict the size of an entire animation.
     var sample: AnimationPlan {
-        let width = min(4, frames.count)
+        sampled(window:4)
+    }
+    func sampled(window:Int) -> AnimationPlan {
+        let width = min(window, frames.count)
         let starts = [0, max(0, (frames.count - width) / 2), frames.count - width]
         let indices = Set(starts.flatMap { Array($0..<($0 + width)) }).sorted()
         var tick = 0
@@ -247,12 +250,24 @@ private final class WebPAnimationWriter {
         pointer = value
     }
     deinit { ring_webp_animation_destroy(pointer) }
-    func add(_ image: CGImage, timestamp: Int, quality: Int, threads: Int) throws {
+    static func frame(_ image:CGImage,quality:Int,threads:Int,effort:Int) throws -> Data {
+        try Task.checkCancellation()
+        let rgba=try AdaptivePalette.sRGB(image)
+        var buffer:UnsafeMutablePointer<UInt8>?,count=0
+        let ok=rgba.withUnsafeBytes {
+            ring_webp_frame_encode($0.bindMemory(to:UInt8.self).baseAddress!,Int32(image.width),Int32(image.height),Int32(quality),Int32(threads),Int32(effort),&buffer,&count)
+        }
+        defer { ring_buffer_free(buffer) }
+        guard ok==1,let buffer else { throw EngineError.io("WebP 프레임 압축 실패") }
+        try Task.checkCancellation()
+        return Data(bytes:buffer,count:count)
+    }
+    func add(_ image: CGImage, timestamp: Int, quality: Int, threads: Int, effort: Int = 4) throws {
         try Task.checkCancellation()
         try autoreleasepool {
             let rgba = try AdaptivePalette.sRGB(image)
             let ok = rgba.withUnsafeBytes {
-                ring_webp_animation_add(pointer, $0.bindMemory(to: UInt8.self).baseAddress!, Int32(image.width), Int32(image.height), Int32(timestamp), Int32(quality), Int32(threads))
+                ring_webp_animation_add_tuned(pointer, $0.bindMemory(to: UInt8.self).baseAddress!, Int32(image.width), Int32(image.height), Int32(timestamp), Int32(quality), Int32(threads), Int32(effort))
             }
             guard ok == 1 else { throw EngineError.io("WebP 프레임 쓰기 실패") }
         }
@@ -300,26 +315,126 @@ struct AnimationEncoding {
     let parallelWebP: Bool
 }
 
+/// Sequential composition avoids asking ImageIO to repeatedly reconstruct a
+/// dependent WebP canvas during all-frame verification. Pixel/colour comparison
+/// remains identical; the decoder also powers the app's WebP editing path.
+private final class AnimationDecodedFrames {
+    private let source:CGImageSource
+    private var webp:UnsafeMutableRawPointer?
+    private let width:Int,height:Int
+    private var position = -1
+    init(_ encoded:AnimationEncoding,format:AnimationFormat) throws {
+        guard let source=CGImageSourceCreateWithData(encoded.bytes as CFData,nil) else { throw EngineError.quality("움짤 화질 검사 디코딩 실패") }
+        self.source=source;width=encoded.width;height=encoded.height
+        if format == .webp {
+            var w:Int32=0,h:Int32=0,frames:Int32=0,loops:Int32=0
+            webp=encoded.bytes.withUnsafeBytes { ring_webp_image_decoder_create($0.bindMemory(to:UInt8.self).baseAddress,encoded.bytes.count,Int32(ThermalPolicy.threads),&w,&h,&frames,&loops) }
+            guard webp != nil,w==width,h==height,frames==CGImageSourceGetCount(source) else {
+                ring_webp_image_decoder_destroy(webp);webp=nil
+                throw EngineError.quality("WebP 순차 디코딩 검사 실패")
+            }
+        }
+    }
+    deinit { ring_webp_image_decoder_destroy(webp) }
+    func image(_ index:Int) throws -> CGImage {
+        if let webp {
+            guard index==position+1 else { throw EngineError.quality("WebP 프레임 순서 검사 실패") }
+            var pixels:UnsafePointer<UInt8>?
+            guard ring_webp_image_decoder_next(webp,&pixels)==1,let pixels else { throw EngineError.quality("WebP 프레임 읽기 실패") }
+            position=index
+            let data=Data(bytes:pixels,count:width*height*4)
+            guard let provider=CGDataProvider(data:data as CFData),let image=CGImage(width:width,height:height,bitsPerComponent:8,bitsPerPixel:32,bytesPerRow:width*4,space:CGColorSpace(name:CGColorSpace.sRGB)!,bitmapInfo:CGBitmapInfo(rawValue:CGImageAlphaInfo.last.rawValue),provider:provider,decode:nil,shouldInterpolate:false,intent:.defaultIntent) else { throw EngineError.quality("WebP 화질 검사 버퍼 오류") }
+            return image
+        }
+        guard let image=CGImageSourceCreateImageAtIndex(source,index,nil) else { throw EngineError.quality("움짤 화질 검사 프레임 읽기 실패") }
+        return image
+    }
+}
+
 enum AnimationPipeline {
+    /// Decode three distributed rasters once and reuse them across at most
+    /// three measured codec requests. This only chooses the full-file request;
+    /// every output frame still has to pass the final fidelity/timing checks.
+    static func webPQuality(asset:AVAsset,start:Double,fps:Double,dimension:Int,extractionSize:CGSize,
+                            crop:VideoCrop,plan:AnimationPlan,targetBytes:Int64?) async throws -> Int {
+        guard plan.frames.count>=24 else { return targetBytes == nil ? 88:96 }
+        let reader=AnimationFrameReader(asset:asset,start:start,fps:fps,dimension:dimension,maximumSize:extractionSize,crop:crop)
+        let sample=plan.sampled(window:1)
+        let capacity=max(1,min(sample.frames.count,AnimationResources.shared.frameCapacity(width:dimension,height:dimension)/2))
+        let indices=capacity==1 ? [sample.frames.count/2]:(0..<capacity).map { $0*(sample.frames.count-1)/(capacity-1) }
+        var images=[CGImage]()
+        for index in indices { images+=try await reader.read(sample.frames[index..<(index+1)]) }
+        var quality=targetBytes == nil ? 80:96
+        var passing:(quality:Int,bytes:Int)?
+        for attempt in 0..<(targetBytes == nil ? 2:3) {
+            try Task.checkCancellation()
+            var bytes=0,error=0.0,count=0,worst=Double.infinity
+            for image in images {
+                try autoreleasepool {
+                    let data=try WebPAnimationWriter.frame(image,quality:quality,threads:AnimationResources.shared.workers,effort:2)
+                    bytes+=data.count
+                    guard let source=CGImageSourceCreateWithData(data as CFData,nil),let decoded=CGImageSourceCreateImageAtIndex(source,0,nil) else { throw EngineError.quality("WebP 샘플 읽기 실패") }
+                    let metrics=try PixelCheck.compare(image,decoded)
+                    error+=metrics.squaredError;count+=metrics.sampleCount;worst=min(worst,metrics.psnr)
+                }
+            }
+            let mean=error==0 ? 99:10*log10(65535.0*65535*Double(count)/error)
+            if let targetBytes {
+                let estimate=Double(bytes)*Double(plan.frames.count)/Double(images.count)
+                if estimate<=Double(targetBytes)*0.94 { return quality }
+                let step=max(1,Int(ceil((quality>80 ? 8.0:16.0)*log2(estimate/(Double(targetBytes)*0.94)))))
+                quality=max(0,quality-step)
+            } else {
+                if mean>=40,worst>=36 {
+                    if passing == nil || bytes<passing!.bytes { passing=(quality,bytes) }
+                    if attempt>0 || mean<42 { break }
+                    quality=72
+                } else {
+                    if passing != nil { break }
+                    quality=96
+                }
+            }
+        }
+        return targetBytes == nil ? passing?.quality ?? 100:quality
+    }
+
     /// Broad motion benefits from independent segments. Keep small changed
     /// rectangles in one encoder so screen recordings retain delta compression.
     static func motionFraction(_ first: CGImage, _ last: CGImage) throws -> Double {
-        let a = try AdaptivePalette.sRGB(ImageResampler.fit(first, maxDimension: 64))
+        try changes(first,last).motion
+    }
+    private static func changes(_ first:CGImage,_ last:CGImage) throws -> (motion:Double,coverage:Double) {
+        let resized=try ImageResampler.fit(first,maxDimension:64)
+        let a = try AdaptivePalette.sRGB(resized)
         let b = try AdaptivePalette.sRGB(ImageResampler.fit(last, maxDimension: 64))
-        guard a.count == b.count, !a.isEmpty else { return 1 }
+        guard a.count == b.count, !a.isEmpty else { return (1,1) }
+        let width=resized.width,height=resized.height
         return a.withUnsafeBytes { ar in b.withUnsafeBytes { br in
             let x = ar.bindMemory(to: UInt8.self), y = br.bindMemory(to: UInt8.self)
-            var changed = 0
+            var changed = 0,subtleChanged=0,left=width,right = -1,top=height,bottom = -1
             for p in stride(from: 0, to: a.count, by: 4) {
-                if (0..<3).contains(where: { abs(Int(x[p + $0]) - Int(y[p + $0])) > 12 }) { changed += 1 }
+                let difference=max(abs(Int(x[p])-Int(y[p])),abs(Int(x[p+1])-Int(y[p+1])),abs(Int(x[p+2])-Int(y[p+2])))
+                if difference>12 {changed+=1}
+                if difference>3 {
+                    subtleChanged+=1
+                    let px=(p/4)%width,py=(p/4)/width
+                    left=min(left,px);right=max(right,px);top=min(top,py);bottom=max(bottom,py)
+                }
             }
-            return Double(changed) / Double(a.count / 4)
+            // Isolated quantization noise must not turn a small moving cursor
+            // into full-screen motion merely because its bounding box is wide.
+            let coverage=right<left || Double(subtleChanged)/Double(width*height)<0.10 ? 0:Double((right-left+1)*(bottom-top+1))/Double(width*height)
+            return (Double(changed)/Double(a.count/4),coverage)
         } }
+    }
+    private static func prefersParallel(_ first:CGImage,_ last:CGImage) throws -> Bool {
+        let change=try changes(first,last)
+        return change.motion>0.15 || change.coverage>0.65
     }
 
     static func encode(asset: AVAsset, start: Double, fps: Double, dimension: Int, extractionSize:CGSize? = nil,
                        crop: VideoCrop = .full, plan: AnimationPlan, format: AnimationFormat, quality: Int,
-                       allowParallelWebP: Bool, maximumBytes: Int? = nil, progress: (Double) -> Void) async throws -> AnimationEncoding {
+                       allowParallelWebP: Bool, maximumBytes: Int? = nil, webpEffort: Int = 4, stableGIF: Bool = false, progress: (Double) -> Void) async throws -> AnimationEncoding {
         let resources = AnimationResources.shared
         let reader = AnimationFrameReader(asset: asset, start: start, fps: fps, dimension: dimension,
                                           maximumSize:extractionSize ?? CGSize(width:dimension,height:dimension),crop: crop)
@@ -354,13 +469,19 @@ enum AnimationPipeline {
             }
             return AnimationEncoding(bytes: bytes, width: first.width, height: first.height, parallelWebP: false)
         }
+        var palette:AdaptivePalette.StablePalette?
+        if format == .gif,stableGIF {
+            let sampleReader=AnimationFrameReader(asset:asset,start:start,fps:fps,dimension:320,maximumSize:extractionSize ?? CGSize(width:dimension,height:dimension),crop:crop)
+            let samples=try await sampleReader.read(plan.sample.frames[...])
+            palette=try AdaptivePalette.StablePalette(images:samples,quality:quality)
+        } else { palette=nil }
         let initialLimit = format == .gif ? resources.workers : 4
         let initialCount = min(plan.frames.count, min(initialLimit, max(1, resources.frameCapacity(width: dimension, height: dimension, bytesPerPixel: format == .gif ? 12 : 4) / 2)))
         var images = try await reader.read(plan.frames[0..<initialCount])
         let width = images[0].width, height = images[0].height
         var parallelWebP = false
         if format == .webp, allowParallelWebP, resources.workers > 1, plan.frames.count >= 8 {
-            parallelWebP = try motionFraction(images[0], images[images.count - 1]) > 0.15
+            parallelWebP = try prefersParallel(images[0], images[images.count - 1])
         }
         let memory = NSMutableData()
         let gif: CGImageDestination?
@@ -393,11 +514,24 @@ enum AnimationPipeline {
                 images += try await reader.read(plan.frames[(position + images.count)..<(position + count)])
             }
             let batch = images
+            if let current=palette {
+                // Keep a palette until the scene's colours actually outgrow
+                // it. This avoids per-frame palette flicker without forcing a
+                // dark or newly saturated scene into the opening palette.
+                let probe=try ImageResampler.fit(batch[0],maxDimension:160)
+                let mapped=try AdaptivePalette.indexed(probe,quality:quality,stable:current)
+                if try PixelCheck.compare(probe,mapped).psnr<34 {
+                    let indices=Set([0,batch.count/2,batch.count-1]).sorted()
+                    let local=try indices.map {try ImageResampler.fit(batch[$0],maxDimension:320)}
+                    palette=try AdaptivePalette.StablePalette(images:local,quality:quality)
+                }
+            }
+            let batchPalette=palette
             // Re-evaluate local motion after decode-ahead. A quiet opening
             // must not force the rest of a moving clip through a serial encoder.
             if format == .webp {
                 parallelWebP = try allowParallelWebP && workers > 1 && batch.count >= 4 &&
-                    motionFraction(batch[0],batch[batch.count-1]) > 0.15
+                    prefersParallel(batch[0],batch[batch.count-1])
                 if parallelWebP {
                     if let writer = continuous {
                         let end = plan.frames[position].start
@@ -428,7 +562,7 @@ enum AnimationPipeline {
                             var next = 0, values: [(Int, CGImage)] = []
                             func submit(_ index: Int) {
                                 let image = batch[index]
-                                group.addTask { try Task.checkCancellation(); return try autoreleasepool { (index, try AdaptivePalette.indexed(image,quality:quality)) } }
+                                group.addTask { try Task.checkCancellation(); return try autoreleasepool { (index, try AdaptivePalette.indexed(image,quality:quality,stable:batchPalette)) } }
                             }
                             while next < min(workers, batch.count) { submit(next); next += 1 }
                             while let value = try await group.next() {
@@ -451,7 +585,7 @@ enum AnimationPipeline {
                         }
                     } else if let continuous {
                         for (index, image) in batch.enumerated() {
-                            try continuous.add(image, timestamp: plan.frames[position + index].start - continuousOrigin, quality: quality, threads: resources.workers)
+                            try continuous.add(image, timestamp: plan.frames[position + index].start - continuousOrigin, quality: quality, threads: resources.workers, effort: webpEffort)
                         }
                     } else if let mux {
                         let base = position
@@ -467,7 +601,7 @@ enum AnimationPipeline {
                                     let writer = try WebPAnimationWriter(width: width, height: height)
                                     let origin = timing[0].start
                                     for (i, image) in chunk.enumerated() {
-                                        try writer.add(image, timestamp: timing[i].start - origin, quality: quality, threads: encoderThreads)
+                                        try writer.add(image, timestamp: timing[i].start - origin, quality: quality, threads: encoderThreads, effort: webpEffort)
                                     }
                                     let duration = timing.last!.end - origin
                                     return (offset, try writer.finish(at: duration), duration)
@@ -626,7 +760,7 @@ enum AnimationPipeline {
     /// permission to drop frames or conceal a size reduction.
     static func verifyQuality(_ encoded:AnimationEncoding,asset:AVAsset,start:Double,fps:Double,dimension:Int,
         extractionSize:CGSize,crop:VideoCrop,plan:AnimationPlan,format:AnimationFormat,automatic:Bool) async throws -> String {
-        guard let source=CGImageSourceCreateWithData(encoded.bytes as CFData,nil) else { throw EngineError.quality("움짤 화질 검사 디코딩 실패") }
+        let decoder=try AnimationDecodedFrames(encoded,format:format)
         let reference=AnimationFrameReader(asset:asset,start:start,fps:fps,dimension:dimension,maximumSize:extractionSize,crop:crop)
         let meanFloor:Double = format == .gif ? (automatic ? 30:27):(automatic ? 36:32)
         let frameFloor=meanFloor-4
@@ -635,7 +769,7 @@ enum AnimationPipeline {
             try Task.checkCancellation()
             let original=try await reference.read(plan.frames[index..<(index+1)])[0]
             let metrics=try autoreleasepool { () throws -> PixelMetrics in
-                guard let decoded=CGImageSourceCreateImageAtIndex(source,index,nil) else { throw EngineError.quality("움짤 화질 검사 프레임 읽기 실패") }
+                let decoded=try decoder.image(index)
                 guard format != .gif || [.none,.noneSkipLast,.noneSkipFirst].contains(decoded.alphaInfo) else {
                     throw EngineError.quality("GIF 프레임의 불투명도 보존 검사 실패")
                 }
@@ -685,6 +819,10 @@ enum AnimationPipeline {
             let unclamped = format == .gif ? kCGImagePropertyGIFUnclampedDelayTime : kCGImagePropertyWebPUnclampedDelayTime
             let fallback = format == .gif ? kCGImagePropertyGIFDelayTime : kCGImagePropertyWebPDelayTime
             guard let delay = dictionary?[unclamped] as? Double ?? dictionary?[fallback] as? Double, delay.isFinite, delay > 0 else { throw EngineError.quality("애니메이션 프레임 시간 검사 실패") }
+            if !singleWebPHold {
+                let expected=Double(plan.frames[index].end-plan.frames[index].start)/Double(plan.scale)
+                guard abs(delay-expected)<0.0001 else { throw EngineError.quality("애니메이션 개별 프레임 시간 검사 실패") }
+            }
             duration += delay
         }
         guard abs(duration - plan.duration) < 0.0025 else { throw EngineError.quality("애니메이션 재생 길이 검사 실패") }

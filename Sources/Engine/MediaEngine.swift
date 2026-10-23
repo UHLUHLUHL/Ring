@@ -105,7 +105,14 @@ enum MediaEngine {
         let maximumRate=automatic ? Int(min(Double(Int32.max),max(100000,budget*1.05))):Int(Int32.max)
         var bestQuality:VideoQualityReport?,bestBytes=0,attempts=0
         let fps=info.frameRate.isFinite && info.frameRate>0 ? info.frameRate:30
-        let initial=automatic ? Double(width)*Double(height)*fps*(codec == .hevc ? 0.06:0.10):budget
+        let pixelRate=Double(width)*Double(height)*fps*(codec == .hevc ? 0.06:0.10)
+        let sourceType=try await track.load(.formatDescriptions).first.map(CMFormatDescriptionGetMediaSubType)
+        // A high-rate HEVC camera source was repeatedly starting far below
+        // the measured fidelity boundary. Use its actual byte budget to seed
+        // the search closer, then keep the same measured bracket and full-file
+        // quality gates. This is a request hint, never a quality prediction.
+        let cameraSeed=originalGeometry && sourceType==kCMVideoCodecType_HEVC ? budget*(codec == .hevc ? 0.55:0.75):0
+        let initial=automatic ? max(pixelRate,cameraSeed):budget
         var rate=Int(max(100000,min(Double(maximumRate),budget,initial)))
         let progress=EngineProgress.handler
         var calibration=VideoRateCalibration(rate:rate,samples:[],constrained:true)

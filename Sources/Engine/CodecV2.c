@@ -191,10 +191,13 @@ void *ring_webp_animation_create(int width,int height) {
     return WebPAnimEncoderNew(width,height,&options);
 }
 int ring_webp_animation_add(void *animation,const uint8_t *rgba,int width,int height,int timestamp,int quality,int threads) {
+    return ring_webp_animation_add_tuned(animation,rgba,width,height,timestamp,quality,threads,4);
+}
+int ring_webp_animation_add_tuned(void *animation,const uint8_t *rgba,int width,int height,int timestamp,int quality,int threads,int effort) {
     WebPPicture picture;WebPConfig config;
-    if(!animation || !WebPPictureInit(&picture)||!WebPConfigInit(&config)) return 0;
+    if(!animation || effort<0 || effort>6 || !WebPPictureInit(&picture)||!WebPConfigInit(&config)) return 0;
     picture.width=width;picture.height=height;picture.use_argb=1;
-    config.quality=quality;config.method=4;config.thread_level=threads>1;config.use_sharp_yuv=1;
+    config.quality=quality;config.method=effort;config.thread_level=threads>1;config.use_sharp_yuv=1;
     if(quality==100){config.lossless=1;config.exact=1;config.quality=75;}
     int ok=WebPPictureImportRGBA(&picture,rgba,width*4) && WebPAnimEncoderAdd(animation,&picture,timestamp,&config);
     WebPPictureFree(&picture);return ok;
@@ -207,6 +210,23 @@ int ring_webp_animation_finish(void *animation,int timestamp,uint8_t **output,si
     WebPDataClear(&data);return *output!=NULL;
 }
 void ring_webp_animation_destroy(void *animation) { if(animation) WebPAnimEncoderDelete(animation); }
+
+// Cheap independent-frame probes select quality before the full animation.
+// The final encoder still preserves animated delta/blend opportunities.
+int ring_webp_frame_encode(const uint8_t *rgba,int width,int height,int quality,int threads,int effort,uint8_t **output,size_t *size) {
+    WebPPicture picture;WebPConfig config;WebPMemoryWriter writer;
+    *output=NULL;*size=0;
+    if(!rgba || width<1 || height<1 || quality<0 || quality>100 || effort<0 || effort>6 ||
+       !WebPPictureInit(&picture) || !WebPConfigInit(&config)) return 0;
+    WebPMemoryWriterInit(&writer);
+    picture.width=width;picture.height=height;picture.use_argb=1;
+    picture.writer=WebPMemoryWrite;picture.custom_ptr=&writer;
+    config.quality=quality;config.method=effort;config.thread_level=threads>1;config.use_sharp_yuv=1;
+    if(quality==100){config.lossless=1;config.exact=1;config.quality=75;}
+    int ok=WebPPictureImportRGBA(&picture,rgba,width*4) && WebPEncode(&config,&picture);
+    if(ok){*output=malloc(writer.size);ok=*output!=NULL;if(ok){memcpy(*output,writer.mem,writer.size);*size=writer.size;}}
+    WebPPictureFree(&picture);WebPMemoryWriterClear(&writer);return ok;
+}
 
 void *ring_webp_mux_create(int width,int height) {
     WebPMux *mux=WebPMuxNew();
@@ -395,6 +415,32 @@ int ring_inflate_raw(const uint8_t *source,size_t size,uint8_t *output,size_t ou
     int rc=inflate(&stream,Z_FINISH);
     int ok=rc==Z_STREAM_END && stream.total_in==size && stream.total_out==output_size;
     inflateEnd(&stream);return ok;
+}
+
+int ring_palette_lookup(const uint8_t *palette,int colors,uint8_t *lookup) {
+    if(!palette || !lookup || colors<1 || colors>255) return 0;
+    for(int key=0;key<32768;key++) {
+        int r=((key>>10)&31)*8+4,g=((key>>5)&31)*8+4,b=(key&31)*8+4,best=0,distance=INT_MAX;
+        for(int i=0;i<colors;i++) {
+            int dr=r-palette[i*3],dg=g-palette[i*3+1],db=b-palette[i*3+2],d=dr*dr+dg*dg+db*db;
+            if(d<distance){distance=d;best=i;}
+        }
+        lookup[key]=(uint8_t)best;
+    }
+    return 1;
+}
+int ring_palette_map(const uint8_t *rgba,int width,int height,int first_row,int rows,const uint8_t *lookup,uint8_t *pixels) {
+    if(!rgba || !lookup || !pixels || width<1 || height<1 || first_row<0 || rows<1 || first_row>height-rows) return 0;
+    // Small, spatially fixed perturbations avoid recursive error-diffusion
+    // trails. The same RGB at the same location maps identically in all frames.
+    const int offsets[4]={-2,1,2,-1};
+    for(int y=first_row;y<first_row+rows;y++) for(int x=0;x<width;x++) {
+        size_t p=(size_t)y*width+x;int d=offsets[(y&1)*2+(x&1)];
+        int r=rgba[p*4]+d,g=rgba[p*4+1]+d,b=rgba[p*4+2]+d;
+        r=r<0?0:r>255?255:r;g=g<0?0:g>255?255:g;b=b<0?0:b>255?255:b;
+        pixels[p]=lookup[(r>>3)<<10 | (g>>3)<<5 | (b>>3)];
+    }
+    return 1;
 }
 
 // Four palette candidates per SIMD operation on both Apple Silicon and Intel.

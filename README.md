@@ -6,7 +6,7 @@
 
 파일 우클릭으로 여는 가벼운 macOS 변환·편집 앱
 
-<a href="https://github.com/UHLUHLUHL/Ring/releases/download/v0.2.28/Ring.dmg"><img src="docs/download-macos.svg" height="60" alt="macOS용 Ring 다운로드"></a>
+<a href="https://github.com/UHLUHLUHL/Ring/releases/download/v0.2.29/Ring.dmg"><img src="docs/download-macos.svg" height="60" alt="macOS용 Ring 다운로드"></a>
 
 [![최신 버전](https://img.shields.io/github/v/release/UHLUHLUHL/Ring?label=%EC%B5%9C%EC%8B%A0%20%EB%B2%84%EC%A0%84&color=5b5b66)](https://github.com/UHLUHLUHL/Ring/releases/latest)
 ![macOS 26+](https://img.shields.io/badge/macOS-26%2B-5b5b66?logo=apple&logoColor=white)

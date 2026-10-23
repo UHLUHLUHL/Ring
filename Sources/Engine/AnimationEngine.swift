@@ -56,10 +56,13 @@ extension MediaEngine {
         resources.enter(); defer { resources.leave() }
         // Preserve the selected raster and every planned picture. A byte cap
         // only changes codec quality/palette depth, never dimensions or FPS.
-        let qualities = options.targetBytes == nil ? (options.format == .webp ? [96,100]:[96]) : (options.format == .gif ? [96,84,72] : [96,80,64,32,0])
+        let qualities = options.targetBytes == nil ? (options.format == .webp ? [88,100]:[96]) : (options.format == .gif ? [96,84,72] : [96,80,64,32,0])
         var first = 0
         var selectedQuality:Int?
-        if let target=options.targetBytes,initial.frames.count>=48 {
+        if options.format == .webp {
+            selectedQuality=try await AnimationPipeline.webPQuality(asset:asset,start:options.start,fps:fps,
+                dimension:dimension,extractionSize:extractionSize(for:dimension),crop:options.crop,plan:initial,targetBytes:options.targetBytes)
+        } else if let target=options.targetBytes,initial.frames.count>=48 {
             var previous:(quality:Int,bytes:Double)?
             for index in qualities.indices {
                 let sample=initial.sample
@@ -81,7 +84,7 @@ extension MediaEngine {
                 previous=(qualities[index],estimate)
             }
         }
-        var candidates=Array(qualities.dropFirst(first)),attempts=0
+        var candidates=Array(qualities.dropFirst(first)),attempts=0,stableGIF=true
         if let selectedQuality { candidates[0]=selectedQuality }
         let maximumAttempts=options.format == .gif ? 3:2
         while !candidates.isEmpty,attempts<maximumAttempts {
@@ -89,7 +92,7 @@ extension MediaEngine {
             try Task.checkCancellation()
             let encoded=try await AnimationPipeline.encode(asset:asset,start:options.start,fps:fps,dimension:dimension,
                 extractionSize:extractionSize(for:dimension),crop:options.crop,plan:initial,format:options.format,
-                quality:quality,allowParallelWebP:true,maximumBytes:nil) { EngineProgress.report(0.10+0.70*$0) }
+                quality:quality,allowParallelWebP:true,maximumBytes:nil,webpEffort:2,stableGIF:stableGIF) { EngineProgress.report(0.10+0.70*$0) }
             lastSize=encoded.bytes.count
             if let target=options.targetBytes,Int64(lastSize)>target {
                 if options.format == .webp,quality>0 {
@@ -109,7 +112,12 @@ extension MediaEngine {
                     plan:initial,format:options.format,automatic:options.targetBytes == nil)
             } catch is AnimationQualityFailure where options.targetBytes == nil && options.format == .webp && quality<100 {
                 // Saturated fine detail can exceed VP8's chroma-subsampling
-                // error budget even at q96. Retry losslessly, not below the gate.
+                // error budget even at high quality. Retry losslessly, not below the gate.
+                continue
+            } catch is AnimationQualityFailure where options.format == .gif && stableGIF {
+                // A scene outside the representative palette gets the full
+                // per-frame palette path, still inside the bounded attempts.
+                stableGIF=false;candidates.insert(quality,at:0)
                 continue
             }
             try Task.checkCancellation()
@@ -177,21 +185,18 @@ enum AdaptivePalette {
         var r:Int=0,g:Int=0,b:Int=0,count:Int=0
         @inline(__always) func component(_ channel:Int)->Int { channel==0 ? r:(channel==1 ? g:b) }
     }
-    static func indexed(_ image:CGImage,quality:Int = 96) throws -> CGImage {
-        let rgba=try sRGB(image),width=image.width,height=image.height
+    static func palette(_ images:[CGImage],quality:Int = 96) throws -> Data {
         var histogram=[Color](repeating:Color(),count:32768)
-        rgba.withUnsafeBytes { raw in
-            let ptr = raw.bindMemory(to: UInt8.self).baseAddress!
-            let total = width * height * 4
-            var p = 0
-            while p < total {
-                let r = Int(ptr[p]), g = Int(ptr[p+1]), b = Int(ptr[p+2])
-                let key = (r >> 3) << 10 | (g >> 3) << 5 | (b >> 3)
-                histogram[key].r += r
-                histogram[key].g += g
-                histogram[key].b += b
-                histogram[key].count += 1
-                p += 4
+        for image in images {
+            try Task.checkCancellation()
+            let rgba=try sRGB(image)
+            rgba.withUnsafeBytes { raw in
+                let ptr=raw.bindMemory(to:UInt8.self).baseAddress!
+                for p in stride(from:0,to:rgba.count,by:4) {
+                    let r=Int(ptr[p]),g=Int(ptr[p+1]),b=Int(ptr[p+2])
+                    let key=(r>>3)<<10 | (g>>3)<<5 | (b>>3)
+                    histogram[key].r+=r;histogram[key].g+=g;histogram[key].b+=b;histogram[key].count+=1
+                }
             }
         }
         var colors:[Color]=[]
@@ -241,19 +246,50 @@ enum AdaptivePalette {
         }
         var lookup=Data( capacity: palette.count * 3 )
         for color in palette { lookup.append(contentsOf:[UInt8(color.r),UInt8(color.g),UInt8(color.b)]) }
-        var cache=[Int16](repeating:-1,count:32768),pixels=Data(count:width*height)
-        var errors=[Float](repeating:0,count:(width+2)*3*2)
-        try rgba.withUnsafeBytes { input in
-            try pixels.withUnsafeMutableBytes { output in
-                try lookup.withUnsafeBytes { palette in
-                    try cache.withUnsafeMutableBufferPointer { cache in
-                        try errors.withUnsafeMutableBufferPointer { errors in
-                            for row in stride(from:0,to:height,by:32) {
-                                try Task.checkCancellation()
-                                guard ring_palette_dither(input.bindMemory(to:UInt8.self).baseAddress!,Int32(width),Int32(height),
-                                    Int32(row),Int32(min(32,height-row)),palette.bindMemory(to:UInt8.self).baseAddress!,Int32(buckets.count),
-                                    output.bindMemory(to:UInt8.self).baseAddress!,cache.baseAddress!,errors.baseAddress!) == 1 else {
-                                    throw EngineError.io("팔레트 픽셀 변환 실패")
+        return lookup
+    }
+
+    struct StablePalette {
+        let colors:Data
+        let lookup:Data
+        init(images:[CGImage],quality:Int) throws {
+            let colors=try AdaptivePalette.palette(images,quality:quality)
+            var table=Data(count:32768)
+            let ok=colors.withUnsafeBytes { palette in table.withUnsafeMutableBytes { output in
+                ring_palette_lookup(palette.bindMemory(to:UInt8.self).baseAddress!,Int32(colors.count/3),output.bindMemory(to:UInt8.self).baseAddress!)
+            } }
+            guard ok==1 else { throw EngineError.io("GIF 공통 팔레트 생성 실패") }
+            self.colors=colors;lookup=table
+        }
+    }
+    static func indexed(_ image:CGImage,quality:Int = 96,stable:StablePalette? = nil) throws -> CGImage {
+        let rgba=try sRGB(image),width=image.width,height=image.height
+        let lookup=try stable?.colors ?? palette([image],quality:quality)
+        var pixels=Data(count:width*height)
+        if let stable {
+            try rgba.withUnsafeBytes { input in try pixels.withUnsafeMutableBytes { output in
+                try stable.lookup.withUnsafeBytes { table in
+                    for row in stride(from:0,to:height,by:32) {
+                        try Task.checkCancellation()
+                        guard ring_palette_map(input.bindMemory(to:UInt8.self).baseAddress!,Int32(width),Int32(height),Int32(row),Int32(min(32,height-row)),table.bindMemory(to:UInt8.self).baseAddress!,output.bindMemory(to:UInt8.self).baseAddress!)==1 else {throw EngineError.io("GIF 픽셀 변환 실패")}
+                    }
+                }
+            } }
+        } else {
+            var cache=[Int16](repeating:-1,count:32768)
+            var errors=[Float](repeating:0,count:(width+2)*3*2)
+            try rgba.withUnsafeBytes { input in
+                try pixels.withUnsafeMutableBytes { output in
+                    try lookup.withUnsafeBytes { palette in
+                        try cache.withUnsafeMutableBufferPointer { cache in
+                            try errors.withUnsafeMutableBufferPointer { errors in
+                                for row in stride(from:0,to:height,by:32) {
+                                    try Task.checkCancellation()
+                                    guard ring_palette_dither(input.bindMemory(to:UInt8.self).baseAddress!,Int32(width),Int32(height),
+                                        Int32(row),Int32(min(32,height-row)),palette.bindMemory(to:UInt8.self).baseAddress!,Int32(lookup.count/3),
+                                        output.bindMemory(to:UInt8.self).baseAddress!,cache.baseAddress!,errors.baseAddress!) == 1 else {
+                                        throw EngineError.io("팔레트 픽셀 변환 실패")
+                                    }
                                 }
                             }
                         }
@@ -261,7 +297,7 @@ enum AdaptivePalette {
                 }
             }
         }
-        let space=lookup.withUnsafeBytes { CGColorSpace(indexedBaseSpace:sRGBSpace,last:palette.count-1,colorTable:$0.bindMemory(to:UInt8.self).baseAddress!) }
+        let space=lookup.withUnsafeBytes { CGColorSpace(indexedBaseSpace:sRGBSpace,last:lookup.count/3-1,colorTable:$0.bindMemory(to:UInt8.self).baseAddress!) }
         guard let space,let provider=CGDataProvider(data:pixels as CFData),let result=CGImage(width:width,height:height,bitsPerComponent:8,bitsPerPixel:8,bytesPerRow:width,space:space,bitmapInfo:CGBitmapInfo(rawValue:CGImageAlphaInfo.none.rawValue),provider:provider,decode:nil,shouldInterpolate:false,intent:.defaultIntent) else { throw EngineError.io("팔레트 이미지 생성 실패") }
         return result
     }

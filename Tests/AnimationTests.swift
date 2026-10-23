@@ -133,6 +133,24 @@ import CryptoKit
         try require(try AdaptivePalette.sRGB(CGImageSourceCreateImageAtIndex(decoded,1,nil)!) == AdaptivePalette.sRGB(CGImageSourceCreateImageAtIndex(expected,0,nil)!),"GIF delta final scanline changed")
         print("PASS GIF delta odd-width crop retains the final row and column exactly")
     }
+    static func stablePaletteMapping() throws {
+        let width=37,height=45,total=width*height
+        var rgba:[UInt8]=(0..<(total*4)).map { (i:Int)->UInt8 in let value=i*73+i/11;return UInt8(value%256) }
+        let palette:[UInt8]=[0,0,0,255,255,255,255,0,0,0,255,0,0,0,255]
+        var lookup=[UInt8](repeating:0,count:32768)
+        try require(ring_palette_lookup(palette,5,&lookup)==1,"shared palette lookup")
+        var whole=[UInt8](repeating:0,count:total),banded=whole,changed=whole
+        try require(ring_palette_map(rgba,Int32(width),Int32(height),0,Int32(height),lookup,&whole)==1,"shared palette map")
+        for row in stride(from:0,to:height,by:32) {
+            try require(ring_palette_map(rgba,Int32(width),Int32(height),Int32(row),Int32(min(32,height-row)),lookup,&banded)==1,"shared palette band")
+        }
+        try require(whole==banded && whole.allSatisfy{$0<5},"shared palette band boundaries")
+        let edited=total/2
+        rgba[edited*4]=255;rgba[edited*4+1]=0;rgba[edited*4+2]=0
+        try require(ring_palette_map(rgba,Int32(width),Int32(height),0,Int32(height),lookup,&changed)==1,"shared palette edited frame")
+        try require((0..<total).allSatisfy{$0==edited || whole[$0]==changed[$0]},"one changed pixel affected other GIF pixels")
+        print("PASS stable palette retains untouched pixels across frames and row bands")
+    }
     static func webPHoldTiming() throws {
         let width=32,height=24
         var rgba=Data(count:width*height*4)
@@ -164,6 +182,12 @@ import CryptoKit
             let delay=webp[kCGImagePropertyWebPUnclampedDelayTime] as! Double
             try require(abs(delay-Double(delays[i])/1000)<0.00001,"WebP hold time changed")
         }
+        let encoded=AnimationEncoding(bytes:data,width:width,height:height,parallelWebP:false)
+        try AnimationPipeline.verify(encoded,plan:AnimationPlan(sourceOffsets:[0,0.005,0.038],duration:0.042,format:.webp),format:.webp)
+        var rejected=false
+        do { try AnimationPipeline.verify(encoded,plan:AnimationPlan(sourceOffsets:[0,0.006,0.038],duration:0.042,format:.webp),format:.webp) }
+        catch { rejected=true }
+        try require(rejected,"same total duration hid an individual frame timing mismatch")
         print("PASS WebP merged-frame holds preserve each delay, count and exact decoded canvas")
     }
     static func timing() throws {
@@ -226,6 +250,7 @@ import CryptoKit
         do {
             try timing()
             try paletteSIMD()
+            try stablePaletteMapping()
             try gifDeltaEdges()
             try webPHoldTiming()
             if CommandLine.arguments.contains("--palette") { return }
@@ -272,7 +297,12 @@ import CryptoKit
             try inspect(frozen.url, expectedDuration: 1, frames:60)
             let frozenGIF = try await RingEngine.shared.run(.init(source: still, operation: .video(.animation(.init(format: .gif, fps: 30, maxDimension: 160, duration: 1)))))
             try inspect(frozenGIF.url,expectedDuration:1,frames:30,width:160,height:90)
-            let frozenFrames=CGImageSourceCreateWithURL(frozenGIF.url as CFURL,nil)!
+            // Also exercise the per-frame palette fallback independently: its
+            // cropped delta canvas must match separately encoded whole frames.
+            let legacyFrozen=try await AnimationPipeline.encode(asset:AVURLAsset(url:still),start:0,fps:30,dimension:160,
+                extractionSize:CGSize(width:320,height:320),plan:AnimationPlan(duration:1,fps:30,format:.gif),format:.gif,
+                quality:96,allowParallelWebP:false,stableGIF:false) {_ in}
+            let frozenFrames=CGImageSourceCreateWithData(legacyFrozen.bytes as CFData,nil)!
             let frozenReference=AVAssetImageGenerator(asset:AVURLAsset(url:still))
             frozenReference.maximumSize=CGSize(width:320,height:320)
             frozenReference.requestedTimeToleranceBefore = .zero;frozenReference.requestedTimeToleranceAfter = .zero
@@ -307,7 +337,7 @@ import CryptoKit
             for (source, expectedMotion) in [(moving, true), (subtle, false)] {
                 let plan = AnimationPlan(duration: 2, fps: 30, format: .webp)
                 let encoded = try await AnimationPipeline.encode(asset: AVURLAsset(url: source), start: 0, fps: 30, dimension: 160, plan: plan, format: .webp, quality: 90, allowParallelWebP: true) { _ in }
-                if AnimationResources.shared.workers > 1 { try require(encoded.parallelWebP == expectedMotion, "adaptive motion path") }
+                if AnimationResources.shared.workers > 1 { try require(encoded.parallelWebP == expectedMotion, "adaptive motion path: expected \(expectedMotion), got \(encoded.parallelWebP)") }
                 try AnimationPipeline.verify(encoded, plan: plan, format: .webp)
                 let url = root.appendingPathComponent(expectedMotion ? "parallel.webp" : "delta.webp")
                 try encoded.bytes.write(to: url); try inspect(url, expectedDuration: 2)
