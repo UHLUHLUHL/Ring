@@ -14,8 +14,6 @@
 
 </div>
 
-<p align="center">파일을 우클릭하고 링에서 형식을 고르면 같은 폴더에 새 파일로 저장돼요.</p>
-
 이 배포본은 FFmpeg의 GPL 구성과 x264·x265를 정적으로 포함합니다. Ring은 [GPLv2](LICENSE)로 배포하며, 완전한 대응 소스 묶음은 각 릴리즈의 `Ring-버전-source.tar.gz`에, 제3자 라이선스 고지는 앱의 `Resources/Licenses`에 있습니다.
 
 1. DMG를 열고 **Ring을 Applications로 드래그**하세요.
