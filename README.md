@@ -1,10 +1,18 @@
+<div align="center">
+
+<img src="docs/icon.png" width="160" alt="Ring 앱 아이콘">
+
 # Ring
 
-파일 우클릭으로 여는 가벼운 macOS 변환·편집 앱.
+파일 우클릭으로 여는 가벼운 macOS 변환·편집 앱
 
-## [⬇️ Ring 0.2.24 다운로드](https://github.com/UHLUHLUHL/Ring/releases/download/v0.2.24/Ring.dmg)
+<a href="https://github.com/UHLUHLUHL/Ring/releases/latest/download/Ring.dmg"><img src="https://img.shields.io/badge/Download_for_macOS-000000?style=for-the-badge&logo=apple&logoColor=white" height="44" alt="macOS용 Ring 다운로드"></a>
 
-macOS 26 이상 · Apple Silicon / Intel
+[![최신 버전](https://img.shields.io/github/v/release/UHLUHLUHL/Ring?label=%EC%B5%9C%EC%8B%A0%20%EB%B2%84%EC%A0%84&color=5b5b66)](https://github.com/UHLUHLUHL/Ring/releases/latest)
+![macOS 26+](https://img.shields.io/badge/macOS-26%2B-5b5b66?logo=apple&logoColor=white)
+![Apple Silicon · Intel](https://img.shields.io/badge/Apple_Silicon_·_Intel-5b5b66)
+
+</div>
 
 1. DMG를 열고 **Ring을 Applications로 드래그**하세요.
 2. Ring을 실행하고 **Finder 확장**을 켜세요.
