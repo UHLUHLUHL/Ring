@@ -35,8 +35,8 @@ extension MediaEngine {
         }
         let resources = AnimationResources.shared
         let fps = options.fps
-        var dimension = options.maxDimension, lastSize = 0
-        var previousSize: (pixels: Int, bytes: Int)?
+        let dimension = options.maxDimension
+        var lastSize = 0
         let initial = options.preserveSourceTiming
             ? try await AnimationPlan.source(asset:asset,start:options.start,duration:duration,fps:fps,format:options.format)
             : AnimationPlan(duration:duration,fps:fps,format:options.format)
@@ -54,56 +54,69 @@ extension MediaEngine {
             return "\(options.format.rawValue.uppercased()) 무손실 움짤 · \(encoded.width)×\(encoded.height) · \(initial.frames.count)프레임 · 픽셀·타이밍 검증"
         }
         resources.enter(); defer { resources.leave() }
-        if let target = options.targetBytes, initial.frames.count >= 48,
-           target < Int64(initial.frames.count) * Int64(dimension * dimension) * 2 {
-            let sample = initial.sample
-            let encoded = try await AnimationPipeline.encode(asset: asset, start: options.start, fps: fps, dimension: dimension,
-                extractionSize:extractionSize(for:dimension),crop: options.crop, plan: sample, format: options.format, quality: 90, allowParallelWebP: true) { EngineProgress.report(0.03 + 0.07 * $0) }
-            let estimate = Double(encoded.bytes.count) * Double(initial.frames.count) / Double(sample.frames.count) * 1.03
-            if estimate > Double(target) {
-                let ratio = max(0.1, min(0.98, sqrt(Double(target) / estimate) * 0.98))
-                dimension = max(min(16,dimension), Int(Double(dimension) * ratio))
-            }
-        }
-        for _ in 0..<4 {
-            try Task.checkCancellation()
-            let plan = initial
-            let encoded = try await AnimationPipeline.encode(asset: asset, start: options.start, fps: fps, dimension: dimension,
-                extractionSize:extractionSize(for:dimension),crop: options.crop, plan: plan, format: options.format, quality: 90, allowParallelWebP: true,
-                maximumBytes: nil) {
-                    EngineProgress.report(0.10 + 0.80 * $0)
+        // Preserve the selected raster and every planned picture. A byte cap
+        // only changes codec quality/palette depth, never dimensions or FPS.
+        let qualities = options.targetBytes == nil ? (options.format == .webp ? [96,100]:[96]) : (options.format == .gif ? [96,84,72] : [96,80,64,32,0])
+        var first = 0
+        var selectedQuality:Int?
+        if let target=options.targetBytes,initial.frames.count>=48 {
+            var previous:(quality:Int,bytes:Double)?
+            for index in qualities.indices {
+                let sample=initial.sample
+                let trial=try await AnimationPipeline.encode(asset:asset,start:options.start,fps:fps,dimension:dimension,
+                    extractionSize:extractionSize(for:dimension),crop:options.crop,plan:sample,format:options.format,
+                    quality:qualities[index],allowParallelWebP:true) { EngineProgress.report(0.03+0.07*$0) }
+                first=index
+                let estimate=Double(trial.bytes.count)*Double(initial.frames.count)/Double(sample.frames.count)*1.03
+                if estimate<=Double(target)*0.97 {
+                    if options.format == .webp,let previous,previous.bytes>estimate {
+                        // Interpolate an actually measured size bracket. This
+                        // selects a request only; full output bytes/pixels still
+                        // decide whether it can be saved.
+                        let fraction=max(0,min(1,log(Double(target)*0.94/estimate)/log(previous.bytes/estimate)))
+                        selectedQuality=Int(floor(Double(qualities[index])+Double(previous.quality-qualities[index])*fraction))
+                    }
+                    break
                 }
-            EngineProgress.report(0.92)
-            lastSize = encoded.bytes.count
-            if options.targetBytes == nil || Int64(lastSize) <= options.targetBytes! {
-                try AnimationPipeline.verify(encoded, plan: plan, format: options.format)
-                try Task.checkCancellation()
-                EngineProgress.report(0.94)
-                try encoded.bytes.write(to: output)
-                return "\(options.format.rawValue.uppercased()) · \(encoded.width)×\(encoded.height) · \(AnimationOptions.frameRateText(fps))fps · \(lastSize)바이트" + (options.format == .gif ? " · 적응형 255색·오차 확산 디더링" : "")
+                previous=(qualities[index],estimate)
             }
-            let excess = Double(options.targetBytes!) / Double(max(1, lastSize))
-            // Keep the requested cadence and q90 profile throughout the
-            // search. Correct spatial size using actual encoded bytes, rather
-            // than simultaneously changing FPS, quality and resolution.
-            var ratio = sqrt(excess)
-            let pixels = encoded.width*encoded.height
-            if let previous=previousSize,previous.pixels>pixels,previous.bytes>lastSize {
-                // Fit bytes = pixelCost * pixels + fixedCost from two actual
-                // encodes. Palettes/headers otherwise make sqrt(target/bytes)
-                // converge very slowly near small GIF/WebP byte limits.
-                let cost=Double(previous.bytes-lastSize)/Double(previous.pixels-pixels)
-                let overhead=max(0,Double(lastSize)-cost*Double(pixels))
-                let projected=max(1,(Double(options.targetBytes!)-overhead)/cost)
-                ratio=min(ratio,max(0.35,sqrt(projected/Double(pixels))))
-            }
-            previousSize=(pixels,lastSize)
-            let next = max(min(16, dimension), Int(Double(max(encoded.width,encoded.height)) * min(0.98, ratio * 0.96)))
-            if next >= dimension { break }
-            dimension = next
-            EngineProgress.report(0.10)
         }
-        throw EngineError.quality("지정한 FPS와 인코딩 품질 설정으로 목표 용량을 맞추지 못했어요 (\(lastSize)바이트). 목표를 높여 주세요.")
+        var candidates=Array(qualities.dropFirst(first)),attempts=0
+        if let selectedQuality { candidates[0]=selectedQuality }
+        let maximumAttempts=options.format == .gif ? 3:2
+        while !candidates.isEmpty,attempts<maximumAttempts {
+            let quality=candidates.removeFirst();attempts+=1
+            try Task.checkCancellation()
+            let encoded=try await AnimationPipeline.encode(asset:asset,start:options.start,fps:fps,dimension:dimension,
+                extractionSize:extractionSize(for:dimension),crop:options.crop,plan:initial,format:options.format,
+                quality:quality,allowParallelWebP:true,maximumBytes:nil) { EngineProgress.report(0.10+0.70*$0) }
+            lastSize=encoded.bytes.count
+            if let target=options.targetBytes,Int64(lastSize)>target {
+                if options.format == .webp,quality>0 {
+                    // A small cap miss should not jump straight from q96 to
+                    // q88 and waste half the available bytes. This chooses a
+                    // request only; actual bytes and all frames decide the pass.
+                    let step=max(1,Int(ceil((quality>80 ? 8:16)*log2(Double(lastSize)/Double(target)))))
+                    candidates=[max(0,quality-step)]
+                }
+                continue
+            }
+            try AnimationPipeline.verify(encoded,plan:initial,format:options.format)
+            let measured:String
+            do {
+                measured=try await AnimationPipeline.verifyQuality(encoded,asset:asset,start:options.start,fps:fps,
+                    dimension:dimension,extractionSize:extractionSize(for:dimension),crop:options.crop,
+                    plan:initial,format:options.format,automatic:options.targetBytes == nil)
+            } catch is AnimationQualityFailure where options.targetBytes == nil && options.format == .webp && quality<100 {
+                // Saturated fine detail can exceed VP8's chroma-subsampling
+                // error budget even at q96. Retry losslessly, not below the gate.
+                continue
+            }
+            try Task.checkCancellation()
+            try encoded.bytes.write(to:output)
+            return "\(options.format.rawValue.uppercased()) · \(encoded.width)×\(encoded.height) · \(AnimationOptions.frameRateText(fps))fps · \(lastSize)바이트 · \(measured)"
+        }
+        throw EngineError.quality("선택한 해상도·프레임과 화질 하한을 유지하면서 목표 용량에 맞는 결과를 찾지 못했어요 (\(lastSize)바이트). 목표를 높이거나 비워 주세요.")
     }
 
     /// Measured encode of twelve frames in three windows, at the requested
@@ -128,7 +141,7 @@ extension MediaEngine {
         let sample=plan.sample
         let encoded=try await AnimationPipeline.encode(asset:asset,start:options.start,fps:options.fps,dimension:options.maxDimension,
             extractionSize:VideoCropGeometry.extractionSize(width:abs(shown.width),height:abs(shown.height),crop:options.crop,maxDimension:options.maxDimension),
-            crop:options.crop,plan:sample,format:options.format,quality:90,allowParallelWebP:true) { _ in }
+            crop:options.crop,plan:sample,format:options.format,quality:96,allowParallelWebP:true) { _ in }
         return Int(Double(encoded.bytes.count)*Double(plan.frames.count)/Double(sample.frames.count)*1.03)
     }
 }
@@ -164,7 +177,7 @@ enum AdaptivePalette {
         var r:Int=0,g:Int=0,b:Int=0,count:Int=0
         @inline(__always) func component(_ channel:Int)->Int { channel==0 ? r:(channel==1 ? g:b) }
     }
-    static func indexed(_ image:CGImage) throws -> CGImage {
+    static func indexed(_ image:CGImage,quality:Int = 96) throws -> CGImage {
         let rgba=try sRGB(image),width=image.width,height=image.height
         var histogram=[Color](repeating:Color(),count:32768)
         rgba.withUnsafeBytes { raw in
@@ -207,8 +220,9 @@ enum AdaptivePalette {
         var buckets=[bucket(colors)]
         // ImageIO's GIF writer marks index 255 transparent on every frame, so
         // the palette stops at 255 colors and leaves that index unused.
-        buckets.reserveCapacity(255)
-        while buckets.count<255 {
+        let maximumColors=quality>=94 ? 255:(quality>=80 ? 192:128)
+        buckets.reserveCapacity(maximumColors)
+        while buckets.count<maximumColors {
             var bestIdx = -1, bestScore = -1
             for idx in buckets.indices where buckets[idx].colors.count > 1 {
                 if buckets[idx].score > bestScore { bestScore = buckets[idx].score; bestIdx = idx }

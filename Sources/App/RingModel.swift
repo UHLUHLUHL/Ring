@@ -283,7 +283,13 @@ final class RingModel: ObservableObject {
                 withAnimation(RingMotion.sCurve(RingMotion.fold)) { isWorking = false }
                 engineTask = nil
                 isCancelling = false
-                showToast("화질을 지키며 더 줄이기 어려워요 · 원본 유지", closeAfter: false)
+                showToast(outcome.reason, closeAfter: false)
+            } catch let outcome as VideoCompressionLimit {
+                DebugLog.write("job target not met \(outcome.targetBytes)")
+                withAnimation(RingMotion.sCurve(RingMotion.fold)) { isWorking = false }
+                engineTask = nil
+                isCancelling = false
+                showToast(outcome.localizedDescription, closeAfter: false)
             } catch {
                 DebugLog.write("job failed \(error)")
                 withAnimation(RingMotion.sCurve(RingMotion.fold)) { isWorking = false }

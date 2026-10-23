@@ -9,6 +9,7 @@
 #include <libavutil/display.h>
 #include <libavutil/sha.h>
 #include <libavutil/audio_fifo.h>
+#include <libavutil/mathematics.h>
 #include <libswscale/swscale.h>
 #include <libswresample/swresample.h>
 #include <stdio.h>
@@ -176,6 +177,14 @@ void ring_video_decoder_destroy(RingVideoDecoder *d){
     if(!d)return;avformat_close_input(&d->format);avcodec_free_context(&d->codec);av_packet_free(&d->packet);
     av_frame_free(&d->frame);av_frame_free(&d->planar);av_frame_free(&d->pending);sws_freeContext(d->scale);free(d);
 }
+int ring_video_same_timing(const RingSoftwareVideoFrame *a,const RingSoftwareVideoFrame *b){
+    if(!a||!b||a->time_base_num<=0||b->time_base_num<=0||a->time_base_den<=0||b->time_base_den<=0||
+       a->pts==AV_NOPTS_VALUE||b->pts==AV_NOPTS_VALUE||a->duration<=0||b->duration<=0||
+       a->pts>INT64_MAX-a->duration||b->pts>INT64_MAX-b->duration)return 0;
+    AVRational ta={a->time_base_num,a->time_base_den},tb={b->time_base_num,b->time_base_den},ns={1,1000000000};
+    return av_rescale_q(a->pts,ta,ns)==av_rescale_q(b->pts,tb,ns)&&
+           av_rescale_q(a->pts+a->duration,ta,ns)==av_rescale_q(b->pts+b->duration,tb,ns);
+}
 static void hash_timing(struct AVSHA *sha,int64_t pts,int64_t duration,AVRational tb){
     int64_t begin=pts==AV_NOPTS_VALUE?INT64_MIN:av_rescale_q(pts,tb,(AVRational){1,1000000000});
     int64_t end=pts==AV_NOPTS_VALUE?INT64_MIN:av_rescale_q(pts+duration,tb,(AVRational){1,1000000000});
@@ -231,14 +240,41 @@ int ring_video_inspect(const char *path,int decode_all,RingSoftwareVideoInfo *in
     if(r>=0){scan->interrupt_callback=(AVIOInterruptCB){interrupted,d};r=avformat_find_stream_info(scan,NULL);}
     if(r<0){status=avfail(error,2,"패킷 검증 실패",r);goto scanned;}
     double audio_end=-INFINITY,audio_start=INFINITY;
+    int pcm_frame_bytes=0;int64_t pcm_start=AV_NOPTS_VALUE,pcm_samples=0;
+    if(d->audio>=0){
+        AVStream *a=scan->streams[d->audio];AVCodecParameters *p=a->codecpar;
+        int bits=av_get_bits_per_sample(p->codec_id);
+        if(!strncmp(avcodec_get_name(p->codec_id),"pcm_",4)&&bits>0&&bits%8==0&&
+           a->time_base.num==1&&a->time_base.den==p->sample_rate)
+            pcm_frame_bytes=bits/8*p->ch_layout.nb_channels;
+    }
     while((r=av_read_frame(scan,pkt))>=0){
         if(stopped(d,error)){status=3;av_packet_unref(pkt);break;}
         if(pkt->flags&AV_PKT_FLAG_CORRUPT){status=fail(error,2,"손상된 패킷을 발견했어요.");av_packet_unref(pkt);break;}
         if(pkt->stream_index==d->video)info->video_bytes+=pkt->size;
-        if(pkt->stream_index==d->audio){info->audio_bytes+=pkt->size;if(pkt->pts!=AV_NOPTS_VALUE){AVStream *a=scan->streams[pkt->stream_index];double start=seconds(pkt->pts,a->time_base);audio_start=fmin(audio_start,start);audio_end=fmax(audio_end,start+seconds(pkt->duration,a->time_base));}av_sha_update(sha,pkt->data,pkt->size);hash_timing(audio_timing,pkt->pts,pkt->duration,scan->streams[pkt->stream_index]->time_base);}
+        if(pkt->stream_index==d->audio){
+            AVStream *a=scan->streams[pkt->stream_index];info->audio_bytes+=pkt->size;
+            if(pkt->pts!=AV_NOPTS_VALUE){double start=seconds(pkt->pts,a->time_base);audio_start=fmin(audio_start,start);audio_end=fmax(audio_end,start+seconds(pkt->duration,a->time_base));}
+            av_sha_update(sha,pkt->data,pkt->size);
+            if(pcm_frame_bytes){
+                // MOV/MP4 can regroup unchanged PCM into different packets.
+                // Hash continuous sample intervals, checking every packet's
+                // sample count and boundary, rather than its arbitrary grouping.
+                int64_t samples=pkt->size/pcm_frame_bytes;
+                if(pkt->pts==AV_NOPTS_VALUE||pkt->size%pcm_frame_bytes||samples<=0||pkt->duration!=samples){
+                    status=fail(error,2,"PCM 음성의 표본 시각·길이가 올바르지 않아요.");av_packet_unref(pkt);break;
+                }
+                if(pcm_start==AV_NOPTS_VALUE||pkt->pts!=pcm_start+pcm_samples){
+                    if(pcm_samples)hash_timing(audio_timing,pcm_start,pcm_samples,a->time_base);
+                    pcm_start=pkt->pts;pcm_samples=0;
+                }
+                pcm_samples+=samples;
+            }else hash_timing(audio_timing,pkt->pts,pkt->duration,a->time_base);
+        }
         av_packet_unref(pkt);
     }
     if(r<0&&r!=AVERROR_EOF&&!status)status=avfail(error,2,"패킷 검증 실패",r);
+    if(pcm_samples)hash_timing(audio_timing,pcm_start,pcm_samples,scan->streams[d->audio]->time_base);
     if(isfinite(audio_end)&&isfinite(audio_start)) {
         AVCodecParameters *audio_parameters=d->format->streams[d->audio]->codecpar;
         double padding=audio_parameters->sample_rate>0?(double)audio_parameters->initial_padding/audio_parameters->sample_rate:0;
@@ -411,9 +447,9 @@ int ring_video_encode(const char *source,const char *destination,const RingSoftw
     AVDictionary *settings=NULL;
     if(options->codec==1){av_dict_set(&settings,"preset","medium",0);av_dict_set(&settings,"x264-params","force-cfr=0:bframes=0:repeat-headers=0",0);}
     if(options->codec==2){av_dict_set(&settings,"preset","medium",0);av_dict_set(&settings,"x265-params","bframes=0:repeat-headers=0:pools=4:frame-threads=2:log-level=error",0);}
-    if(options->codec==3){av_dict_set(&settings,"preset","6",0);av_dict_set(&settings,"svtav1-params","lp=4",0);}
+    if(options->codec==3){av_dict_set(&settings,"preset",options->compression_profile?"8":"6",0);av_dict_set(&settings,"svtav1-params","lp=4",0);}
     if(options->bitrate==0){
-        av_dict_set(&settings,"crf",options->codec==3?"8":"10",0);
+        av_dict_set(&settings,"crf",options->compression_profile ? (options->codec==3?"14":"16") : (options->codec==3?"8":"10"),0);
         if(options->codec==3)av_dict_set(&settings,"svtav1-params","lp=4:tune=1",0);
         else av_dict_set(&settings,"tune","psnr",0);
     }
@@ -509,4 +545,135 @@ done:
     while(e.timings){Timing *next=e.timings->next;free(e.timings);e.timings=next;}
     av_frame_free(&e.held_video);av_packet_free(&e.packet);avcodec_free_context(&e.video);avcodec_free_context(&e.audio);avcodec_free_context(&e.audio_decoder);
     swr_free(&e.resample);if(e.fifo)av_audio_fifo_free(e.fifo);avformat_free_context(e.output);ring_video_decoder_destroy(e.input);return status;
+}
+
+int ring_video_copy_nv12(const RingSoftwareVideoFrame *f,uint8_t *y,int ys,uint8_t *uv,int uvs){
+    if(!f||!f->y||!f->u||!f->v||!y||!uv||f->width<1||f->height<1||ys<f->width||uvs<((f->width+1)/2)*2)return 0;
+    for(int row=0;row<f->height;row++)memcpy(y+(size_t)row*ys,f->y+(size_t)row*f->y_stride,f->width);
+    for(int row=0;row<(f->height+1)/2;row++){
+        const uint8_t *u=f->u+(size_t)row*f->u_stride,*v=f->v+(size_t)row*f->v_stride;uint8_t *out=uv+(size_t)row*uvs;
+        for(int x=0;x<(f->width+1)/2;x++){out[x*2]=u[x];out[x*2+1]=v[x];}
+    }
+    return 1;
+}
+static int next_mux_packet(AVFormatContext *input,AVPacket *packet,int stream,RingVideoCancel cancel,void *context,char *error){
+    int r;
+    while((r=av_read_frame(input,packet))>=0){
+        if(cancel&&cancel(context)){av_packet_unref(packet);return -fail(error,3,"작업을 취소했어요.");}
+        if(packet->stream_index==stream){
+            if(packet->flags&AV_PKT_FLAG_CORRUPT){av_packet_unref(packet);return -fail(error,2,"손상된 미디어 패킷을 발견했어요.");}
+            return 1;
+        }
+        av_packet_unref(packet);
+    }
+    return r==AVERROR_EOF?0:-avfail(error,2,"미디어 패킷 읽기 실패",r);
+}
+int ring_video_mux_original(const char *source,const char *video,const char *destination,int original_geometry,
+                            RingVideoCancel cancel,void *context,char *error){
+    AVFormatContext *original=NULL,*encoded=NULL,*output=NULL;AVPacket *vp=NULL,*ap=NULL;
+    char *temporary=NULL;int status=0,r,vi=-1,ai=-1,oi=-1;
+    struct stat before,after;
+    if(!source||!video||!destination||!strcmp(source,destination)||!strcmp(video,destination)||stat(source,&before))return fail(error,2,"미디어 저장 경로 오류");
+    r=avformat_open_input(&original,source,NULL,NULL);if(r>=0)r=avformat_find_stream_info(original,NULL);
+    if(r<0){status=avfail(error,2,"원본 컨테이너 읽기 실패",r);goto done;}
+    r=avformat_open_input(&encoded,video,NULL,NULL);if(r>=0)r=avformat_find_stream_info(encoded,NULL);
+    if(r<0){status=avfail(error,2,"인코딩한 영상 읽기 실패",r);goto done;}
+    vi=av_find_best_stream(encoded,AVMEDIA_TYPE_VIDEO,-1,-1,NULL,0);
+    ai=av_find_best_stream(original,AVMEDIA_TYPE_AUDIO,-1,-1,NULL,0);
+    oi=av_find_best_stream(original,AVMEDIA_TYPE_VIDEO,-1,-1,NULL,0);
+    if(vi<0||oi<0){status=fail(error,2,"영상 트랙이 없어요.");goto done;}
+    r=avformat_alloc_output_context2(&output,NULL,"mp4",NULL);if(r<0||!output){status=fail(error,4,"MP4 저장 준비 실패");goto done;}
+    AVStream *vin=encoded->streams[vi],*vout=avformat_new_stream(output,NULL),*aout=NULL;
+    if(!vout){status=fail(error,4,"영상 트랙 생성 실패");goto done;}
+    r=avcodec_parameters_copy(vout->codecpar,vin->codecpar);if(r<0){status=avfail(error,4,"영상 정보 복사 실패",r);goto done;}
+    vout->time_base=vin->time_base;vout->avg_frame_rate=vin->avg_frame_rate;vout->sample_aspect_ratio=vin->sample_aspect_ratio;vout->duration=vin->duration;
+    av_dict_copy(&vout->metadata,vin->metadata,0);
+    if(original_geometry){
+        AVCodecParameters *par=original->streams[oi]->codecpar;
+        av_packet_side_data_remove(vout->codecpar->coded_side_data,&vout->codecpar->nb_coded_side_data,AV_PKT_DATA_DISPLAYMATRIX);
+        const AVPacketSideData *matrix=av_packet_side_data_get(par->coded_side_data,par->nb_coded_side_data,AV_PKT_DATA_DISPLAYMATRIX);
+        if(matrix){AVPacketSideData *copy=av_packet_side_data_new(&vout->codecpar->coded_side_data,&vout->codecpar->nb_coded_side_data,AV_PKT_DATA_DISPLAYMATRIX,matrix->size,0);
+            if(!copy){status=fail(error,4,"회전 정보 복사 실패");goto done;}memcpy(copy->data,matrix->data,matrix->size);}
+    }
+    if(ai>=0){
+        AVStream *audio=original->streams[ai];
+        if(avformat_query_codec(output->oformat,audio->codecpar->codec_id,FF_COMPLIANCE_NORMAL)<=0){status=fail(error,1,"MP4에 원본 음성을 그대로 저장할 수 없어요.");goto done;}
+        aout=avformat_new_stream(output,NULL);if(!aout){status=fail(error,4,"음성 트랙 생성 실패");goto done;}
+        r=avcodec_parameters_copy(aout->codecpar,audio->codecpar);if(r<0){status=avfail(error,4,"음성 정보 복사 실패",r);goto done;}
+        aout->codecpar->codec_tag=0;aout->time_base=audio->time_base;av_dict_copy(&aout->metadata,audio->metadata,0);
+    }
+    av_dict_copy(&output->metadata,original->metadata,0);
+    temporary=malloc(strlen(destination)+32);if(!temporary){status=fail(error,4,"메모리가 부족해요.");goto done;}
+    sprintf(temporary,"%s.ring-mux-XXXXXX",destination);int fd=mkstemp(temporary);
+    if(fd<0){status=fail(error,4,"MP4 임시 파일 생성 실패");goto done;}close(fd);
+    output->url=av_strdup(temporary);if(!output->url){status=fail(error,4,"메모리가 부족해요.");goto done;}
+    r=avio_open(&output->pb,temporary,AVIO_FLAG_WRITE);if(r<0){status=avfail(error,4,"MP4 파일 열기 실패",r);goto done;}
+    int64_t movie_scale=vin->time_base.den;
+    if(ai>=0){int64_t a=movie_scale,b=original->streams[ai]->time_base.den;
+        while(b){int64_t next=a%b;a=b;b=next;}movie_scale=movie_scale/a*original->streams[ai]->time_base.den;}
+    if(movie_scale<1||movie_scale>INT32_MAX){status=fail(error,1,"원본 시각 정밀도를 유지할 수 없어요.");goto done;}
+    AVDictionary *settings=NULL;av_dict_set(&settings,"movflags","+faststart",0);
+    av_dict_set_int(&settings,"movie_timescale",movie_scale,0);
+    av_dict_set_int(&settings,"video_track_timescale",vin->time_base.den,0);
+    r=avformat_write_header(output,&settings);av_dict_free(&settings);if(r<0){status=avfail(error,4,"MP4 헤더 저장 실패",r);goto done;}
+    vp=av_packet_alloc();ap=av_packet_alloc();if(!vp||!ap){status=fail(error,4,"메모리가 부족해요.");goto done;}
+    int hasv=next_mux_packet(encoded,vp,vi,cancel,context,error),hasa=ai>=0?next_mux_packet(original,ap,ai,cancel,context,error):0;
+    while(hasv>0||hasa>0){
+        if(cancel&&cancel(context)){status=fail(error,3,"작업을 취소했어요.");break;}
+        int choosev=hasa<=0||(hasv>0&&av_compare_ts(vp->dts==AV_NOPTS_VALUE?vp->pts:vp->dts,vin->time_base,
+            ap->dts==AV_NOPTS_VALUE?ap->pts:ap->dts,original->streams[ai]->time_base)<=0);
+        AVPacket *packet=choosev?vp:ap;AVStream *in=choosev?vin:original->streams[ai],*out=choosev?vout:aout;
+        av_packet_rescale_ts(packet,in->time_base,out->time_base);packet->stream_index=out->index;
+        r=av_interleaved_write_frame(output,packet);av_packet_unref(packet);
+        if(r<0){status=avfail(error,4,"MP4 패킷 저장 실패",r);break;}
+        if(choosev)hasv=next_mux_packet(encoded,vp,vi,cancel,context,error);else hasa=next_mux_packet(original,ap,ai,cancel,context,error);
+        if(hasv<0||hasa<0){status=hasv<0?-hasv:-hasa;break;}
+    }
+    if(!status&&(hasv<0||hasa<0))status=hasv<0?-hasv:-hasa;
+    if(!status){r=av_write_trailer(output);if(r<0)status=avfail(error,4,"MP4 마감 실패",r);}
+    if(output->pb){r=avio_closep(&output->pb);if(!status&&r<0)status=avfail(error,4,"MP4 닫기 실패",r);}
+    if(!status&&(stat(source,&after)||before.st_size!=after.st_size||before.st_mtimespec.tv_sec!=after.st_mtimespec.tv_sec||before.st_mtimespec.tv_nsec!=after.st_mtimespec.tv_nsec))status=fail(error,2,"작업 중 원본이 바뀌었어요.");
+    if(!status&&cancel&&cancel(context))status=fail(error,3,"작업을 취소했어요.");
+    if(!status&&link(temporary,destination))status=fail(error,4,"기존 파일을 덮어쓰지 않아요.");
+done:
+    if(output&&output->pb)avio_closep(&output->pb);
+    if(temporary){unlink(temporary);free(temporary);}av_packet_free(&vp);av_packet_free(&ap);
+    avformat_close_input(&original);avformat_close_input(&encoded);avformat_free_context(output);return status;
+}
+
+int ring_video_decoder_seek(RingVideoDecoder *d,double time,char *error){
+    if(!d||!isfinite(time)||time<0)return fail(error,2,"프레임 탐색 시각 오류");
+    if(stopped(d,error))return 3;
+    AVRational tb=d->format->streams[d->video]->time_base;
+    int64_t target=av_rescale_q((int64_t)floor(time*1000000),(AVRational){1,1000000},tb);
+    int r=avformat_seek_file(d->format,d->video,INT64_MIN,target,target,AVSEEK_FLAG_BACKWARD);
+    if(r<0)return avfail(error,2,"원본 프레임 탐색 실패",r);
+    avcodec_flush_buffers(d->codec);av_packet_unref(d->packet);av_frame_unref(d->frame);
+    av_frame_free(&d->pending);
+    d->flushed=0;d->ended=0;return 0;
+}
+int ring_video_presentation_times(const char *source,double start,double duration,RingVideoTimestamp callback,
+                                  RingVideoCancel cancel,void *context,char *error){
+    if(!source||!callback||!isfinite(start)||!isfinite(duration)||start<0||duration<=0)return fail(error,2,"영상 구간 오류");
+    AVFormatContext *input=NULL;AVPacket *packet=NULL;int status=0,r,count=0;double previous=-INFINITY;
+    r=avformat_open_input(&input,source,NULL,NULL);if(r>=0)r=avformat_find_stream_info(input,NULL);
+    if(r<0){status=avfail(error,2,"원본 시각 읽기 실패",r);goto done;}
+    int video=av_find_best_stream(input,AVMEDIA_TYPE_VIDEO,-1,-1,NULL,0);
+    if(video<0){status=fail(error,2,"영상 트랙이 없어요.");goto done;}
+    enum AVCodecID codec=input->streams[video]->codecpar->codec_id;
+    if(codec!=AV_CODEC_ID_H264&&codec!=AV_CODEC_ID_HEVC&&codec!=AV_CODEC_ID_AV1){status=1;goto done;}
+    packet=av_packet_alloc();if(!packet){status=fail(error,4,"메모리가 부족해요.");goto done;}
+    while((r=av_read_frame(input,packet))>=0){
+        if(cancel&&cancel(context)){status=fail(error,3,"작업을 취소했어요.");av_packet_unref(packet);break;}
+        if(packet->stream_index==video&&!(packet->flags&AV_PKT_FLAG_DISCARD)){
+            if(packet->flags&AV_PKT_FLAG_CORRUPT||packet->pts==AV_NOPTS_VALUE){status=fail(error,2,"원본 프레임 시각이 손상됐어요.");av_packet_unref(packet);break;}
+            double time=seconds(packet->pts,input->streams[video]->time_base);
+            if(time<=start)previous=fmax(previous,time);
+            else if(time<start+duration){if(++count>1800){status=fail(error,1,"선택 구간은 최대 1,800프레임이어야 해요.");av_packet_unref(packet);break;}callback(time,context);}
+        }
+        av_packet_unref(packet);
+    }
+    if(!status&&r!=AVERROR_EOF)status=avfail(error,2,"원본 시각 읽기 실패",r);
+    if(!status&&isfinite(previous))callback(previous,context);
+done:av_packet_free(&packet);avformat_close_input(&input);return status;
 }

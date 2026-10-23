@@ -5,6 +5,9 @@ import VideoToolbox
 /// Bundled static codecs. The ring keeps its current choices; this API is also
 /// available to tools without making the user choose an encoder implementation.
 enum SoftwareVideo {
+    // An absent full-range flag denotes video range for these 8-bit YUV paths.
+    // Explicit full range remains distinct and must survive the output.
+    private static func videoRange(_ value:Int32)->Int32 { value==0 ? 1:value }
     static var capabilities: RingSoftwareVideoCapabilities { ring_video_capabilities() }
     private static let cancelled: @convention(c) (UnsafeMutableRawPointer?) -> Int32 = { _ in Task.isCancelled ? 1 : 0 }
     private final class Progress {
@@ -55,13 +58,14 @@ enum SoftwareVideo {
         return false
     }
     static func encode(_ source: URL, to output: URL, codec: VideoCodec, container: VideoContainer,
-                       bitrate: Int, audio: VideoAudioPolicy = .preserve) throws {
+                       bitrate: Int, audio: VideoAudioPolicy = .preserve, compressionProfile: Bool = false) throws {
         try Task.checkCancellation()
         guard source.standardizedFileURL != output.standardizedFileURL,
               !FileManager.default.fileExists(atPath: output.path) else { throw EngineError.io("원본이나 기존 결과를 덮어쓰지 않아요.") }
         var options = RingSoftwareVideoOptions()
         options.codec = codec == .h264 ? 1 : codec == .hevc ? 2 : 3
         options.container = container == .mp4 ? 1 : container == .mov ? 2 : 3
+        options.compression_profile = compressionProfile ? 1 : 0
         options.bitrate = Int64(bitrate); options.allow_opus_transcode = audio == .convertToOpus ? 1 : 0
         let box = Progress(), context = Unmanaged.passUnretained(box).toOpaque()
         var error = [CChar](repeating: 0, count: 512)
@@ -71,8 +75,11 @@ enum SoftwareVideo {
             } }
         }
         try checked(status, error)
+        if container != .webm,audio == .preserve {
+            try MP4AudioTimeline.preservePriming(from:source,in:output)
+        }
     }
-    private final class Frames {
+    final class Frames {
         let decoder: OpaquePointer
         init(_ url: URL) throws {
             var error = [CChar](repeating: 0, count: 512)
@@ -83,6 +90,10 @@ enum SoftwareVideo {
             decoder = value
         }
         deinit { ring_video_decoder_destroy(decoder) }
+        func seek(to time:Double) throws {
+            var error=[CChar](repeating:0,count:512)
+            try checked(ring_video_decoder_seek(decoder,time,&error),error)
+        }
         func next() throws -> RingSoftwareVideoFrame? {
             try Task.checkCancellation()
             var frame = RingSoftwareVideoFrame(), error = [CChar](repeating: 0, count: 512)
@@ -90,6 +101,27 @@ enum SoftwareVideo {
             if result < 0 { try checked(-result, error) }
             return result == 1 ? frame : nil
         }
+    }
+    private final class PresentationTimes { var values=[Double]() }
+    static func presentationTimes(_ source:URL,start:Double,duration:Double) throws -> [Double]? {
+        let box=PresentationTimes(),context=Unmanaged.passUnretained(box).toOpaque()
+        var error=[CChar](repeating:0,count:512)
+        let status=withExtendedLifetime(box) {
+            source.path.withCString { ring_video_presentation_times($0,start,duration,{ time,context in
+                Unmanaged<PresentationTimes>.fromOpaque(context!).takeUnretainedValue().values.append(time)
+            },cancelled,context,&error) }
+        }
+        if status==1,error[0]==0 { return nil }
+        try checked(status,error)
+        return box.values.sorted()
+    }
+    static func muxOriginal(_ source:URL,video:URL,to output:URL,originalGeometry:Bool) throws {
+        var error=[CChar](repeating:0,count:512)
+        let status=source.path.withCString { input in video.path.withCString { encoded in output.path.withCString { result in
+            ring_video_mux_original(input,encoded,result,originalGeometry ? 1:0,cancelled,nil,&error)
+        } } }
+        try checked(status,error)
+        try MP4AudioTimeline.preservePriming(from:source,in:output)
     }
     /// Every displayed frame, every Y/U/V pixel: same report and unchanged
     /// acceptance gates as the Apple path, with bundled decoding for AV1/WebM.
@@ -103,9 +135,9 @@ enum SoftwareVideo {
                 break
             }
             let at = Double(a.pts)*Double(a.time_base_num)/Double(a.time_base_den)
-            let bt = Double(b.pts)*Double(b.time_base_num)/Double(b.time_base_den)
-            guard a.width == b.width, a.height == b.height, abs(at-bt) <= 0.000001,
-                  a.color_range == b.color_range, a.color_primaries == b.color_primaries,
+            var sourceTiming=a,outputTiming=b
+            guard a.width == b.width, a.height == b.height, ring_video_same_timing(&sourceTiming,&outputTiming)==1,
+                  videoRange(a.color_range) == videoRange(b.color_range), a.color_primaries == b.color_primaries,
                   a.color_transfer == b.color_transfer, a.color_space == b.color_space else {
                 throw EngineError.quality("영상 프레임의 해상도·표시 시각·색상 정보가 달라요.")
             }
@@ -123,19 +155,27 @@ enum SoftwareVideo {
             EngineProgress.report(max(0, at)/max(0.001, duration))
         }
         guard report.frames > 0 else { throw EngineError.quality("검증할 영상 프레임이 없어요.") }
+        report.markCanonicalTimingVerified()
         return report
     }
     private static func bytes<T>(_ value: T) -> Data { var copy = value; return withUnsafeBytes(of: &copy) { Data($0) } }
-    static func verify(_ source: URL, _ output: URL, codec: VideoCodec, audio: VideoAudioPolicy) throws {
-        let a = try inspect(source, allFrames: true), b = try inspect(output, allFrames: true)
+    static func verify(_ source: URL, _ output: URL, codec: VideoCodec, audio: VideoAudioPolicy,
+                       width:Int? = nil,height:Int? = nil,preserveTransform:Bool = true,
+                       verifiedQuality:VideoQualityReport? = nil) throws {
+        // A completed pixel comparison already decoded every picture, checked
+        // both ends of every display interval to nanosecond precision, and
+        // rejected missing/extra frames. Do not repeat that full decode merely
+        // to rebuild the same timeline hash. Packet/audio/metadata checks remain.
+        let timingVerified=verifiedQuality?.canonicalTimingVerified == true
+        let a = try inspect(source, allFrames: !timingVerified), b = try inspect(output, allFrames: !timingVerified)
         let expected: Int32 = codec == .h264 ? 1 : codec == .hevc ? 2 : 3
-        guard b.video_codec == expected, a.width == b.width, a.height == b.height,
-              a.frame_count == b.frame_count, abs(a.duration-b.duration) <= 0.001,
-              bytes(a.decoded_timeline_sha256) == bytes(b.decoded_timeline_sha256),
-              a.color_range == b.color_range, a.color_primaries == b.color_primaries,
+        guard b.video_codec == expected, Int(b.width) == (width ?? Int(a.width)), Int(b.height) == (height ?? Int(a.height)),
+              abs(a.duration-b.duration) <= 0.001,
+              timingVerified || (a.frame_count == b.frame_count && bytes(a.decoded_timeline_sha256) == bytes(b.decoded_timeline_sha256)),
+              videoRange(a.color_range) == videoRange(b.color_range), a.color_primaries == b.color_primaries,
               a.color_transfer == b.color_transfer, a.color_space == b.color_space,
-              a.has_display_matrix == b.has_display_matrix,
-              bytes(a.display_matrix) == bytes(b.display_matrix), a.audio_tracks == b.audio_tracks else {
+              !preserveTransform || a.has_display_matrix == b.has_display_matrix && bytes(a.display_matrix) == bytes(b.display_matrix),
+              a.audio_tracks == b.audio_tracks else {
             throw EngineError.quality("출력 코덱·프레임·타이밍·색·회전 보존 검증 실패")
         }
         if audio == .preserve, a.audio_tracks > 0 {
@@ -187,7 +227,7 @@ enum SoftwareVideo {
         return "\(options.container.title) · \(options.codec.title) · 전체 프레임·시각·색상·회전 검증 · " + (available.audioConversionRequired ? "명시적 Opus 변환" : "원본 음성 유지")
     }
 
-    static func compress(_ source: URL, to output: URL, options: VideoCompressionOptions) throws -> String {
+    static func compress(_ source: URL, to output: URL, options: VideoCompressionOptions) async throws -> String {
         let info = try inspect(source)
         guard info.duration.isFinite, info.duration > 0 else { throw EngineError.unsupported("영상 길이를 확정하지 못해 원본 타이밍을 검증할 수 없어요.") }
         guard options.crop.isFull, options.maxDimension == nil else {
@@ -200,21 +240,21 @@ enum SoftwareVideo {
         guard budget.isFinite, budget >= 100_000, budget < Double(Int32.max) else { throw EngineError.quality("원본 음성·프레임·해상도를 유지하기에는 목표 용량이 너무 작아요.") }
         let work = try StagingWorkspace(beside: output); defer { work.cleanup() }
         let automatic = options.targetBytes == nil
-        let initial = Double(info.width)*Double(info.height)*max(1,info.frame_rate)*(options.codec == .h264 ? 0.10 : 0.06)
-        var rate = Int(max(100_000, min(budget, automatic ? initial : budget)))
+        // Automatic jobs use the existing native constant-quality profile once.
+        // A byte-target job starts from its duration/audio budget.
+        var rate = automatic ? 0 : Int(max(100_000, budget))
         let best = work.directory.appendingPathComponent("best.mp4")
         var bestQuality: VideoQualityReport?, bestBytes = Int.max
         for attempt in 0..<2 {
             try Task.checkCancellation()
             let candidate = work.directory.appendingPathComponent("candidate-\(attempt).mp4")
-            try encode(source, to: candidate, codec: options.codec, container: .mp4, bitrate: rate)
+            try encode(source, to: candidate, codec: options.codec, container: .mp4, bitrate: rate, compressionProfile: true)
             let count = try candidate.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
             var quality: VideoQualityReport?
             if count > 0, count <= limit {
                 let measured = try compare(source, candidate, duration: info.duration); quality = measured
-                if (automatic ? measured.preferredForAutomatic : measured.acceptable),
+                if (automatic ? measured.preferredForCompression : measured.compressionAcceptable),
                    MediaEngine.preferVideoCandidate(measured, bytes: count, over: bestQuality, previousBytes: bestBytes, limit: limit, automatic: automatic) {
-                    try verify(source, candidate, codec: options.codec, audio: .preserve)
                     if FileManager.default.fileExists(atPath: best.path) { try FileManager.default.removeItem(at: best) }
                     try FileManager.default.moveItem(at: candidate, to: best)
                     bestQuality = measured; bestBytes = count
@@ -224,20 +264,36 @@ enum SoftwareVideo {
             if attempt == 0 {
                 let available = max(1,Double(limit-info.audio_bytes-4096))
                 let actual = max(1,Double(count)-Double(info.audio_bytes)-4096)
-                let sizeRate = Double(rate)*available/actual*0.98
-                if let quality, !(automatic ? quality.preferredForAutomatic : quality.acceptable) {
-                    rate = Int(max(100_000,min(budget,sizeRate,Double(rate)*min(4,max(1.1,pow(10,-quality.rateMargin(preferred:automatic)/10))))))
-                } else { rate = Int(max(100_000,min(budget,sizeRate))) }
+                // Native quality has no requested rate; derive one from its measured
+                // payload. Never clamp a correction to the initial nominal budget:
+                // SVT can undershoot that request substantially on a short VFR clip.
+                let basis = rate>0 ? rate : Int(max(100000, actual*8/info.duration))
+                guard let corrected=MediaEngine.correctedVideoRate(rate:basis,videoBytes:actual,
+                    availableBytes:available,quality:quality,automatic:automatic) else { break }
+                rate=corrected
             }
         }
         let after = try source.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey])
         guard resource.fileSize == after.fileSize, resource.contentModificationDate == after.contentModificationDate else { throw EngineError.invalid("처리 중 원본이 변경됐어요.") }
         try Task.checkCancellation()
         guard let quality = bestQuality else {
-            let codec: Int32 = options.codec == .h264 ? 1 : options.codec == .hevc ? 2 : 3
-            if automatic, info.video_codec == codec { throw NoCompressionSavings(reason: "화질을 지키며 더 줄이기 어려워요 · 원본 유지") }
-            throw EngineError.quality("목표 용량과 기존 화질 기준을 함께 만족하지 못했어요. 원본은 유지했어요.")
+            if automatic { throw NoCompressionSavings(reason: "현재 화질 기준을 통과하는 더 작은 결과를 찾지 못했어요 · 원본 유지") }
+            throw VideoCompressionLimit(targetBytes: options.targetBytes!)
         }
+        // Verify the chosen output once. Underfilled provisional candidates must
+        // not trigger another full decode before a size-correction encode.
+        try verify(source, best, codec: options.codec, audio: .preserve,verifiedQuality:quality)
+        // The check above hashes every original audio packet and timestamp.
+        // Native compressed-reader buffers can group trimmed AAC preroll
+        // differently, so additionally compare the native audible window.
+        let nativeSource=AVURLAsset(url:source),nativeResult=AVURLAsset(url:best)
+        if let originalAudio=try? await nativeSource.loadTracks(withMediaType:.audio).first,
+           let resultAudio=try? await nativeResult.loadTracks(withMediaType:.audio).first {
+            try await MediaEngine.verifyAudioPlaybackWindow(originalAudio,resultAudio)
+        }
+        try Task.checkCancellation()
+        let finalSource = try source.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey])
+        guard resource.fileSize == finalSource.fileSize, resource.contentModificationDate == finalSource.contentModificationDate else { throw EngineError.invalid("처리 중 원본이 변경됐어요.") }
         try FileManager.default.moveItem(at: best, to: output)
         return "소프트웨어 압축 · \(bestBytes)바이트 · \(quality.summary) · 원본 프레임·오디오 유지"
     }

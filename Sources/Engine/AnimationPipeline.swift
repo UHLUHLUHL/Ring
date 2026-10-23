@@ -184,7 +184,8 @@ private final class AnimationFrameReader {
         try Task.checkCancellation()
         if !triedSequential {
             triedSequential = true
-            if dimension > 1280 { sequential = try await SequentialAnimationReader.make(asset: asset) }
+            sequential=try await SequentialAnimationReader.make(asset:asset,canonical:true)
+            if sequential == nil,dimension>1280 { sequential=try await SequentialAnimationReader.make(asset:asset) }
         }
         if let sequential {
             return try frames.map { frame in
@@ -427,7 +428,7 @@ enum AnimationPipeline {
                             var next = 0, values: [(Int, CGImage)] = []
                             func submit(_ index: Int) {
                                 let image = batch[index]
-                                group.addTask { try Task.checkCancellation(); return try autoreleasepool { (index, try AdaptivePalette.indexed(image)) } }
+                                group.addTask { try Task.checkCancellation(); return try autoreleasepool { (index, try AdaptivePalette.indexed(image,quality:quality)) } }
                             }
                             while next < min(workers, batch.count) { submit(next); next += 1 }
                             while let value = try await group.next() {
@@ -618,6 +619,36 @@ enum AnimationPipeline {
             throw EngineError.quality("GIF 끝 표시 없음")
         }
         return data
+    }
+
+    /// Measure every selected, composited frame against its actual extracted
+    /// raster. Timing/geometry are independently checked above; a cap is never
+    /// permission to drop frames or conceal a size reduction.
+    static func verifyQuality(_ encoded:AnimationEncoding,asset:AVAsset,start:Double,fps:Double,dimension:Int,
+        extractionSize:CGSize,crop:VideoCrop,plan:AnimationPlan,format:AnimationFormat,automatic:Bool) async throws -> String {
+        guard let source=CGImageSourceCreateWithData(encoded.bytes as CFData,nil) else { throw EngineError.quality("움짤 화질 검사 디코딩 실패") }
+        let reference=AnimationFrameReader(asset:asset,start:start,fps:fps,dimension:dimension,maximumSize:extractionSize,crop:crop)
+        let meanFloor:Double = format == .gif ? (automatic ? 30:27):(automatic ? 36:32)
+        let frameFloor=meanFloor-4
+        var error=0.0,samples=0,worst=Double.infinity
+        for index in plan.frames.indices {
+            try Task.checkCancellation()
+            let original=try await reference.read(plan.frames[index..<(index+1)])[0]
+            let metrics=try autoreleasepool { () throws -> PixelMetrics in
+                guard let decoded=CGImageSourceCreateImageAtIndex(source,index,nil) else { throw EngineError.quality("움짤 화질 검사 프레임 읽기 실패") }
+                guard format != .gif || [.none,.noneSkipLast,.noneSkipFirst].contains(decoded.alphaInfo) else {
+                    throw EngineError.quality("GIF 프레임의 불투명도 보존 검사 실패")
+                }
+                return try PixelCheck.compare(original,decoded)
+            }
+            error+=metrics.squaredError;samples+=metrics.sampleCount;worst=min(worst,metrics.psnr)
+            EngineProgress.report(0.82+0.12*Double(index+1)/Double(plan.frames.count))
+        }
+        let average=error == 0 ? 99:10*log10(65535.0*65535*Double(samples)/error)
+        guard average>=meanFloor,worst>=frameFloor else {
+            throw AnimationQualityFailure(average:average,worst:worst)
+        }
+        return String(format:"전체 %d프레임 검증 · PSNR %.2f / 최저 %.2f dB",plan.frames.count,average,worst)
     }
 
     static func verify(_ encoded: AnimationEncoding, plan: AnimationPlan, format: AnimationFormat) throws {

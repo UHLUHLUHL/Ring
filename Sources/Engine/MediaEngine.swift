@@ -39,7 +39,7 @@ enum MediaEngine {
     static func compress(_ source:URL,to output:URL,options:VideoCompressionOptions) async throws -> String {
         // AV1/WebM may have no AVFoundation reader. Select its bundled path
         // before asking the Apple framework to inspect the source.
-        if options.codec == .av1 { return try SoftwareVideo.compress(source, to: output, options: options) }
+        if options.codec == .av1 { return try await SoftwareVideo.compress(source, to: output, options: options) }
         let info: VideoSourceInfo
         do { info = try await VideoSourceInfo.inspect(source) }
         catch {
@@ -53,22 +53,21 @@ enum MediaEngine {
             do { readable = try SoftwareVideo.inspect(source, allFrames: true) }
             catch { try Task.checkCancellation(); throw originalError }
             guard readable.restricted == 0 else { throw originalError }
-            return try SoftwareVideo.compress(source, to: output, options: options)
+            return try await SoftwareVideo.compress(source, to: output, options: options)
         }
         guard SoftwareVideo.appleAvailable(options.codec, width: info.width, height: info.height) else {
-            return try SoftwareVideo.compress(source, to: output, options: options)
+            return try await SoftwareVideo.compress(source, to: output, options: options)
         }
-        do { return try await compressApple(source, to: output, options: options) }
+        do { return try await compressApple(source, to: output, options: options, info: info) }
         catch {
             guard !Task.isCancelled, SoftwareVideo.isEncoderFailure(error), SoftwareVideo.supported(options.codec),
                   options.crop.isFull, options.maxDimension == nil else { throw error }
-            return try SoftwareVideo.compress(source, to: output, options: options)
+            return try await SoftwareVideo.compress(source, to: output, options: options)
         }
     }
-    private static func compressApple(_ source:URL,to output:URL,options:VideoCompressionOptions) async throws -> String {
+    private static func compressApple(_ source:URL,to output:URL,options:VideoCompressionOptions,info:VideoSourceInfo) async throws -> String {
         let targetBytes = options.targetBytes, codec = options.codec
         if let targetBytes, !(1...1_000_000_000_000).contains(targetBytes) { throw EngineError.invalid("목표 비디오 용량 오류") }
-        let info=try await VideoSourceInfo.inspect(source)
         if let restriction=info.reencodeRestriction { throw EngineError.unsupported(restriction) }
         guard info.copyAudio[.mp4] == true else { throw EngineError.unsupported("MP4에 원본 음성을 그대로 담을 수 없어요. 음성을 낮추지 않고 작업을 중단했어요.") }
         let asset=AVURLAsset(url:source),duration=try await asset.load(.duration)
@@ -86,8 +85,10 @@ enum MediaEngine {
         let region=options.crop.isFull ? nil:options.crop.pixelRect(width:max(1,Int(shownWidth.rounded())),height:max(1,Int(shownHeight.rounded())))
         let swapsAxes=region == nil && (abs(transform.b)>0.5 || abs(transform.c)>0.5)
         let width=swapsAxes ? shown.height:shown.width,height=swapsAxes ? shown.width:shown.height
+        let originalGeometry=region == nil && width==Int(natural.width) && height==Int(natural.height)
         // A byte target is an upper bound, never permission to lower the frame
-        // rate, audio quality, geometry or the automatic quality floor.
+        // rate, audio quality or geometry. Only the explicit-cap pixel-error
+        // allowance differs from automatic compression.
         let savingLimit=Int64(Double(info.sourceBytes)*0.99)
         let byteLimit=min(targetBytes ?? savingLimit,savingLimit)
         let budget=VideoCropGeometry.videoBitrate(targetBytes:byteLimit,duration:duration.seconds,audioBytes:info.audioBytes)
@@ -98,14 +99,19 @@ enum MediaEngine {
         defer { scratch.cleanup() }
         let automatic=targetBytes == nil
         let best=workspace.appendingPathComponent("best.mp4")
-        let maximumRate=Int(Int32.max)
+        // Automatic probes need not exceed the source rate. A byte-target
+        // correction must be allowed above its nominal request when hardware
+        // underuses that request; only measured output bytes enforce the cap.
+        let maximumRate=automatic ? Int(min(Double(Int32.max),max(100000,budget*1.05))):Int(Int32.max)
         var bestQuality:VideoQualityReport?,bestBytes=0,attempts=0
         let fps=info.frameRate.isFinite && info.frameRate>0 ? info.frameRate:30
         let initial=automatic ? Double(width)*Double(height)*fps*(codec == .hevc ? 0.06:0.10):budget
         var rate=Int(max(100000,min(Double(maximumRate),budget,initial)))
         let progress=EngineProgress.handler
-        var calibration=VideoRateCalibration(rate:rate,samples:[],constrained:automatic)
-        if duration.seconds>=1 {
+        var calibration=VideoRateCalibration(rate:rate,samples:[],constrained:true)
+        // An explicit byte budget is already a good first request. Use the full
+        // result as feedback instead of spending six probes around two near-identical encodes.
+        if automatic, duration.seconds>=1 {
             calibration=try await calibratedVideoRate(track:track,duration:duration.seconds,workspace:workspace,
                 rate:rate,maximumRate:maximumRate,width:width,height:height,natural:natural,transform:transform,
                 crop:region,codec:codec,colors:info.colorProperties,fullRange:info.fullRange,
@@ -123,7 +129,7 @@ enum MediaEngine {
             try await EngineProgress.$handler.withValue({ value in progress?(base+span*0.75*value) }) {
                 try await encode(asset,to:candidate,video:track,audio:audio.first,duration:duration,width:width,height:height,
                     transform:transform,natural:natural,crop:region,bitrate:rate,codec:codec,
-                    colorProperties:info.colorProperties,fullRange:info.fullRange,constrainedRate:calibration.constrained)
+                    colorProperties:info.colorProperties,fullRange:info.fullRange,constrainedRate:calibration.constrained,canonicalSource:source)
             }
             let bytes=try candidate.resourceValues(forKeys:[.fileSizeKey]).fileSize ?? 0
             guard bytes>0 else { throw EngineError.quality("비디오 인코딩 결과가 비어 있어요.") }
@@ -133,8 +139,9 @@ enum MediaEngine {
             if Int64(bytes)<=byteLimit {
                 let encoded=AVURLAsset(url:candidate),outTrack=try await encoded.loadTracks(withMediaType:.video)[0]
                 let quality=try await EngineProgress.$handler.withValue({ value in progress?(base+span*(0.75+0.25*value)) }) {
-                    try await VideoQuality.compare(source:asset,video:track,output:encoded,track:outTrack,width:width,height:height,
-                        natural:natural,transform:transform,crop:region,fullRange:info.fullRange,duration:duration.seconds)
+                    if originalGeometry { return try SoftwareVideo.compare(source,candidate,duration:duration.seconds) }
+                    return try await VideoQuality.compare(source:asset,video:track,output:encoded,track:outTrack,width:width,height:height,
+                        natural:natural,transform:transform,crop:region,fullRange:info.fullRange,duration:duration.seconds,canonicalTiming:true,colorProperties:info.colorProperties)
                 }
                 fullQuality=quality
                 if preferVideoCandidate(quality,bytes:bytes,over:bestQuality,previousBytes:bestBytes,limit:byteLimit,automatic:automatic) {
@@ -147,76 +154,67 @@ enum MediaEngine {
             progress?(base+span)
             if automatic ? bestQuality != nil:bestQuality != nil && Double(bestBytes)>=Double(byteLimit)*0.90 { break }
             guard attempt==0 else { break }
+            // Near the cap a failed-quality candidate has too little size headroom
+            // for a meaningful rate increase. Do not repeat an equivalent encode.
+            if let quality=fullQuality,
+               !(automatic ? quality.preferredForCompression : quality.compressionAcceptable), measured>=available*0.90 { break }
             if automatic {
                 if let quality=fullQuality {
                     // Learn optimism from this full encode rather than applying
                     // the old unconditional >=1.4 jump to every quality miss.
                     let nearby=calibration.samples.min { abs(log(Double($0.rate)/Double(rate))) < abs(log(Double($1.rate)/Double(rate))) }
-                    let bias=max(0,(nearby?.quality.rateMargin(preferred:true) ?? 0)-quality.rateMargin(preferred:true))
+                    let bias=max(0,(nearby?.quality.compressionMargin(automatic:true) ?? 0)-quality.compressionMargin(automatic:true))
                     let full=VideoRateSample(rate:rate,bytesPerSecond:measured/duration.seconds,quality:quality)
                     var corrected=calibration.samples.map { VideoRateSample(rate:$0.rate,bytesPerSecond:$0.bytesPerSecond,quality:$0.quality,bias:bias) }
                     corrected.removeAll { $0.rate==rate };corrected.append(full)
                     rate=qualityVideoRate(corrected,target:0.35,maximumRate:maximumRate,explore:false)
-                    if rate<=full.rate { rate=Int(min(Double(maximumRate),ceil(Double(full.rate)*min(4,max(1.1,pow(10,-quality.rateMargin(preferred:true)/10)))))) }
+                    if rate<=full.rate { rate=Int(min(Double(maximumRate),ceil(Double(full.rate)*min(4,max(1.1,pow(10,-quality.compressionMargin(automatic:true)/10)))))) }
+                    // Without any passing probe the fitted slope is not a
+                    // quality bracket. Give the last allowed full attempt
+                    // useful headroom instead of repeating a plateau.
+                    if !calibration.samples.contains(where:{$0.margin>=0.35}) {
+                        rate=max(rate,Int(min(Double(maximumRate),Double(full.rate)*2)))
+                    }
                     rate=min(rate,Int(min(Double(maximumRate),Double(full.rate)*available/measured*0.98)))
                 } else {
                     rate=max(100000,Int(Double(rate)*available/measured*0.98))
                 }
             } else {
-                // Correct the measured video payload, never copied audio. For
-                // sparse/VFR material a single linear correction can miss a
-                // bitrate-control jump; nearby probes resolve that cheaply.
-                let desired=Int(max(100000,min(Double(maximumRate),Double(rate)*available/measured*0.975)))
-                if duration.seconds>=1 {
-                    let calibrated=try await calibratedVideoRate(track:track,duration:duration.seconds,workspace:workspace,
-                        rate:desired,maximumRate:maximumRate,width:width,height:height,natural:natural,transform:transform,
-                        crop:region,codec:codec,colors:info.colorProperties,fullRange:info.fullRange,
-                        targetVideoBytes:available,fullRate:rate,fullVideoBytes:measured,fullConstrained:calibration.constrained)
-                    calibration=calibrated
-                    rate=calibrated.rate
-                } else { rate=desired }
+                guard let corrected=correctedVideoRate(rate:rate, videoBytes:measured, availableBytes:available,
+                    quality:fullQuality, automatic:false, maximumRate:maximumRate) else { break }
+                rate=corrected
             }
         }
         guard let quality=bestQuality else {
-            if automatic, options.crop.isFull, options.maxDimension == nil {
-                let descriptions=try await track.load(.formatDescriptions)
-                let expected=codec == .hevc ? kCMVideoCodecType_HEVC:kCMVideoCodecType_H264
-                if !descriptions.isEmpty, descriptions.allSatisfy({CMFormatDescriptionGetMediaSubType($0)==expected}) {
-                    let current=try source.resourceValues(forKeys:[.fileSizeKey,.contentModificationDateKey])
-                    guard Int64(current.fileSize ?? 0)==info.sourceBytes,current.contentModificationDate==info.modified else {
-                        throw EngineError.invalid("작업 중 원본이 바뀌었어요. 새 원본으로 다시 열어 주세요.")
-                    }
-                    try Task.checkCancellation()
-                    // No candidate passed; retaining the source is a normal
-                    // no-op, not a saved compressed file or an optimality claim.
-                    throw NoCompressionSavings(reason:"화질을 지키며 더 줄이기 어려워요 · 원본 유지")
-                }
+            let current=try source.resourceValues(forKeys:[.fileSizeKey,.contentModificationDateKey])
+            guard Int64(current.fileSize ?? 0)==info.sourceBytes,current.contentModificationDate==info.modified else {
+                throw EngineError.invalid("작업 중 원본이 바뀌었어요. 새 원본으로 다시 열어 주세요.")
             }
-            throw EngineError.quality(targetBytes == nil || targetBytes!>=savingLimit
-                ? "원본 프레임·해상도·오디오와 화질 기준을 지키면서 줄일 수 있는 결과가 없어요. 원본을 유지했어요."
-                : "목표 용량과 화질 기준을 함께 만족하는 결과를 찾지 못했어요. 원본은 유지했어요. 목표를 높이거나 비워 주세요.")
+            try Task.checkCancellation()
+            if automatic {
+                throw NoCompressionSavings(reason:"현재 화질 기준을 통과하는 더 작은 결과를 찾지 못했어요 · 원본 유지")
+            }
+            throw VideoCompressionLimit(targetBytes:targetBytes!)
         }
         try Task.checkCancellation()
         EngineProgress.report(0.90)
         try await verify(best,duration:duration.seconds,videos:1,audios:audio.count,width:width,height:height)
         EngineProgress.report(0.92)
         let result=AVURLAsset(url:best),outVideo=try await result.loadTracks(withMediaType:.video)[0]
-        try verifyFrameTiming(source:asset,video:track,output:result,track:outVideo)
+        try SoftwareVideo.verify(source,best,codec:codec,audio:.preserve,width:width,height:height,
+            preserveTransform:originalGeometry,verifiedQuality:quality)
         EngineProgress.report(0.94)
-        let originalRange=try await track.load(.timeRange),outputRange=try await outVideo.load(.timeRange)
         let outTransform=try await outVideo.load(.preferredTransform)
         let expected=region == nil ? normalizedTransform(transform,width:width,height:height):.identity
-        guard abs(originalRange.start.seconds-outputRange.start.seconds)<0.001,
-              abs(originalRange.end.seconds-outputRange.end.seconds)<0.001,
-              abs(expected.a-outTransform.a)<0.001,abs(expected.b-outTransform.b)<0.001,
-              abs(expected.c-outTransform.c)<0.001,abs(expected.d-outTransform.d)<0.001,
-              abs(expected.tx-outTransform.tx)<0.01,abs(expected.ty-outTransform.ty)<0.01 else {
+        guard originalGeometry || (abs(expected.a-outTransform.a)<0.001 && abs(expected.b-outTransform.b)<0.001 &&
+              abs(expected.c-outTransform.c)<0.001 && abs(expected.d-outTransform.d)<0.001 &&
+              abs(expected.tx-outTransform.tx)<0.01 && abs(expected.ty-outTransform.ty)<0.01) else {
             throw EngineError.quality("영상의 시작·끝 시각 또는 회전이 달라져 저장하지 않았어요.")
         }
         try await verifyVideoColor(outVideo,colors:info.colorProperties,fullRange:info.fullRange)
         EngineProgress.report(0.96)
         if let audio=audio.first {
-            try await verifyOriginalAudio(source:asset,audio:audio,output:result,track:try await result.loadTracks(withMediaType:.audio)[0])
+            try await verifyAudioPlaybackWindow(audio,try await result.loadTracks(withMediaType:.audio)[0])
         }
         EngineProgress.report(0.98)
         let current=try source.resourceValues(forKeys:[.fileSizeKey,.contentModificationDateKey])
@@ -231,7 +229,7 @@ enum MediaEngine {
 
     static func preferVideoCandidate(_ quality:VideoQualityReport,bytes:Int,over previous:VideoQualityReport?,
         previousBytes:Int,limit:Int64,automatic:Bool) -> Bool {
-        guard bytes>0,Int64(bytes)<=limit,automatic ? quality.preferredForAutomatic:quality.acceptable else { return false }
+        guard bytes>0,Int64(bytes)<=limit,automatic ? quality.preferredForCompression:quality.compressionAcceptable else { return false }
         guard let previous else { return true }
         if automatic { return bytes<previousBytes }
         // First stay within the requested 90-100% band, then maximize actual
@@ -241,11 +239,22 @@ enum MediaEngine {
         return quality.distortion<previous.distortion || (quality.distortion==previous.distortion && bytes<previousBytes)
     }
 
+    static func correctedVideoRate(rate:Int, videoBytes:Double, availableBytes:Double,
+        quality:VideoQualityReport?, automatic:Bool, maximumRate:Int = Int(Int32.max)) -> Int? {
+        guard rate>0, videoBytes.isFinite, videoBytes>0, availableBytes.isFinite, availableBytes>0 else { return nil }
+        let failed=quality.map { !(automatic ? $0.preferredForCompression : $0.compressionAcceptable) } ?? false
+        if failed, videoBytes>=availableBytes*0.90 { return nil }
+        let corrected=Int(max(100000,min(Double(maximumRate),Double(rate)*availableBytes/videoBytes*0.975)))
+        if failed, Double(corrected)<Double(rate)*1.10 { return nil }
+        guard abs(Double(corrected)/Double(rate)-1)>=0.01 else { return nil }
+        return corrected
+    }
+
     private struct VideoRateSample {
         let rate:Int,bytesPerSecond:Double,quality:VideoQualityReport
         var bias:Double=0
         var constrained:Bool=true
-        var margin:Double { quality.rateMargin(preferred:true)-bias }
+        var margin:Double { quality.compressionMargin(automatic:true)-bias }
     }
     private struct VideoRateCalibration {
         let rate:Int,samples:[VideoRateSample]
@@ -310,7 +319,7 @@ enum MediaEngine {
                 let observation:VideoRateSample=try await EngineProgress.$handler.withValue(nil) {
                     try await encode(composition,to:url,video:sampled,audio:nil,duration:position,width:width,height:height,
                         transform:transform,natural:natural,crop:crop,bitrate:next,codec:codec,colorProperties:colors,
-                        fullRange:fullRange,constrainedRate:constrained)
+                        fullRange:fullRange,constrainedRate:constrained,allowFrameReordering:false)
                     let encoded=AVURLAsset(url:url),out=try await encoded.loadTracks(withMediaType:.video)[0]
                     let quality=try await VideoQuality.compare(source:composition,video:sampled,output:encoded,track:out,
                         width:width,height:height,natural:natural,transform:transform,crop:crop,fullRange:fullRange,duration:position.seconds)
@@ -325,8 +334,8 @@ enum MediaEngine {
                     // file by about 10%. Near the budget, keep the measured
                     // request instead of scaling it into an encoder plateau.
                     // Only actual full-file bytes decide the 90-100% result.
-                    if size>=target*0.85,size<=target*1.05,observation.quality.acceptable,
-                       index>0 || observation.quality.preferredForAutomatic { break }
+                    if size>=target*0.85,size<=target*1.05,observation.quality.compressionAcceptable,
+                       index>0 || observation.quality.preferredForCompression { break }
                     if index==0,fullRate==nil {
                         // Compare real outputs from the two hardware rate-control
                         // modes. A burst cap is efficient for some camera clips
@@ -353,12 +362,16 @@ enum MediaEngine {
                         next=qualityVideoRate(observations,target:0.35,maximumRate:maximumRate,explore:false)
                         break
                     }
-                    next=qualityVideoRate(observations,target:0.35,maximumRate:maximumRate,explore:index<2)
+                    next=qualityVideoRate(observations,target:0.35,maximumRate:maximumRate,explore:index<1)
+                    // Usually two probes suffice. If both miss, measure one
+                    // more short window rather than extrapolating twice into
+                    // expensive full-file encodes without any passing point.
+                    if index==1,observations.contains(where:{$0.margin>=0.35}) { break }
                 }
                 if observations.contains(where:{ $0.rate==next && $0.constrained==constrained }) { break }
             }
             if let target=targetVideoBytes {
-                let eligible=observations.filter { predicted($0)>=target*0.85 && predicted($0)<=target*1.05 && $0.quality.acceptable }
+                let eligible=observations.filter { predicted($0)>=target*0.85 && predicted($0)<=target*1.05 && $0.quality.compressionAcceptable }
                 if let best=eligible.min(by:{$0.quality.distortion<$1.quality.distortion}) {
                     next=best.rate;constrained=best.constrained
                 } else {
@@ -392,12 +405,16 @@ enum MediaEngine {
     }
 
     static func encode(_ asset:AVAsset,to output:URL,video:AVAssetTrack,audio:AVAssetTrack?,duration:CMTime,width:Int,height:Int,transform:CGAffineTransform,natural:CGSize,crop:CGRect?,bitrate:Int,codec:VideoCodec,
-                       fileType:AVFileType = .mp4,colorProperties:[String:Any] = [:],fullRange:Bool = false,constrainedRate:Bool = false) async throws {
-        let reader=try AVAssetReader(asset:asset),writer=try AVAssetWriter(outputURL:output,fileType:fileType)
+                       fileType:AVFileType = .mp4,colorProperties:[String:Any] = [:],fullRange:Bool = false,constrainedRate:Bool = false,canonicalSource:URL? = nil,allowFrameReordering:Bool = true) async throws {
+        let canonical=try canonicalSource.map { try CanonicalVideoReader($0,fullRange:fullRange,colors:colorProperties) }
+        let encodedURL=canonical == nil ? output:output.deletingLastPathComponent().appendingPathComponent("video-only-"+UUID().uuidString+".mp4")
+        defer { if encodedURL != output { try? FileManager.default.removeItem(at:encodedURL) } }
+        let reader=try AVAssetReader(asset:asset),writer=try AVAssetWriter(outputURL:encodedURL,fileType:fileType)
         // Movie edit offsets otherwise default to a coarse timescale (often
         // 600), even when mediaTimeScale preserves individual sample intervals.
         var movieScale: Int64 = 1
         var scales = [duration.timescale, try await video.load(.naturalTimeScale)]
+        if let canonical { scales.append(canonical.timeScale) }
         if let audio { scales.append(try await audio.load(.naturalTimeScale)) }
         for scale in scales where scale > 0 {
             var a=movieScale,b=Int64(scale)
@@ -408,18 +425,21 @@ enum MediaEngine {
         }
         writer.movieTimeScale=CMTimeScale(movieScale)
         let emptyEdits=try await emptyVideoEdits(video)
+        let implicitAudioPriming = canonical == nil && audio != nil ? try (asset as? AVURLAsset).map { try MP4AudioTimeline.usesImplicitPriming($0.url) } ?? false:false
         let pixels=[kCVPixelBufferPixelFormatTypeKey as String:fullRange ? kCVPixelFormatType_420YpCbCr8BiPlanarFullRange:kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange]
         // One decoded sample in, one encoded sample out. A video composition
         // would resample VFR onto a fixed cadence when cropping.
         let videoOutput=AVAssetReaderTrackOutput(track:video,outputSettings:pixels)
         videoOutput.alwaysCopiesSampleData=false
         let cropper=try frameRenderer(crop:crop,width:width,height:height,natural:natural,transform:transform,fullRange:fullRange)
-        guard reader.canAdd(videoOutput) else { throw EngineError.unsupported("비디오 디코딩 경로를 지원하지 않아요.") };reader.add(videoOutput)
+        if canonical == nil {
+            guard reader.canAdd(videoOutput) else { throw EngineError.unsupported("비디오 디코딩 경로를 지원하지 않아요.") };reader.add(videoOutput)
+        }
         var settings:[String:Any]=[
             AVVideoCodecKey:codec == .hevc ? AVVideoCodecType.hevc:AVVideoCodecType.h264,
             AVVideoWidthKey:width,AVVideoHeightKey:height,AVVideoScalingModeKey:AVVideoScalingModeResizeAspectFill,
             AVVideoEncoderSpecificationKey:[kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder as String:true],
-            AVVideoCompressionPropertiesKey:[AVVideoAverageBitRateKey:bitrate,AVVideoAllowFrameReorderingKey:true,
+            AVVideoCompressionPropertiesKey:[AVVideoAverageBitRateKey:bitrate,AVVideoAllowFrameReorderingKey:canonical == nil && allowFrameReordering,
                 AVVideoMaxKeyFrameIntervalDurationKey:2,
                 AVVideoProfileLevelKey:codec == .hevc ? kVTProfileLevel_HEVC_Main_AutoLevel as String:AVVideoProfileLevelH264HighAutoLevel]]
         if constrainedRate {
@@ -442,7 +462,7 @@ enum MediaEngine {
         videoInput.transform=crop == nil ? normalizedTransform(transform,width:width,height:height):.identity
         guard writer.canAdd(videoInput) else { throw EngineError.unsupported("하드웨어 비디오 인코딩을 지원하지 않아요.") };writer.add(videoInput)
         var pairs:[(AVAssetReaderOutput,AVAssetWriterInput)]=[(videoOutput,videoInput)]
-        if let audio {
+        if let audio,canonical == nil {
             let out=AVAssetReaderTrackOutput(track:audio,outputSettings:nil)
             out.alwaysCopiesSampleData=false
             guard let description=try await audio.load(.formatDescriptions).first else { throw EngineError.unsupported("원본 음성 정보를 읽지 못했어요.") }
@@ -454,7 +474,7 @@ enum MediaEngine {
         // startReading can race AVFoundation's extractor initialization.
         do {
             try Task.checkCancellation()
-            guard writer.startWriting(),reader.startReading() else { throw writer.error ?? reader.error ?? EngineError.io("미디어 입출력 시작 실패") }
+            guard writer.startWriting(),canonical != nil || reader.startReading() else { throw writer.error ?? reader.error ?? EngineError.io("미디어 입출력 시작 실패") }
             writer.startSession(atSourceTime:.zero)
             do {
                 try await withThrowingTaskGroup(of:Void.self) { group in
@@ -464,13 +484,19 @@ enum MediaEngine {
                                 try Task.checkCancellation()
                                 var waited=0
                                 while !input.isReadyForMoreMediaData {
-                                    guard writer.status == .writing,reader.status == .reading || reader.status == .completed,waited<30000 else { throw writer.error ?? reader.error ?? EngineError.io("하드웨어 인코더 응답 시간 초과") }
+                                    guard writer.status == .writing,canonical != nil || reader.status == .reading || reader.status == .completed,waited<30000 else { throw writer.error ?? reader.error ?? EngineError.io("하드웨어 인코더 응답 시간 초과") }
                                     try await Task.sleep(nanoseconds:2_000_000);waited+=2
                                 }
                                 let hasSample:Bool=try autoreleasepool {
-                                    guard let sample=out.copyNextSampleBuffer() else { return false }
-                                    if input.mediaType == .video,isEmptyVideoEdit(sample,ranges:emptyEdits) { return true }
+                                    guard let sample=try canonical?.next() ?? (canonical == nil ? out.copyNextSampleBuffer():nil) else { return false }
+                                    if canonical == nil,input.mediaType == .video,isEmptyVideoEdit(sample,ranges:emptyEdits) { return true }
                                     let written = input.mediaType == .video ? try cropper?.render(sample) ?? sample : sample
+                                    if input.mediaType == .audio,implicitAudioPriming {
+                                        // Without a source edit list, the reader has
+                                        // already applied implicit priming/padding.
+                                        CMRemoveAttachment(written,key:kCMSampleBufferAttachmentKey_TrimDurationAtStart)
+                                        CMRemoveAttachment(written,key:kCMSampleBufferAttachmentKey_TrimDurationAtEnd)
+                                    }
                                     guard input.append(written) else { throw writer.error ?? EngineError.io("비디오 샘플 쓰기 실패") }
                                     let time=CMSampleBufferGetOutputPresentationTimeStamp(sample).seconds
                                     if input.mediaType == .video,time.isFinite { EngineProgress.report(0.05+0.8*time/duration.seconds) }
@@ -483,10 +509,16 @@ enum MediaEngine {
                     }
                     try await group.waitForAll()
                 }
-                guard reader.status == .completed else { throw reader.error ?? EngineError.io("미디어 읽기가 끝나지 않았어요.") }
-                writer.endSession(atSourceTime:duration)
+                guard canonical != nil || reader.status == .completed else { throw reader.error ?? EngineError.io("미디어 읽기가 끝나지 않았어요.") }
+                if !implicitAudioPriming { writer.endSession(atSourceTime:canonical?.endTime ?? duration) }
                 await writer.finishWriting()
                 guard writer.status == .completed else { throw writer.error ?? EngineError.io("비디오 마감 실패") }
+                if let canonicalSource {
+                    try SoftwareVideo.muxOriginal(canonicalSource,video:encodedURL,to:output,
+                        originalGeometry:crop == nil && width==Int(natural.width) && height==Int(natural.height))
+                } else if implicitAudioPriming {
+                    try MP4AudioTimeline.finishVideoPresentation(in:output,end:try await video.load(.timeRange).end.seconds,movieDuration:duration.seconds)
+                }
             } catch { reader.cancelReading();writer.cancelWriting();throw error }
         } catch { reader.cancelReading();writer.cancelWriting();throw error }
     }

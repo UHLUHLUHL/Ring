@@ -15,6 +15,12 @@ extension AnimationPlan {
               let track = try await asset.loadTracks(withMediaType: .video).first else {
             return AnimationPlan(duration: duration, fps: fps, format: format)
         }
+        if let url=(asset as? AVURLAsset)?.url,
+           try await SequentialAnimationReader.make(asset:asset,canonical:true) != nil,
+           let times=try SoftwareVideo.presentationTimes(url,start:start,duration:duration) {
+            guard !times.isEmpty,times.count<=AnimationOptions.maximumFrames else { throw EngineError.invalid("선택 구간은 최대 1,800프레임이어야 해요.") }
+            return try AnimationPlan(sourceOffsets:times.map{$0-start},duration:duration,format:format)
+        }
         let reader = try AVAssetReader(asset: asset)
         let output = AVAssetReaderTrackOutput(track: track, outputSettings: nil)
         output.alwaysCopiesSampleData = false
@@ -49,17 +55,21 @@ extension AnimationPlan {
 /// seeking the image generator. Other transforms/color formats retain the
 /// established generator path. Only two decoded samples are held here.
 final class SequentialAnimationReader {
-    private let reader: AVAssetReader
-    private let output: AVAssetReaderTrackOutput
+    private let reader: AVAssetReader?
+    private let output: AVAssetReaderTrackOutput?
+    private let canonical:CanonicalVideoReader?
+    private let orientation:Int
     private var current: CMSampleBuffer?
     private var next: CMSampleBuffer?
     private var cachedTime: CMTime?
     private var cachedImage: CGImage?
 
-    static func make(asset: AVAsset) async throws -> SequentialAnimationReader? {
-        guard let track = try await asset.loadTracks(withMediaType: .video).first,
-              try await track.load(.preferredTransform) == .identity else { return nil }
+    static func make(asset: AVAsset,canonical:Bool = false) async throws -> SequentialAnimationReader? {
+        guard let track = try await asset.loadTracks(withMediaType:.video).first else { return nil }
+        let transform=try await track.load(.preferredTransform)
+        guard let orientation=orientation(transform),canonical || orientation==1 else { return nil }
         let descriptions = try await track.load(.formatDescriptions)
+        if canonical,!descriptions.allSatisfy({[kCMVideoCodecType_H264,kCMVideoCodecType_HEVC,FourCharCode(0x61763031)].contains(CMFormatDescriptionGetMediaSubType($0))}) { return nil }
         for description in descriptions {
             let encoded=CMVideoFormatDescriptionGetDimensions(description)
             let displayed=CMVideoFormatDescriptionGetPresentationDimensions(description,usePixelAspectRatio:true,useCleanAperture:true)
@@ -70,23 +80,59 @@ final class SequentialAnimationReader {
             let extensions = CMFormatDescriptionGetExtensions(description) as? [String:Any] ?? [:]
             let transfer = extensions[kCMFormatDescriptionExtension_TransferFunction as String] as? String
             if transfer == kCMFormatDescriptionTransferFunction_SMPTE_ST_2084_PQ as String ||
-                transfer == kCMFormatDescriptionTransferFunction_ITU_R_2100_HLG as String { return nil }
+                transfer == kCMFormatDescriptionTransferFunction_ITU_R_2100_HLG as String {
+                if canonical { throw EngineError.unsupported("HDR 영상의 움짤 변환은 아직 지원하지 않아요.") }
+                return nil
+            }
+        }
+        if canonical,let url=(asset as? AVURLAsset)?.url {
+            let info=try await VideoSourceInfo.inspect(url)
+            if let issue=info.reencodeRestriction { throw EngineError.unsupported(issue) }
+            // Without explicit color tags, AVFoundation applies its own
+            // display defaults. Retain that established RGB interpretation
+            // instead of guessing a matrix/transfer for the NV12 conversion.
+            guard [AVVideoColorPrimariesKey,AVVideoTransferFunctionKey,AVVideoYCbCrMatrixKey]
+                .allSatisfy({info.colorProperties[$0] != nil}) else { return nil }
+            return try SequentialAnimationReader(source:url,info:info,orientation:orientation)
         }
         return try SequentialAnimationReader(asset: asset, track: track)
     }
 
+    private static func orientation(_ t:CGAffineTransform)->Int? {
+        let values=[t.a,t.b,t.c,t.d],rounded=values.map{Int($0.rounded())}
+        guard zip(values,rounded).allSatisfy({abs($0.0-CGFloat($0.1))<0.0001}) else { return nil }
+        switch rounded {
+        case [1,0,0,1]:return 1
+        case [-1,0,0,1]:return 2
+        case [-1,0,0,-1]:return 3
+        case [1,0,0,-1]:return 4
+        case [0,1,1,0]:return 5
+        case [0,1,-1,0]:return 6
+        case [0,-1,-1,0]:return 7
+        case [0,-1,1,0]:return 8
+        default:return nil
+        }
+    }
+    private init(source:URL,info:VideoSourceInfo,orientation:Int) throws {
+        canonical=try CanonicalVideoReader(source,fullRange:info.fullRange,colors:info.colorProperties)
+        reader=nil;output=nil;self.orientation=orientation
+    }
     private init(asset: AVAsset, track: AVAssetTrack) throws {
-        reader = try AVAssetReader(asset: asset)
-        output = AVAssetReaderTrackOutput(track: track, outputSettings:
+        canonical=nil;orientation=1
+        let reader = try AVAssetReader(asset: asset)
+        let output = AVAssetReaderTrackOutput(track: track, outputSettings:
             [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA])
         output.alwaysCopiesSampleData = false
         guard reader.canAdd(output) else { throw EngineError.unsupported("순차 프레임 디코딩을 지원하지 않아요.") }
         reader.add(output)
+        self.reader=reader;self.output=output
         guard reader.startReading() else { throw reader.error ?? EngineError.io("영상 디코딩 시작 실패") }
     }
-    deinit { reader.cancelReading() }
+    deinit { reader?.cancelReading() }
 
     private func readSample() throws -> CMSampleBuffer? {
+        if let canonical { return try canonical.next() }
+        guard let reader,let output else { throw EngineError.io("프레임 읽기 경로가 없어요.") }
         while let sample = output.copyNextSampleBuffer() {
             try Task.checkCancellation()
             let attachments = CMSampleBufferGetSampleAttachmentsArray(sample, createIfNecessary: false) as? [[String: Any]]
@@ -98,6 +144,10 @@ final class SequentialAnimationReader {
     }
     func image(at time: Double) throws -> CGImage {
         try Task.checkCancellation()
+        if let canonical,current == nil || time-(current.map{CMSampleBufferGetOutputPresentationTimeStamp($0).seconds} ?? 0)>1 {
+            try canonical.seek(to:max(0,time))
+            current=nil;next=nil
+        }
         if current == nil { current = try readSample(); next = try readSample() }
         while let following = next, CMSampleBufferGetOutputPresentationTimeStamp(following).seconds <= time + 1e-8 {
             current = following; next = try readSample()
@@ -114,7 +164,8 @@ final class SequentialAnimationReader {
         guard VTCreateCGImageFromCVPixelBuffer(pixel, options: nil, imageOut: &image) == noErr, let image else {
             throw EngineError.io("영상 색상 변환 실패")
         }
-        cachedTime = stamp; cachedImage = image
-        return image
+        let displayed=try PDFEngine.oriented(image,orientation)
+        cachedTime = stamp; cachedImage = displayed
+        return displayed
     }
 }

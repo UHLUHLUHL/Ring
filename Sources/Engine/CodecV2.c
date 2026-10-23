@@ -195,6 +195,7 @@ int ring_webp_animation_add(void *animation,const uint8_t *rgba,int width,int he
     if(!animation || !WebPPictureInit(&picture)||!WebPConfigInit(&config)) return 0;
     picture.width=width;picture.height=height;picture.use_argb=1;
     config.quality=quality;config.method=4;config.thread_level=threads>1;config.use_sharp_yuv=1;
+    if(quality==100){config.lossless=1;config.exact=1;config.quality=75;}
     int ok=WebPPictureImportRGBA(&picture,rgba,width*4) && WebPAnimEncoderAdd(animation,&picture,timestamp,&config);
     WebPPictureFree(&picture);return ok;
 }
@@ -409,7 +410,9 @@ int ring_palette_dither(const uint8_t *rgba,int width,int height,int first_row,i
     const size_t length=((size_t)width+2)*3;
     for(int y=first_row;y<first_row+rows;y++) {
         float *cur=errors+(y&1)*length,*next=errors+((y+1)&1)*length;
-        for(int x=0;x<width;x++) {
+        int direction=(y&1)?-1:1;
+        for(int column=0;column<width;column++) {
+            int x=direction>0?column:width-1-column;
             size_t pixel=(size_t)y*width+x,e=((size_t)x+1)*3;
             int r=(int)floorf(fminf(255,fmaxf(0,rgba[pixel*4]+cur[e]))+0.5f);
             int g=(int)floorf(fminf(255,fmaxf(0,rgba[pixel*4+1]+cur[e+1]))+0.5f);
@@ -433,9 +436,9 @@ int ring_palette_dither(const uint8_t *rgba,int width,int height,int first_row,i
             }
             pixels[pixel]=(uint8_t)index;
             float dr=r-red[index],dg=g-green[index],db=b-blue[index];
-            cur[e+3]+=dr*(7.0f/16);next[e-3]+=dr*(3.0f/16);next[e]+=dr*(5.0f/16);next[e+3]+=dr*(1.0f/16);
-            cur[e+4]+=dg*(7.0f/16);next[e-2]+=dg*(3.0f/16);next[e+1]+=dg*(5.0f/16);next[e+4]+=dg*(1.0f/16);
-            cur[e+5]+=db*(7.0f/16);next[e-1]+=db*(3.0f/16);next[e+2]+=db*(5.0f/16);next[e+5]+=db*(1.0f/16);
+            cur[e+3*direction]+=dr*(7.0f/16);next[e-3*direction]+=dr*(3.0f/16);next[e]+=dr*(5.0f/16);next[e+3*direction]+=dr*(1.0f/16);
+            cur[e+3*direction+1]+=dg*(7.0f/16);next[e-3*direction+1]+=dg*(3.0f/16);next[e+1]+=dg*(5.0f/16);next[e+3*direction+1]+=dg*(1.0f/16);
+            cur[e+3*direction+2]+=db*(7.0f/16);next[e-3*direction+2]+=db*(3.0f/16);next[e+2]+=db*(5.0f/16);next[e+3*direction+2]+=db*(1.0f/16);
         }
         memset(cur,0,length*sizeof(float));
     }

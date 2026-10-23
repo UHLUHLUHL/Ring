@@ -27,11 +27,37 @@ import CryptoKit
             flash.include(luma:index == 51 ? blurred:exact,u:exact,v:exact)
         }
         try require(clean.acceptable && !colorDamage.acceptable && !flash.acceptable,"color drift and single bad frame rejected")
+        try require(!clean.canonicalTimingVerified,"metrics alone must not authorize skipping decoded timing validation")
+        var ta=RingSoftwareVideoFrame(),tb=RingSoftwareVideoFrame()
+        ta.pts=3000;ta.duration=3000;ta.time_base_num=1;ta.time_base_den=90000
+        tb.pts=2000;tb.duration=2000;tb.time_base_num=1;tb.time_base_den=60000
+        try require(ring_video_same_timing(&ta,&tb)==1,"equivalent rational frame times")
+        tb.pts+=1
+        try require(ring_video_same_timing(&ta,&tb)==0,"shifted frame start rejected")
+        tb.pts-=1;tb.duration-=1
+        try require(ring_video_same_timing(&ta,&tb)==0,"changed display hold rejected")
         var floorOnly=VideoQualityReport()
         let nearFloor=RingVideoPlaneQuality(ssim:0.999,tail_ssim:0.99,mse:1.2)
         floorOnly.include(luma:nearFloor,u:nearFloor,v:nearFloor)
         try require(floorOnly.acceptable && !floorOnly.preferredForAutomatic && clean.preferredForAutomatic,
             "automatic fidelity must exceed the explicit-limit safety floor")
+        var efficient=VideoQualityReport(),small=VideoQualityReport(),damaged=VideoQualityReport()
+        for _ in 0..<20 {
+            efficient.include(luma:.init(ssim:0.975,tail_ssim:0.90,mse:2),u:.init(ssim:1,tail_ssim:1,mse:2),v:.init(ssim:1,tail_ssim:1,mse:2))
+            small.include(luma:.init(ssim:0.960,tail_ssim:0.80,mse:4),u:.init(ssim:1,tail_ssim:1,mse:3),v:.init(ssim:1,tail_ssim:1,mse:3))
+            damaged.include(luma:.init(ssim:0.85,tail_ssim:0.60,mse:50),u:.init(ssim:1,tail_ssim:1,mse:50),v:.init(ssim:1,tail_ssim:1,mse:50))
+        }
+        try require(efficient.preferredForCompression && !efficient.acceptable,"automatic compression allows bounded loss without weakening conversion")
+        try require(small.compressionAcceptable && !small.preferredForCompression,"explicit cap permits more loss than automatic")
+        try require(!damaged.compressionAcceptable && !colorDamage.compressionAcceptable && !flash.compressionAcceptable,"damaged structure, color and single bad frame still rejected")
+        try require(MediaEngine.correctedVideoRate(rate:1_000_000,videoBytes:600_000,availableBytes:1_000_000,
+            quality:small,automatic:true)! > 1_000_000, "undershooting encoder correction must exceed the nominal initial budget")
+        try require(MediaEngine.correctedVideoRate(rate:1_000_000,videoBytes:970_000,availableBytes:1_000_000,
+            quality:small,automatic:true) == nil, "do not repeat a failed-quality near-cap encode")
+        try require(MediaEngine.correctedVideoRate(rate:1_000_000,videoBytes:1_100_000,availableBytes:1_000_000,
+            quality:nil,automatic:false)! < 1_000_000, "oversized unmeasured candidates must reduce the request")
+        try require(MediaEngine.correctedVideoRate(rate:1_000_000,videoBytes:800_000,availableBytes:1_000_000,
+            quality:clean,automatic:false) != nil, "byte correction remains available without assuming a quality failure")
         try require(clean.distortion<floorOnly.distortion,"rank fidelity rather than file size")
         try require(clean.rateMargin(preferred:true)>0 && floorOnly.rateMargin(preferred:true)<0 &&
             colorDamage.rateMargin(preferred:false)<0 && flash.rateMargin(preferred:false)<0,"search coordinate respects every quality guard")
@@ -40,8 +66,18 @@ import CryptoKit
         try require(!MediaEngine.preferVideoCandidate(clean,bytes:400,over:floorOnly,previousBytes:950,limit:1000,automatic:false),
             "higher fidelity must not silently replace an in-band target with an underfilled result")
         try require(MediaEngine.preferVideoCandidate(clean,bytes:900,over:clean,previousBytes:950,limit:1000,automatic:true) &&
-            !MediaEngine.preferVideoCandidate(floorOnly,bytes:800,over:clean,previousBytes:950,limit:1000,automatic:true),
+            !MediaEngine.preferVideoCandidate(small,bytes:800,over:clean,previousBytes:950,limit:1000,automatic:true),
             "auto minimizes actual passing bytes and never relaxes its quality floor")
+        let yw=13,yh=9,ys=18,cw=7,ch=5,cs=10
+        let y=(0..<(ys*yh)).map { UInt8($0%251) },u=(0..<(cs*ch)).map { UInt8(($0*3)%251) },v=(0..<(cs*ch)).map { UInt8(($0*7)%251) }
+        var copyY=[UInt8](repeating:253,count:ys*yh),copyUV=[UInt8](repeating:253,count:18*ch),frame=RingSoftwareVideoFrame()
+        frame.width=Int32(yw);frame.height=Int32(yh);frame.y_stride=Int32(ys);frame.u_stride=Int32(cs);frame.v_stride=Int32(cs)
+        y.withUnsafeBufferPointer { py in u.withUnsafeBufferPointer { pu in v.withUnsafeBufferPointer { pv in
+            frame.y=py.baseAddress;frame.u=pu.baseAddress;frame.v=pv.baseAddress
+            precondition(ring_video_copy_nv12(&frame,&copyY,Int32(ys),&copyUV,18)==1)
+        } } }
+        for row in 0..<yh { for x in 0..<ys { try require(copyY[row*ys+x] == (x<yw ? y[row*ys+x]:253),"YUV bridge changed luma/padding") } }
+        for row in 0..<ch { for x in 0..<cw { try require(copyUV[row*18+2*x]==u[row*cs+x] && copyUV[row*18+2*x+1]==v[row*cs+x],"YUV bridge swapped or changed chroma") } }
         let edgeWidth=17,edgeHeight=9
         var edge=[UInt8](repeating:100,count:edgeWidth*edgeHeight),edgeResult=RingVideoPlaneQuality()
         edge[edge.count-1]=200
@@ -52,7 +88,7 @@ import CryptoKit
         try require(abs(edgeResult.mse-10000.0/Double(edge.count))<1e-9 && edgeResult.ssim<1,"partial edge blocks measured")
         print("PASS pixel identity, known error, fine-detail loss, chroma drift, single-frame quality gate")
     }
-    static func compare(_ source: URL,_ output: URL,crop:VideoCrop = .full,maxDimension:Int? = nil) async throws -> VideoQualityReport {
+    static func compare(_ source: URL,_ output: URL,crop:VideoCrop = .full,maxDimension:Int? = nil,canonical:Bool = false) async throws -> VideoQualityReport {
         let asset=AVURLAsset(url:source),result=AVURLAsset(url:output),info=try await VideoSourceInfo.inspect(source)
         let track=try await asset.loadTracks(withMediaType:.video)[0],out=try await result.loadTracks(withMediaType:.video)[0]
         let natural=try await track.load(.naturalSize),transform=try await track.load(.preferredTransform)
@@ -61,7 +97,7 @@ import CryptoKit
         let swaps=region == nil && abs(transform.b)>0.5
         return try await VideoQuality.compare(source:asset,video:track,output:result,track:out,
             width:swaps ? size.height:size.width,height:swaps ? size.width:size.height,natural:natural,transform:transform,
-            crop:region,fullRange:info.fullRange,duration:info.duration)
+            crop:region,fullRange:info.fullRange,duration:info.duration,canonicalTiming:canonical,colorProperties:info.colorProperties)
     }
     static func main() async {
         setbuf(stdout,nil)
@@ -77,7 +113,7 @@ import CryptoKit
                 let bytes=try output.resourceValues(forKeys:[.fileSizeKey]).fileSize ?? 0
                 try require(bytes>=18_000_000 && bytes<=20_000_000,"representative 20 MB target should preserve quality within the budget")
                 let quality=try await compare(source,output)
-                try require(quality.acceptable,"explicit-limit quality floor")
+                try require(quality.compressionAcceptable,"explicit-limit compression quality floor")
                 try require(Array(before)==Array(SHA256.hash(data:try Data(contentsOf:source,options:.mappedIfSafe))),"budget source changed")
                 try await VideoConversionTestsPlayback.play(output)
                 print("PASS 20 MB quality budget",detail)
@@ -130,8 +166,8 @@ import CryptoKit
             for (crop,limit,codec) in [(VideoCrop.full,Optional<Int>.none,VideoCodec.hevc),(.init(ratio:.square),320,.hevc),(.full,nil,.h264)] {
                 let output=root.appendingPathComponent(UUID().uuidString+".mp4")
                 let detail=try await MediaEngine.compress(source,to:output,options:.init(codec:codec,maxDimension:limit,crop:crop))
-                let quality=try await compare(source,output,crop:crop,maxDimension:limit)
-                try require(quality.frames==times.count && quality.preferredForAutomatic,"auto preferred quality/VFR/crop")
+                let quality=try await compare(source,output,crop:crop,maxDimension:limit,canonical:true)
+                try require(quality.frames==times.count && quality.preferredForCompression,"auto preferred quality/VFR/crop")
                 try await VideoConversionTestsPlayback.play(output)
                 print("PASS auto",detail)
             }
@@ -139,6 +175,8 @@ import CryptoKit
             do {
                 _ = try await MediaEngine.compress(source,to:impossible,options:.init(targetBytes:40000,codec:.hevc))
                 throw EngineError.quality("TEST: impossible high-quality byte target accepted")
+            } catch is VideoCompressionLimit {
+                try require(!FileManager.default.fileExists(atPath:impossible.path),"rejected target published")
             } catch let error as EngineError {
                 if case .quality(let reason)=error,!reason.hasPrefix("TEST:") {
                     try require(!FileManager.default.fileExists(atPath:impossible.path),"rejected target published")

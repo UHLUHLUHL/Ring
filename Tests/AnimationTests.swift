@@ -81,7 +81,9 @@ import CryptoKit
             }
             var current=[Float](repeating:0,count:(width+2)*3),next=current
             for y in 0..<height {
-                for x in 0..<width {
+                let direction=y%2 == 0 ? 1:-1
+                for column in 0..<width {
+                    let x=direction>0 ? column:width-1-column
                     let pixel=y*width+x,e=(x+1)*3
                     let rgb=(0..<3).map { max(0,min(255,Int((Float(rgba[pixel*4+$0])+current[e+$0]).rounded()))) }
                     let quantized=rgb.map { ($0>>3)*8+4 }
@@ -93,8 +95,8 @@ import CryptoKit
                     expected[pixel]=UInt8(best)
                     for c in 0..<3 {
                         let error=Float(rgb[c]-Int(palette[best*3+c]))
-                        current[e+3+c]+=error*(7.0/16);next[e-3+c]+=error*(3.0/16)
-                        next[e+c]+=error*(5.0/16);next[e+3+c]+=error*(1.0/16)
+                        current[e+3*direction+c]+=error*(7.0/16);next[e-3*direction+c]+=error*(3.0/16)
+                        next[e+c]+=error*(5.0/16);next[e+3*direction+c]+=error*(1.0/16)
                     }
                 }
                 swap(&current,&next);next=[Float](repeating:0,count:next.count)
@@ -185,7 +187,10 @@ import CryptoKit
     static func sourceTiming(_ root:URL) async throws {
         let times=[0.0,0.0048,0.03817,0.0715,0.12,0.18,0.216,0.25,0.34,0.346]
         let source=root.appendingPathComponent("irregular.mp4")
-        try await MediaFixture.write(source,times:times,duration:0.35)
+        try await MediaFixture.write(source,times:times,duration:0.35,colorProperties:[
+            AVVideoColorPrimariesKey:AVVideoColorPrimaries_ITU_R_709_2,
+            AVVideoTransferFunctionKey:AVVideoTransferFunction_ITU_R_709_2,
+            AVVideoYCbCrMatrixKey:AVVideoYCbCrMatrix_ITU_R_709_2])
         let asset=AVURLAsset(url:source),fps=try await MediaEngine.sourceFrameRate(asset)!
         for format in [AnimationFormat.gif,.webp] {
             let plan=try await AnimationPlan.source(asset:asset,start:0,duration:0.35,fps:fps,format:format)
@@ -196,6 +201,7 @@ import CryptoKit
             try inspect(result.url,expectedDuration:0.35,frames:times.count,width:160,height:90)
         }
         let sequential=try await SequentialAnimationReader.make(asset:asset)!
+        let canonical=try await SequentialAnimationReader.make(asset:asset,canonical:true)!
         let reference=AVAssetImageGenerator(asset:asset)
         reference.requestedTimeToleranceBefore = .zero;reference.requestedTimeToleranceAfter = .zero
         for time in times {
@@ -206,6 +212,12 @@ import CryptoKit
                 return (0..<x.count).reduce(0.0) { sum,i in let d=Double(x[i])-Double(y[i]);return sum+d*d }/Double(x.count)
             } }
             try require(mse<2.1,"sequential reader color/frame mismatch at \(time): MSE \(mse)")
+            let canonicalPixels=try AdaptivePalette.sRGB(canonical.image(at:time))
+            let canonicalMSE=canonicalPixels.withUnsafeBytes { ar in b.withUnsafeBytes { br -> Double in
+                let x=ar.bindMemory(to:UInt8.self),y=br.bindMemory(to:UInt8.self)
+                return (0..<x.count).reduce(0.0) { sum,i in let d=Double(x[i])-Double(y[i]);return sum+d*d }/Double(x.count)
+            } }
+            try require(canonicalMSE<2.1,"canonical reader color/frame mismatch at \(time): MSE \(canonicalMSE)")
         }
         print("PASS VFR retains every displayed frame and duration; sequential reader matches generator colors/order")
     }
@@ -248,12 +260,11 @@ import CryptoKit
                 }
                 let turned = try await RingEngine.shared.run(.init(source: rotated, operation: .video(.animation(.init(format: format, fps: detected, maxDimension: 160, start: 0.2, duration: 1.017)))))
                 try inspect(turned.url, expectedDuration: AnimationPlan(duration: 1.017, fps: detected, format: format).duration, width: 90, height: 160)
-                // GIF's per-frame palettes impose a larger minimum when all
-                // requested frames are retained instead of silently dropping FPS.
-                let target: Int64 = format == .gif ? 100_000:50_000
+                // A feasible cap must retain both the raster and all frames.
+                let target: Int64 = 2_000_000
                 let limited = try await RingEngine.shared.run(.init(source: moving, operation: .video(.animation(.init(format: format, fps: 30, maxDimension: 320, targetBytes: target, duration: 2)))))
                 try require(try Data(contentsOf: limited.url).count <= target, "target exceeded")
-                try inspect(limited.url,expectedDuration:2,frames:60)
+                try inspect(limited.url,expectedDuration:2,frames:60,width:320,height:180)
                 try require(limited.detail.contains("30fps"),"byte target silently lowered requested FPS")
                 print("PASS", format.rawValue, "15/24/30/60fps, rotation, fractional FPS/trim, sampled target", limited.detail)
             }
@@ -279,21 +290,17 @@ import CryptoKit
             }
             let single = try await RingEngine.shared.run(.init(source: still, operation: .video(.animation(.init(format: .webp, fps: 1, maxDimension: 160, duration: 0.2)))))
             try inspect(single.url, expectedDuration: 0.2)
-            // The default animation must retain the q90/method4/sharp-YUV
-            // still-frame reference, including the 2x + vImage resize path.
+            // Automatic encoding may use lossless WebP when VP8 chroma
+            // subsampling cannot meet the measured quality floor.
             let qualityReference=AVAssetImageGenerator(asset:AVURLAsset(url:still))
             qualityReference.appliesPreferredTrackTransform=true
             qualityReference.maximumSize=CGSize(width:320,height:320)
             let full=try await qualityReference.image(at:.zero).image
             let fitted=try ImageResampler.fit(full,maxDimension:160)
-            let rgba=try AdaptivePalette.sRGB(fitted)
-            let expectedBytes=try TargetSizeCodec.memoryEncode(rgba,width:160,height:90,webp:true,quality:90)
-            let expectedSource=CGImageSourceCreateWithData(expectedBytes as CFData,nil)!
             let actualSource=CGImageSourceCreateWithURL(single.url as CFURL,nil)!
-            let expectedPixels=try AdaptivePalette.sRGB(CGImageSourceCreateImageAtIndex(expectedSource,0,nil)!)
-            let actualPixels=try AdaptivePalette.sRGB(CGImageSourceCreateImageAtIndex(actualSource,0,nil)!)
-            try require(expectedPixels==actualPixels,"default animation quality/resize differs from q90 sharp-YUV reference")
-            print("PASS default WebP decoded pixels match q90/method4/sharp-YUV + vImage reference")
+            let quality=try PixelCheck.compare(fitted,CGImageSourceCreateImageAtIndex(actualSource,0,nil)!)
+            try require(quality.psnr>=36,"automatic WebP must meet its measured floor, including chroma/resize")
+            print("PASS automatic WebP fidelity including lossless fallback and vImage resize")
             print("PASS still WebP and single sampled frame retain animation duration")
 
             // Exercise adaptive choice and inspect every decoded frame after mux.

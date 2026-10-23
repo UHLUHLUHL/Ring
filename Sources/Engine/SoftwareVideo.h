@@ -9,6 +9,7 @@ extern "C" {
    Errors are UTF-8 strings written to a caller-owned 512-byte buffer. */
 typedef int (*RingVideoCancel)(void *context);
 typedef void (*RingVideoProgress)(double fraction, void *context);
+typedef void (*RingVideoTimestamp)(double seconds,void *context);
 typedef struct {
     int h264, hevc, av1, mp4, mov, webm, opus;
 } RingSoftwareVideoCapabilities;
@@ -32,6 +33,9 @@ typedef struct {
        WebM accepts AV1 only. Audio is always copied; incompatible audio is
        rejected unless allow_opus_transcode is explicitly set. */
     int codec, container, allow_opus_transcode;
+    /* Compression only: SVT preset 8 and native CRF14 (x264/x265 CRF16).
+       Zero preserves the conservative format-conversion profile. */
+    int compression_profile;
     /* Positive: ABR bit budget for compression. Zero: conservative native
        constant-quality format conversion (x264/x265 CRF10, SVT CRF8, PSNR tune).
        Final decoded-frame quality verification is still required by the caller. */
@@ -50,8 +54,15 @@ int ring_video_inspect(const char *path, int decode_all, RingSoftwareVideoInfo *
                        RingVideoCancel cancel, void *context, char *error);
 int ring_video_encode(const char *source, const char *destination, const RingSoftwareVideoOptions *options,
                       RingVideoProgress progress, RingVideoCancel cancel, void *context, char *error);
+int ring_video_copy_nv12(const RingSoftwareVideoFrame *frame,uint8_t *y,int y_stride,uint8_t *uv,int uv_stride);
+int ring_video_same_timing(const RingSoftwareVideoFrame *a,const RingSoftwareVideoFrame *b);
+int ring_video_mux_original(const char *source,const char *video,const char *destination,int original_geometry,
+                            RingVideoCancel cancel,void *context,char *error);
 RingVideoDecoder *ring_video_decoder_create(const char *path, RingVideoCancel cancel, void *context, char *error);
 int ring_video_decoder_next(RingVideoDecoder *decoder, RingSoftwareVideoFrame *frame, char *error);
+int ring_video_decoder_seek(RingVideoDecoder *decoder,double seconds,char *error);
+int ring_video_presentation_times(const char *source,double start,double duration,RingVideoTimestamp timestamp,
+                                  RingVideoCancel cancel,void *context,char *error);
 void ring_video_decoder_destroy(RingVideoDecoder *decoder);
 #ifdef __cplusplus
 }

@@ -60,12 +60,11 @@ import CryptoKit
             let result=try await RingEngine.shared.run(.init(source:source,operation:.video(.compress(.init(targetBytes:520000,codec:.hevc,crop:crop)))))
             try await playback(result.url)
             print("PASS compression",crop.isFull ? "original size":"VFR crop",result.detail)
-        } catch let error as EngineError {
+        } catch let outcome as VideoCompressionLimit {
             // Original PCM consumes 460800 bytes. An old byte-only test could
             // silently sacrifice video quality in the tiny remaining budget.
-            if case .quality(let reason)=error,reason.contains("목표 용량과 화질 기준을 함께 만족하는 결과를 찾지 못했어요") {
-                print("PASS unchanged-audio target rejected at quality floor",crop.isFull ? "original":"crop")
-            } else { throw error }
+            try require(outcome.targetBytes==520000,"target-limit outcome retains the requested cap")
+            print("PASS unchanged-audio target rejected at quality floor",crop.isFull ? "original":"crop")
         }
     }
     do {

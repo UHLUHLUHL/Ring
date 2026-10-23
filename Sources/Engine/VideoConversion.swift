@@ -323,8 +323,13 @@ extension MediaEngine {
     static func verifyOriginalAudio(source: AVAsset, audio: AVAssetTrack, output: AVAsset, track: AVAssetTrack) async throws {
         let a = try streamSignature(asset: source, track: audio, payload: true)
         let b = try streamSignature(asset: output, track: track, payload: true)
-        let sourceRange = try await audio.load(.timeRange), resultRange = try await track.load(.timeRange)
-        guard a.payload == b.payload, abs(sourceRange.start.seconds - resultRange.start.seconds) < 0.001,
+        guard a.payload == b.payload else { throw EngineError.quality("원본 음성의 데이터가 달라요.") }
+        try await verifyAudioPlaybackWindow(audio,track)
+    }
+
+    static func verifyAudioPlaybackWindow(_ source:AVAssetTrack,_ output:AVAssetTrack) async throws {
+        let sourceRange=try await source.load(.timeRange),resultRange=try await output.load(.timeRange)
+        guard abs(sourceRange.start.seconds - resultRange.start.seconds) < 0.001,
               abs(sourceRange.end.seconds - resultRange.end.seconds) < 0.001 else { throw EngineError.quality("원본 음성의 데이터·타이밍이 달라요.") }
     }
 

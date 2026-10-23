@@ -9,6 +9,8 @@ import CoreVideo
 struct VideoQualityReport {
     private static let averageErrorFloor = 46.0, frameErrorFloor = 42.0
     private(set) var frames = 0
+    private(set) var canonicalTimingVerified = false
+    mutating func markCanonicalTimingVerified() { canonicalTimingVerified = frames > 0 }
     private var sumSSIM = 0.0, sumMSE = 0.0, sumChromaMSE = 0.0
     private(set) var worstSSIM = 1.0, worstPSNR = 99.0, worstChromaPSNR = 99.0, worstTailSSIM = 1.0
     private var histogram = [Int](repeating: 0, count: 1001)
@@ -31,10 +33,26 @@ struct VideoQualityReport {
         psnr >= Self.averageErrorFloor && worstPSNR >= Self.frameErrorFloor &&
         chromaPSNR >= Self.averageErrorFloor && worstChromaPSNR >= Self.frameErrorFloor && worstTailSSIM >= 0.920
     }
-    /// Automatic compression uses this more conservative quality goal;
-    /// `acceptable` remains the safety floor for an explicit byte limit.
+    /// Legacy fidelity reference retained for diagnostics. Format conversion
+    /// uses `acceptable`; lossy compression has separate bounds below.
     var preferredForAutomatic: Bool {
         acceptable && psnr>=48 && chromaPSNR>=48 && worstPSNR>=44 && worstChromaPSNR>=44
+    }
+    /// Compression is intentionally lossy. A user-selected cap permits more
+    /// error than automatic compression; conversion keeps the strict gate above.
+    var compressionAcceptable: Bool { compressionMargin(automatic:false) >= 0 }
+    var preferredForCompression: Bool { compressionMargin(automatic:true) >= 0 }
+    func compressionMargin(automatic:Bool) -> Double {
+        guard frames>0 else { return -99 }
+        func structure(_ value:Double,_ floor:Double) -> Double {
+            10*log10((1-floor)/max(1e-12,1-value))
+        }
+        let average = automatic ? 44.0:40.0, minimum = automatic ? 40.0:36.0
+        return min(psnr-average, chromaPSNR-average, worstPSNR-minimum, worstChromaPSNR-minimum,
+            structure(meanSSIM,automatic ? 0.970:0.950),
+            structure(fifthPercentileSSIM,automatic ? 0.960:0.930),
+            structure(worstSSIM,automatic ? 0.940:0.900),
+            structure(worstTailSSIM,automatic ? 0.850:0.750))
     }
     /// Mean squared error over the actual 4:2:0 pixel counts. Lower means a
     /// closer decoded result. Used to rank candidates under an explicit cap.
@@ -67,20 +85,29 @@ struct VideoQualityReport {
 
 enum VideoQuality {
     private final class Frames {
-        let reader: AVAssetReader, output: AVAssetReaderTrackOutput
+        let reader: AVAssetReader?, output: AVAssetReaderTrackOutput?
+        let canonical:CanonicalVideoReader?
         let emptyEdits: [CMTimeRange]
-        init(asset: AVAsset, track: AVAssetTrack, fullRange: Bool) async throws {
+        init(asset: AVAsset, track: AVAssetTrack, fullRange: Bool, canonicalTiming:Bool,colors:[String:Any]) async throws {
+            if canonicalTiming,let url=(asset as? AVURLAsset)?.url {
+                canonical=try CanonicalVideoReader(url,fullRange:fullRange,colors:colors)
+                reader=nil;output=nil;emptyEdits=[];return
+            }
+            canonical=nil
             emptyEdits = try await MediaEngine.emptyVideoEdits(track)
-            reader = try AVAssetReader(asset: asset)
-            output = AVAssetReaderTrackOutput(track: track, outputSettings: [kCVPixelBufferPixelFormatTypeKey as String:
+            let reader = try AVAssetReader(asset: asset)
+            let output = AVAssetReaderTrackOutput(track: track, outputSettings: [kCVPixelBufferPixelFormatTypeKey as String:
                 fullRange ? kCVPixelFormatType_420YpCbCr8BiPlanarFullRange : kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange])
             output.alwaysCopiesSampleData = false
             guard reader.canAdd(output) else { throw EngineError.unsupported("화질 검증용 디코더를 사용할 수 없어요.") }
             reader.add(output)
+            self.reader=reader;self.output=output
             guard reader.startReading() else { throw reader.error ?? EngineError.io("화질 검증 시작 실패") }
         }
-        deinit { if reader.status == .reading { reader.cancelReading() } }
+        deinit { if let reader,reader.status == .reading { reader.cancelReading() } }
         func next() throws -> CMSampleBuffer? {
+            if let canonical { return try canonical.next() }
+            guard let reader,let output else { throw EngineError.quality("프레임 읽기 경로가 없어요.") }
             while let sample = output.copyNextSampleBuffer() {
                 try Task.checkCancellation()
                 guard CMSampleBufferGetNumSamples(sample) > 0 else { continue }
@@ -100,9 +127,9 @@ enum VideoQuality {
 
     static func compare(source: AVAsset, video: AVAssetTrack, output: AVAsset, track: AVAssetTrack,
                         width: Int, height: Int, natural: CGSize, transform: CGAffineTransform,
-                        crop: CGRect?, fullRange: Bool, duration: Double) async throws -> VideoQualityReport {
-        let reference = try await Frames(asset: source, track: video, fullRange: fullRange)
-        let encoded = try await Frames(asset: output, track: track, fullRange: fullRange)
+                        crop: CGRect?, fullRange: Bool, duration: Double,canonicalTiming:Bool = false,colorProperties:[String:Any] = [:]) async throws -> VideoQualityReport {
+        let reference = try await Frames(asset: source, track: video, fullRange: fullRange,canonicalTiming:canonicalTiming,colors:colorProperties)
+        let encoded = try await Frames(asset: output, track: track, fullRange: fullRange,canonicalTiming:canonicalTiming,colors:colorProperties)
         // Match the exact crop/resampling used before encoding, so a user's
         // intentional geometry change is not counted as codec damage.
         let renderer = try MediaEngine.frameRenderer(crop: crop, width: width, height: height,
@@ -120,6 +147,9 @@ enum VideoQuality {
                 let outTime = CMSampleBufferGetOutputPresentationTimeStamp(b).seconds
                 guard time.isFinite, outTime.isFinite, abs(time - outTime) <= 0.000001 else {
                     throw EngineError.quality("프레임 재생 시각이 달라져 저장하지 않았어요.")
+                }
+                if canonicalTiming,abs(CMSampleBufferGetDuration(a).seconds-CMSampleBufferGetDuration(b).seconds)>0.000001 {
+                    throw EngineError.quality("프레임의 표시 길이가 달라져 저장하지 않았어요.")
                 }
                 let prepared = try renderer?.render(a) ?? a
                 let pixels = CMSampleBufferGetImageBuffer(prepared)!, result = CMSampleBufferGetImageBuffer(b)!

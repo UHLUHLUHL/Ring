@@ -17,6 +17,24 @@ struct NoCompressionSavings: LocalizedError {
     var errorDescription: String? { reason }
 }
 
+/// The requested cap was valid, but no measured candidate met its quality floor.
+/// This is a settings outcome, distinct from damaged input or an encoder failure.
+struct VideoCompressionLimit: LocalizedError {
+    let targetBytes: Int64
+    var errorDescription: String? {
+        let cap = ByteCountFormatter.string(fromByteCount: targetBytes, countStyle: .file)
+        return "\(cap) 안에서 현재 화질 기준을 통과하는 결과를 찾지 못했어요. 목표를 높이거나 비워 주세요. 원본은 그대로예요."
+    }
+}
+
+struct AnimationQualityFailure: LocalizedError {
+    let average: Double
+    let worst: Double
+    var errorDescription: String? {
+        "선택한 크기·프레임에서 움짤 화질 기준을 만족하지 못했어요. 원본은 그대로예요."
+    }
+}
+
 enum ImageFormat: String, CaseIterable {
     case png, jpg, heic, tiff, bmp, webp, avif, jxl, pdf, docx, txt
     var isModern: Bool { self == .avif || self == .jxl }
