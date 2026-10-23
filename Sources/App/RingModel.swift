@@ -15,6 +15,30 @@ final class RingModel: ObservableObject {
     enum Screen: Equatable { case ring, crop, addBackground, tool(Tool) }
 
     private var settingsObserver: AnyCancellable?
+    @Published var viewportHeight: CGFloat = RingWindowLayout.size.height
+    @Published private(set) var previewHeightReduction: CGFloat = 0
+    var maximumPanelHeight: CGFloat = RingWindowLayout.size.height
+    private var toolPanelSized = false
+
+    func sizeToolPanel(_ height: CGFloat) {
+        guard screen != .ring, !toolPanelSized, height.isFinite, height > 0 else { return }
+        let desired = ceil(height) + 16
+        // Fit tall previews once while opening; subsequent control changes keep the size.
+        if desired > maximumPanelHeight + 1, case .tool(let tool) = screen {
+            switch tool {
+            case .videoTrim, .videoCompression, .animation:
+                let reduction = min(320, previewHeightReduction + desired - maximumPanelHeight)
+                if reduction > previewHeightReduction + 0.5 {
+                    previewHeightReduction = reduction
+                    return
+                }
+            default: break
+            }
+        }
+        toolPanelSized = true
+        viewportHeight = min(maximumPanelHeight, desired)
+        screenChanged(screen)
+    }
     let file: FileInfo
     @Published var tab: Tab
     /// 0 = 변환 layout, 1 = 편집 layout; animated between the two on a tab switch.
@@ -47,7 +71,15 @@ final class RingModel: ObservableObject {
     }
     var editItems: [RingAction] { isSubmenu ? convertItems : file.editActions }
 
-    @Published var screen: Screen = .ring { didSet { if screen != oldValue { screenChanged(screen) } } }
+    @Published var screen: Screen = .ring {
+        didSet {
+            if screen != oldValue {
+                toolPanelSized = false
+                previewHeightReduction = 0
+                screenChanged(screen)
+            }
+        }
+    }
     @Published var toast: String?
     @Published var thumbnail: NSImage?
     @Published var appeared = false

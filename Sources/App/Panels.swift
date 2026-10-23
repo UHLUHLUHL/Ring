@@ -4,7 +4,31 @@ import SwiftUI
 
 // MARK: - Shared panel chrome
 
+private struct ToolPanelMeasureKey: EnvironmentKey {
+    static let defaultValue: (CGFloat) -> Void = { _ in }
+}
+private struct ToolPanelReadyKey: EnvironmentKey {
+    static let defaultValue = true
+}
+extension EnvironmentValues {
+    var toolPanelMeasure: (CGFloat) -> Void {
+        get { self[ToolPanelMeasureKey.self] }
+        set { self[ToolPanelMeasureKey.self] = newValue }
+    }
+    var toolPanelReady: Bool {
+        get { self[ToolPanelReadyKey.self] }
+        set { self[ToolPanelReadyKey.self] = newValue }
+    }
+}
+
+private struct ToolPanelMeasurement: Equatable {
+    let height: CGFloat
+    let ready: Bool
+}
+
 struct GlassPanel<Content: View>: View {
+    @Environment(\.toolPanelMeasure) private var measure
+    @Environment(\.toolPanelReady) private var ready
     let title: String
     let subtitle: String
     let width: CGFloat
@@ -35,6 +59,13 @@ struct GlassPanel<Content: View>: View {
         }
         .padding(20)
         .frame(width: width)
+        .fixedSize(horizontal: false, vertical: true)
+        .onGeometryChange(for: ToolPanelMeasurement.self) {
+            ToolPanelMeasurement(height: $0.size.height, ready: ready)
+        } action: { value in
+            if value.ready { measure(value.height) }
+        }
+        .opacity(ready ? 1 : 0)
         .glassEffect(.regular, in: RoundedRectangle(cornerRadius: 30, style: .continuous))
         .hitTestableGlass(RoundedRectangle(cornerRadius: 30, style: .continuous))
     }

@@ -34,6 +34,7 @@ private struct ToolForm<Content:View>:View {
     let title:String
     var width:CGFloat = 460
     var ready=true
+    var validationHeight: CGFloat? = nil
     var buttonTitle="저장"
     let operation:() throws -> EngineOperation
     @ViewBuilder var content:Content
@@ -42,10 +43,12 @@ private struct ToolForm<Content:View>:View {
         GlassPanel(title:title,subtitle:model.file.name,width:width,onClose:model.backToRing) {
             VStack(alignment:.leading,spacing:14) {
                 content
-                if let error {
-                    Text(error).font(.system(size:12)).foregroundStyle(.red).fixedSize(horizontal:false,vertical:true)
-                        .accessibilityIdentifier("tool.validation")
-                }
+                Group {
+                    if let error {
+                        Text(error).font(.system(size:12)).foregroundStyle(.red).fixedSize(horizontal:false,vertical:true)
+                            .accessibilityIdentifier("tool.validation")
+                    } else if validationHeight != nil { Color.clear }
+                }.frame(height: validationHeight, alignment: .leading)
                 HStack(spacing:8) {
                     Spacer()
                     Button("취소", action: model.backToRing)
@@ -532,7 +535,7 @@ private struct VideoToolPanel:View {
         // 460pt is the ToolForm content width (500 minus its 20pt margins).
         let width:CGFloat = 460
         let aspect = sourceSize.map { max(0.2,min(5,$0.width/max(1,$0.height))) } ?? 16.0/9
-        let height = min(maxHeight, width/aspect)
+        let height = max(80, min(maxHeight, width/aspect) - model.previewHeightReduction)
         return CGSize(width: min(width, height*aspect), height: height)
     }
 
@@ -550,12 +553,13 @@ private struct VideoToolPanel:View {
                     CropFrame(crop:$cropRect,bounds:CropFrame.fitted(sourceSize,in:geo.size),pixels:sourceSize,aspect:cropAspect)
                 }
                 .accessibilityIdentifier("video.cropFrame")
+                .allowsHitTesting(!(codec == "AV1" && !isAnimation))
             }
         }
         .frame(width: previewSize(maxHeight: maxHeight).width, height: previewSize(maxHeight: maxHeight).height)
         .overlay(RoundedRectangle(cornerRadius: radius, style: .continuous).strokeBorder(Color.white.opacity(0.12), lineWidth: 1))
         .frame(maxWidth: .infinity)
-        .animation(.snappy, value: sourceSize)
+
     }
 
     private var cropControls:some View {
@@ -617,22 +621,33 @@ private struct VideoToolPanel:View {
     }
 
     var body:some View {
-        ToolForm(model:model,title:title,width:500,ready:canSave,operation:operation) {
+        ToolForm(model:model,title:title,width:500,ready:canSave,validationHeight:32,operation:operation) {
             switch tool {
             case .trim:
                 trimTimelineSection(videoMaxHeight: 380, middlePrefix: "선택 구간")
 
             case .compress:
                 videoPreview(maxHeight:340)
-                cropControls
+                cropControls.disabled(codec == "AV1")
                 PanelRow(label:"원본") { Text(model.file.sizeText).foregroundStyle(.secondary) }
                 PanelRow(label:"목표") { SizeFields(value:$size,unit:$unit) }
                 Text("비워두면 화질을 우선해 자동 압축해요. 입력하면 상한 안에서 화질을 높여요.")
                     .font(.system(size:11)).foregroundStyle(.secondary)
-                dimensionControls
+                dimensionControls.disabled(codec == "AV1")
                 Text("영상만 재압축해요. 목표가 작을수록 화질이 낮아질 수 있어요.")
                     .font(.system(size:11)).foregroundStyle(.secondary)
-                PanelRow(label:"코덱") { Picker("코덱",selection:$codec) { Text("HEVC · 고효율/작은 용량").tag("HEVC");Text("H.264 · 범용 호환성").tag("H264") }.labelsHidden() }
+                PanelRow(label:"코덱") {
+                    Picker("코덱", selection:$codec) {
+                        Text("HEVC · 고효율/작은 용량").tag("HEVC")
+                        Text("H.264 · 범용 호환성").tag("H264")
+                        if RingFeatures.enabled("video", "AV1"), SoftwareVideo.supported(.av1) {
+                            Text("AV1 · 높은 압축 효율").tag("AV1")
+                                .disabled(!videoCrop.isFull || !compressionDimension.isEmpty)
+                        }
+                    }.labelsHidden().accessibilityIdentifier("video.compression.codec")
+                }
+                Text(codec == "AV1" ? "AV1은 원본 해상도·전체 화면으로 압축해요." : " ")
+                    .font(.system(size:11)).foregroundStyle(.secondary).frame(height:14)
 
             case .animation(let format):
                 trimTimelineSection(videoMaxHeight:270, middlePrefix: "구간")
@@ -658,6 +673,7 @@ private struct VideoToolPanel:View {
                     .buttonStyle(.plain).font(.system(size:11)).foregroundStyle(.secondary)
                     .accessibilityIdentifier("animation.fps.source")
                 }
+                Group {
                 if let value=Double(fps), value>AnimationOptions.maximumFPS {
                     Text("변환은 최대 60fps까지 지원해요. 프리셋으로 프레임률을 선택해 주세요.")
                         .font(.system(size:11)).foregroundStyle(.secondary)
@@ -665,6 +681,8 @@ private struct VideoToolPanel:View {
                     Text("60fps GIF는 일부 뷰어에서 느리게 재생될 수 있어요. 일정한 재생 속도에는 WebP를 권장해요.")
                         .font(.system(size:11)).foregroundStyle(.secondary).fixedSize(horizontal:false,vertical:true)
                 }
+                else { Color.clear }
+                }.frame(height:28, alignment:.leading)
                 dimensionControls
                 ResolutionNote(text:animationResolution)
                 if needsAnimationEstimate {
@@ -682,7 +700,9 @@ private struct VideoToolPanel:View {
                     else { Color.clear.frame(height:28) }
                 }
             }
-        }.task(id:animationSettingsKey) {
+        }
+        .environment(\.toolPanelReady, duration != nil)
+        .task(id:animationSettingsKey) {
             animationEstimate=nil;animationEstimateError=nil
             let key=animationSettingsKey
             animationEstimateKey=key
@@ -783,7 +803,8 @@ private struct VideoToolPanel:View {
         return Double(dimensions.width)*Double(dimensions.height)*max(0,endVal-startVal)*fps>150_000_000
     }
     private var canSave:Bool {
-        duration != nil
+        if case .compress = tool, codec == "AV1", !videoCrop.isFull || !compressionDimension.isEmpty { return false }
+        return duration != nil
     }
     private func outputDimensions(_ limit:Int?) -> (width:Int,height:Int) {
         guard let sourceSize else { return (0,0) }
@@ -849,7 +870,7 @@ private struct VideoToolPanel:View {
             }
             let maxDimension=Int(compressionDimension)
             let target=size.trimmingCharacters(in:.whitespacesAndNewlines)
-            return .video(.compress(.init(targetBytes:target.isEmpty ? nil:try ToolSettings.bytes(target,unit:unit),codec:codec == "HEVC" ? .hevc:.h264,maxDimension:maxDimension,crop:videoCrop)))
+            return .video(.compress(.init(targetBytes:target.isEmpty ? nil:try ToolSettings.bytes(target,unit:unit),codec:codec == "AV1" ? .av1:codec == "HEVC" ? .hevc:.h264,maxDimension:maxDimension,crop:videoCrop)))
         }
         let from = startVal
         let to = endVal > 0 ? endVal : duration

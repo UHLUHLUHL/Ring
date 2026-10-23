@@ -36,7 +36,10 @@ struct RootView: View {
                 .transition(.move(edge: .bottom).combined(with: .opacity))
             }
         }
-        .frame(width: RingWindowLayout.size.width, height: RingWindowLayout.size.height)
+        .frame(width: RingWindowLayout.size.width, height: model.viewportHeight)
+        .environment(\.toolPanelMeasure, { [screen = model.screen] height in
+            if model.screen == screen { model.sizeToolPanel(height) }
+        })
         // Only a fade here: the ring grows out of its centre inside RingView. Scaling this
         // whole view made the glass render lighter until the animation ended.
         .opacity(model.appeared ? 1 : 0)

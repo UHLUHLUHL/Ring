@@ -124,7 +124,12 @@ final class RingWindowController {
 
     private init(file: FileInfo, at point: NSPoint, center: NSPoint?) {
         model = RingModel(file: file)
-        let size = RingWindowLayout.size
+        var size = RingWindowLayout.size
+        if let frame = Self.screen(for: point)?.visibleFrame {
+            model.maximumPanelHeight = frame.height - 12
+            size.height = min(size.height, model.maximumPanelHeight)
+        }
+        model.viewportHeight = size.height
         panel = RingPanel(contentRect: NSRect(origin: .zero, size: size),
                           styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
         panel.isOpaque = false
@@ -141,7 +146,7 @@ final class RingWindowController {
         host.frame = NSRect(origin: .zero, size: size)
         panel.contentView = host
 
-        let origin = Self.ringOrigin(for: point, center: center)
+        let origin = Self.ringOrigin(for: point, center: center, size: size)
         panel.setFrameOrigin(origin)
         model.close = { [weak self] in self?.close(animated: true) }
         model.screenChanged = { [weak self] screen in self?.fitForScreen(screen) }
@@ -196,9 +201,8 @@ final class RingWindowController {
 
     /// Ring opens to the right of the file (left when there is no room). Only the ring block is
     /// pushed back on screen, so it stays as close to the file as possible near the edges.
-    private static func ringOrigin(for point: NSPoint, center: NSPoint? = nil) -> NSPoint {
+    private static func ringOrigin(for point: NSPoint, center: NSPoint? = nil, size: CGSize) -> NSPoint {
         if let center {
-            let size = RingWindowLayout.size
             return NSPoint(x: center.x - size.width / 2, y: center.y - (size.height - RingWindowLayout.ringCenterY))
         }
         var c = NSPoint(x: point.x + besideOffset, y: point.y)
@@ -209,7 +213,6 @@ final class RingWindowController {
             // ringBlock is in top-down coordinates; flip for AppKit.
             c.y = min(max(c.y, vf.minY + b.maxY), vf.maxY + b.minY)
         }
-        let size = RingWindowLayout.size
         return NSPoint(x: c.x - size.width / 2, y: c.y - (size.height - RingWindowLayout.ringCenterY))
     }
 
@@ -217,10 +220,13 @@ final class RingWindowController {
     private func fitForScreen(_ screen: RingModel.Screen) {
         guard screen != .ring, let vf = Self.screen(for: NSPoint(x: panel.frame.midX, y: panel.frame.midY))?.visibleFrame else { return }
         var f = panel.frame
+        model.maximumPanelHeight = vf.height - 12
+        f.size.height = min(model.viewportHeight, model.maximumPanelHeight)
+        model.viewportHeight = f.height
         f.origin.x = min(max(f.origin.x, vf.minX), vf.maxX - f.width)
         f.origin.y = min(max(f.origin.y, vf.minY), vf.maxY - f.height)
         if f != panel.frame {
-            panel.setFrameOrigin(f.origin)
+            panel.setFrame(f, display: true)
         }
     }
 
