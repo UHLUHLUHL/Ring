@@ -7,6 +7,25 @@ import Foundation
         throw EngineError.invalid("TEST: invalid input accepted: "+message)
     }
     static func main() throws {
+        let defaults = UserDefaults.standard
+        let saved = RingFeatures.groups.map { (RingFeatures.key($0.id), defaults.object(forKey: RingFeatures.key($0.id))) }
+        defer { for (key, value) in saved { if let value { defaults.set(value, forKey: key) } else { defaults.removeObject(forKey: key) } } }
+        for (key, _) in saved { defaults.removeObject(forKey: key) }
+        RingFeatures.set("image", "JXL", enabled: true)
+        RingFeatures.set("image", "AVIF", enabled: true)
+        RingFeatures.set("image", "JXL", enabled: true)
+        let image = FileInfo(url: URL(fileURLWithPath: "/tmp/source.png"))
+        try require(image.convertActions.suffix(2).map(\.id) == ["AVIF", "JXL"], "custom photo formats and deterministic order")
+        try require(FileInfo(url: URL(fileURLWithPath: "/tmp/source.jxl")).kind == .image, "JXL input detection")
+        try require(!FileInfo(url: URL(fileURLWithPath: "/tmp/source.jxl")).convertActions.contains { $0.id == "JXL" }, "omit same image format")
+        try require(RingFeatures.frameFormats.suffix(2) == ["AVIF", "JXL"], "custom single frame formats")
+        RingFeatures.set("animation", "AVIF", enabled: true)
+        RingFeatures.set("animation", "JXL", enabled: true)
+        RingFeatures.set("video", "WEBM", enabled: true)
+        let video = FileInfo(url: URL(fileURLWithPath: "/tmp/source.mp4"))
+        try require(video.convertActions.suffix(3).map(\.id) == ["AVIF", "JXL", "WEBM"], "custom video outputs")
+        try require(Set(video.convertActions.map(\.id)).count == video.convertActions.count, "unique custom sectors")
+        for (key, _) in saved { defaults.removeObject(forKey: key) }
         for ext in ["docx","md","markdown","html","htm","rtf"] {
             let f=FileInfo(url:URL(fileURLWithPath:"/tmp/Ring.\(ext)"))
             try require(f.kind == .document && f.convertActions.map(\.title)==["PDF","PNG","JPG","WEBP"],"document routing \(ext)")

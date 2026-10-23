@@ -111,6 +111,9 @@ struct FillSegmented<Value: CaseIterable & Hashable & RawRepresentable>: NSViewR
 }
 
 func pixelSize(of url: URL) -> CGSize {
+    if ["avif", "jxl"].contains(url.pathExtension.lowercased()), let reader = try? ModernImageReader(url) {
+        return reader.orientation >= 5 ? CGSize(width: reader.height, height: reader.width) : CGSize(width: reader.width, height: reader.height)
+    }
     guard let src = CGImageSourceCreateWithURL(url as CFURL, nil),
           let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any],
           let w = props[kCGImagePropertyPixelWidth] as? Int,
@@ -121,6 +124,9 @@ func pixelSize(of url: URL) -> CGSize {
 
 /// A bounded preview; full-resolution pixels are loaded only by the engine on save.
 func panelPreview(of url:URL)->NSImage? {
+    if ["avif", "jxl"].contains(url.pathExtension.lowercased()), let image = try? ImageCodec.preview(url, maxDimension: 1024) {
+        return NSImage(cgImage: image, size: .zero)
+    }
     guard let source=CGImageSourceCreateWithURL(url as CFURL,[kCGImageSourceShouldCache:false] as CFDictionary),
           let image=CGImageSourceCreateThumbnailAtIndex(source,0,[kCGImageSourceCreateThumbnailFromImageAlways:true,
               kCGImageSourceThumbnailMaxPixelSize:1024,kCGImageSourceCreateThumbnailWithTransform:true] as CFDictionary) else { return nil }
@@ -316,9 +322,10 @@ struct CropPanel: View {
     init(model: RingModel) {
         self.model = model
         let source = CGImageSourceCreateWithURL(model.file.url as CFURL, nil)
-        let props = source.flatMap { CGImageSourceCopyPropertiesAtIndex($0, 0, nil) as? [CFString: Any] }
-        let w = props?[kCGImagePropertyPixelWidth] as? Int ?? 1000
-        let h = props?[kCGImagePropertyPixelHeight] as? Int ?? 1000
+        let modern = ["avif", "jxl"].contains(model.file.url.pathExtension.lowercased()) ? try? ModernImageReader(model.file.url) : nil
+        let props = modern?.properties ?? source.flatMap { CGImageSourceCopyPropertiesAtIndex($0, 0, nil) as? [CFString: Any] }
+        let w = modern?.width ?? props?[kCGImagePropertyPixelWidth] as? Int ?? 1000
+        let h = modern?.height ?? props?[kCGImagePropertyPixelHeight] as? Int ?? 1000
         let orient = props?[kCGImagePropertyOrientation] as? Int ?? 1
         orientation = orient
         pixels = orient >= 5 ? CGSize(width: h, height: w) : CGSize(width: w, height: h)

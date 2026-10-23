@@ -2,7 +2,7 @@ import AppKit
 import SwiftUI
 import Combine
 
-enum AnimatedImageTool: Hashable { case webp, crop, resize, speed, frame(ImageFormat) }
+enum AnimatedImageTool: Hashable { case webp, crop, resize, speed, frame(ImageFormat), output(AnimationFormat) }
 
 private actor AnimationPreviewSource {
     let url: URL
@@ -112,6 +112,7 @@ struct AnimatedImagePanel: View {
     private var title: String {
         switch tool {
         case .webp: return "움짤 WebP 변환"
+        case .output(let format): return "움짤 \(format.rawValue.uppercased()) 변환"
         case .crop: return "움짤 자르기"
         case .resize: return "움짤 크기 조절"
         case .frame(let format): return "한 장 저장 · \(format.rawValue.uppercased())"
@@ -172,7 +173,7 @@ struct AnimatedImagePanel: View {
                 HStack(spacing: 8) {
                     Spacer()
                     Button("취소", action: back).buttonStyle(.glass)
-                    Button(frameFormat.map { "\($0.rawValue.uppercased()) 한 장 저장" } ?? "WEBP로 저장", action: save)
+                    Button(frameFormat.map { "\($0.rawValue.uppercased()) 한 장 저장" } ?? "\(outputFormat.rawValue.uppercased())로 저장", action: save)
                         .buttonStyle(.glassProminent).keyboardShortcut(.defaultAction)
                         .disabled(playback.image == nil || playback.error != nil || info.editingIssue != nil || model.isWorking)
                         .accessibilityIdentifier("animation.save")
@@ -258,7 +259,7 @@ struct AnimatedImagePanel: View {
 
     private var outputDescription: some View {
         VStack(alignment: .leading, spacing: 5) {
-            Label(frameFormat.map { "\($0.rawValue.uppercased()) · 선택한 한 장" } ?? "WEBP · 움직임 유지",
+            Label(frameFormat.map { "\($0.rawValue.uppercased()) · 선택한 한 장" } ?? "\(outputFormat.rawValue.uppercased()) · 움직임 유지",
                   systemImage: frameFormat != nil ? "photo" : "play.rectangle")
                 .font(.system(size: 12, weight: .semibold))
             Text(explanation).font(.system(size: 11.5)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
@@ -266,7 +267,11 @@ struct AnimatedImagePanel: View {
         .frame(maxWidth: .infinity, alignment: .leading).padding(12)
         .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 12))
     }
+    private var outputFormat: AnimationFormat {
+        if case .output(let format) = tool { return format }; return .webp
+    }
     private var explanation: String {
+        if case .output = tool { return "모든 프레임을 무손실로 저장하고 재생 시간·반복·투명도를 유지해요. 용량은 커질 수 있어요." }
         if let format = frameFormat {
             return format == .jpg ? "선택한 프레임을 최고 품질 JPG로 저장해요. 투명한 영역은 흰색으로 저장돼요."
                 : "선택한 프레임만 무손실 \(format.rawValue.uppercased())로 저장해요. 원본 움짤은 그대로 남아요."
@@ -291,6 +296,7 @@ struct AnimatedImagePanel: View {
             let edit: AnimatedImageEdit
             switch tool {
             case .webp: edit = .webp
+            case .output(let format): edit = .output(format: format, edit: .webp)
             case .crop: edit = .crop(crop)
             case .frame(let format): edit = .frame(playback.index, format: format)
             case .speed: edit = .speed(rate)

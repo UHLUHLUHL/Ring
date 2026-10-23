@@ -39,9 +39,9 @@ struct FileInfo {
             kind = .pdf
         } else if DocumentSource.extensions.contains(url.pathExtension.lowercased()) {
             kind = .document
-        } else if type?.conforms(to: .movie) == true || ["mp4","mov","m4v"].contains(url.pathExtension.lowercased()) {
+        } else if type?.conforms(to: .movie) == true || ["mp4","mov","m4v","webm"].contains(url.pathExtension.lowercased()) {
             kind = .video
-        } else if type?.conforms(to: .image) == true || ["webp","avif","heic"].contains(url.pathExtension.lowercased()) {
+        } else if type?.conforms(to: .image) == true || ["webp","avif","jxl","heic"].contains(url.pathExtension.lowercased()) {
             kind = .image
         } else {
             kind = .other
@@ -62,17 +62,18 @@ struct FileInfo {
             return ["DOCX", "JPG", "PNG", "WEBP"].map { RingAction(id: $0, title: $0, symbol: nil, kind: .convert($0)) }
         case .image:
             let own = (ext == "JPEG") ? "JPG" : ext
-            let formats = ["PNG", "JPG", "WEBP", "HEIC", "PDF"].filter { $0 != own }
+            let formats = (["PNG", "JPG", "WEBP", "HEIC", "PDF"] + RingFeatures.selected("image")).filter { $0 != own }
             return formats.map { RingAction(id: $0, title: $0, symbol: nil, kind: .convert($0)) }
         case .document:
             return ["PDF","PNG","JPG","WEBP"].map { RingAction(id:$0,title:$0,symbol:nil,kind:.convert($0)) }
         case .video:
-            return ["MP4","MOV","GIF","WEBP"].map { RingAction(id:$0,title:$0,symbol:nil,kind:.convert($0)) }
+            return (["MP4","MOV","GIF","WEBP"] + RingFeatures.selected("animation") + (RingFeatures.enabled("video", "WEBM") ? ["WEBM"] : [])).map { RingAction(id:$0,title:$0,symbol:nil,kind:.convert($0)) }
         case .animatedImage:
+            let additional = RingFeatures.selected("animation").filter { $0 != animation?.format }.map { RingAction(id: $0, title: $0, symbol: nil, kind: .convert($0)) }
             return [animation?.format == "WEBP"
                     ? RingAction(id: "speed", title: "재생 속도", symbol: "speedometer", kind: .tool)
                     : RingAction(id: "WEBP", title: "WEBP", symbol: nil, kind: .convert("WEBP")),
-                    RingAction(id: "frame", title: "한 장 저장", symbol: "photo", kind: .tool)]
+                    RingAction(id: "frame", title: "한 장 저장", symbol: "photo", kind: .tool)] + additional
         case .other:
             return []
         }

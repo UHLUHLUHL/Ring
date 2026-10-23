@@ -187,6 +187,16 @@ struct VideoSourceInfo {
             }
             codecs[container] = supported
         }
+        // Merge bundled encoder/muxer support using the actual input, not the host model.
+        for container in VideoContainer.engineCases {
+            try Task.checkCancellation()
+            if let available = try? SoftwareVideo.availability(url, container: container) {
+                var supported = codecs[container] ?? []
+                for codec in available.codecs where !supported.contains(codec) { supported.append(codec) }
+                codecs[container] = supported
+                if container == .webm { copyAudio[container] = !available.audioConversionRequired }
+            }
+        }
         try Task.checkCancellation()
         return VideoSourceInfo(duration: duration, videoDuration: videoTime, audioDuration: audioTime, width: width, height: height,
             frameRate: fps, videoBitrate: videoRate, audioBitrate: audioRate, videoBytes: videoBytes, audioBytes: audioBytes,

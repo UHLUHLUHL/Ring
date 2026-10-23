@@ -4,6 +4,7 @@ import ServiceManagement
 
 /// Shown when Ring is launched directly (not from the Finder menu).
 struct HomeView: View {
+    @State private var showingFeatures = false
     @State private var extensionEnabled: Bool?
     @AppStorage(AppSettings.showShortcutHints) private var showHints = true
     @State private var launchAtLogin = SMAppService.mainApp.status == .enabled
@@ -85,6 +86,9 @@ struct HomeView: View {
                 }
             }
 
+            Button("링 기능 구성…") { showingFeatures = true }.buttonStyle(.glass)
+                .frame(maxWidth: .infinity, alignment: .leading)
+
             settingRow(isOn: $showHints) {
                 VStack(alignment: .leading, spacing: 1) {
                     Text("링 아래 단축키 안내 표시").font(.system(size: 13, weight: .medium))
@@ -109,6 +113,7 @@ struct HomeView: View {
         }
         .padding(24)
         .frame(width: 520)
+        .sheet(isPresented: $showingFeatures) { RingFeatureSettings() }
         .onAppear(perform: refresh)
         .onDisappear(perform: stopRecording)
     }
@@ -214,5 +219,37 @@ final class HomeWindow {
         }
         NSApp.activate(ignoringOtherApps: true)
         window?.makeKeyAndOrderFront(nil)
+    }
+}
+
+
+private struct RingFeatureSettings: View {
+    @Environment(\.dismiss) private var dismiss
+    @State private var revision = 0
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text("링 기능 구성").font(.title2.bold())
+            Text("원하는 기능을 켜면 링에 추가돼요. 모든 칸은 항목 수에 맞춰 같은 각도로 나뉩니다.")
+                .font(.callout).foregroundStyle(.secondary)
+            ForEach(RingFeatures.groups, id: \.id) { group in
+                GroupBox(group.title) {
+                    VStack(alignment: .leading, spacing: 10) {
+                        ForEach(group.items) { item in
+                            Toggle(item.title, isOn: Binding(get: {
+                                _ = revision
+                                return RingFeatures.enabled(group.id, item.id)
+                            }, set: { on in
+                                RingFeatures.set(group.id, item.id, enabled: on)
+                                revision += 1
+                            }))
+                            .accessibilityIdentifier("feature.\(group.id).\(item.id)")
+                        }
+                    }.frame(maxWidth: .infinity, alignment: .leading).padding(6)
+                }
+            }
+            Text("영상 코덱은 선택한 파일에서 지원하는 항목만 표시해요. WebM에 음성 변환이 필요하면 실행 전에 확인합니다.")
+                .font(.caption).foregroundStyle(.secondary)
+            HStack { Spacer(); Button("완료") { dismiss() }.buttonStyle(.glassProminent) }
+        }.padding(24).frame(width: 440)
     }
 }

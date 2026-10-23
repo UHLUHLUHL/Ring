@@ -88,7 +88,7 @@ private struct ImageCompressionPanel:View {
             Picker("압축 방식",selection:$mode) { ForEach(CompressionMode.allCases,id:\.self) { Text($0.rawValue).tag($0) } }.pickerStyle(.segmented).labelsHidden()
             PanelRow(label:"원본") { Text(model.file.sizeText).font(.system(size:13,weight:.medium)).foregroundStyle(.secondary) }
             if mode != .lossless {
-                PanelRow(label:"형식") { Picker("출력 형식",selection:$format) { ForEach([ImageFormat.jpg,.webp,.heic],id:\.self) { Text($0.rawValue.uppercased()).tag($0) } }.labelsHidden() }
+                PanelRow(label:"형식") { Picker("출력 형식",selection:$format) { ForEach([ImageFormat.jpg,.webp,.heic] + RingFeatures.selected("image").compactMap { ImageFormat(rawValue: $0.lowercased()) }.filter { $0.isModern },id:\.self) { Text($0.rawValue.uppercased()).tag($0) } }.labelsHidden() }
                 if mode == .target {
                     PanelRow(label:"용량") { SizeFields(value:$size,unit:$unit) }
                 } else {

@@ -16,6 +16,10 @@ import CryptoKit
             colorProperties: [AVVideoColorPrimariesKey: AVVideoColorPrimaries_ITU_R_709_2,
                 AVVideoTransferFunctionKey: AVVideoTransferFunction_ITU_R_709_2,
                 AVVideoYCbCrMatrixKey: AVVideoYCbCrMatrix_ITU_R_709_2], bitrate: 2_000_000)
+        let sourceInfo = try await VideoSourceInfo.inspect(source)
+        try require(sourceInfo.codecs[.mp4]?.contains(.av1) == true, "MP4 AV1 available to ring")
+        try require(sourceInfo.codecs[.webm] == [.av1], "WebM AV1 available to ring")
+        try require(sourceInfo.copyAudio[.webm] == true, "silent WebM needs no audio consent")
         let original = SHA256.hash(data: try Data(contentsOf: source))
         try require(SoftwareVideo.isEncoderFailure(NSError(domain: AVFoundationErrorDomain, code: AVError.Code.encoderTemporarilyUnavailable.rawValue)), "real encoder failure permits fallback")
         for code in [AVError.Code.failedToLoadSampleData.rawValue, AVError.Code.segmentStartedWithNonSyncSample.rawValue] {

@@ -1,6 +1,7 @@
 import AppKit
 import QuickLookThumbnailing
 import SwiftUI
+import Combine
 
 @MainActor
 final class RingModel: ObservableObject {
@@ -13,6 +14,7 @@ final class RingModel: ObservableObject {
     }
     enum Screen: Equatable { case ring, crop, addBackground, tool(Tool) }
 
+    private var settingsObserver: AnyCancellable?
     let file: FileInfo
     @Published var tab: Tab
     /// 0 = 변환 layout, 1 = 편집 layout; animated between the two on a tab switch.
@@ -30,11 +32,18 @@ final class RingModel: ObservableObject {
     @Published private(set) var videoCodec: VideoConversionCodec?
     private var videoInspectionTask: Task<Void, Never>?
     var frameFormatItems: [RingAction] {
-        ["PNG", "JPG", "WEBP"].map { RingAction(id: "frame-" + $0, title: $0, symbol: nil, kind: .convert($0)) }
+        RingFeatures.frameFormats.map { RingAction(id: "frame-" + $0, title: $0, symbol: nil, kind: .convert($0)) }
     }
     var convertItems: [RingAction] {
         if file.kind == .video, videoStage != .format { return videoMenuItems }
-        return choosingFrameFormat ? frameFormatItems : file.convertActions
+        if choosingFrameFormat { return frameFormatItems }
+        if file.kind == .video {
+            return file.convertActions.filter { action in
+                guard let container = VideoContainer(rawValue: action.id.lowercased()) else { return true }
+                return videoSource.map { !($0.codecs[container] ?? []).isEmpty } ?? (container != .webm)
+            }
+        }
+        return file.convertActions
     }
     var editItems: [RingAction] { isSubmenu ? convertItems : file.editActions }
 
@@ -65,6 +74,12 @@ final class RingModel: ObservableObject {
         tab = file.convertActions.isEmpty && !file.editActions.isEmpty ? .edit : .convert
         tabProgress = (tab == .edit) ? 1 : 0
         if file.kind == .pdf,file.selection.count>1 { tab = .edit;tabProgress = 1 }
+        settingsObserver = NotificationCenter.default.publisher(for: UserDefaults.didChangeNotification)
+            .receive(on: DispatchQueue.main).sink { [weak self] _ in
+                guard let self else { return }
+                self.hovered = nil
+                self.objectWillChange.send()
+            }
         loadThumbnail()
         if file.kind == .video { inspectVideo() }
     }
@@ -113,7 +128,7 @@ final class RingModel: ObservableObject {
         switch action.kind {
         case .convert(let format):
             if file.kind == .animatedImage {
-                withAnimation(Self.panelTransition) { screen = .tool(.animatedImage(.webp)) }
+                withAnimation(Self.panelTransition) { screen = .tool(.animatedImage(AnimationFormat(rawValue: format.lowercased()).map { $0.isModern ? .output($0) : .webp } ?? .webp)) }
                 return
             }
             if file.kind == .video, let format = AnimationFormat(rawValue: format.lowercased()) {
@@ -352,6 +367,17 @@ final class RingModel: ObservableObject {
     }
 
     private func loadThumbnail() {
+        if ["AVIF", "JXL"].contains(file.ext) {
+            let url = file.url, animated = file.animation != nil
+            Task { [weak self] in
+                let image = await Task.detached(priority: .userInitiated) { () -> CGImage? in
+                    if animated, let decoder = try? AnimatedImageDecoder(url) { return try? decoder.frame(0, preview: true) }
+                    return try? ImageCodec.preview(url, maxDimension: 192)
+                }.value
+                if let image { self?.thumbnail = NSImage(cgImage: image, size: .zero) }
+            }
+            return
+        }
         let request = QLThumbnailGenerator.Request(fileAt: file.url, size: CGSize(width: 96, height: 96),
                                                    scale: NSScreen.main?.backingScaleFactor ?? 2,
                                                    representationTypes: .thumbnail)
@@ -379,7 +405,7 @@ extension RingModel {
         switch videoStage {
         case .format: return file.convertActions
         case .codec:
-            return (videoContainer.flatMap { videoSource?.codecs[$0] } ?? []).map {
+            return (videoContainer.flatMap { videoSource?.codecs[$0] } ?? []).filter { $0 != .av1 || videoContainer == .webm || RingFeatures.enabled("video", "AV1") }.map {
                 RingAction(id: "video-codec-" + $0.rawValue, title: $0.title, symbol: $0 == .passthrough ? "arrow.right.arrow.left" : nil, kind: .tool)
             }
         }
@@ -396,7 +422,7 @@ extension RingModel {
     }
     var showsVideoHub: Bool {
         guard file.kind == .video, tab == .convert else { return false }
-        if videoStage == .format, let action = hoveredAction, ["GIF", "WEBP"].contains(action.id) { return false }
+        if videoStage == .format, let action = hoveredAction, AnimationFormat(rawValue: action.id.lowercased()) != nil { return false }
         return true
     }
     private func inspectVideo() {
@@ -450,8 +476,16 @@ extension RingModel {
     func startVideoConversion() {
         guard !isWorking, !isNavigating, let container = videoContainer, let codec = videoCodec,
               let info = videoSource, info.codecs[container]?.contains(codec) == true else { return }
-        let options = VideoConversionOptions(container: container, codec: codec,
+        var options = VideoConversionOptions(container: container, codec: codec,
             sourceBytes: info.sourceBytes, sourceModified: info.modified)
+        if container == .webm, info.hasAudio, info.copyAudio[container] != true {
+            let alert = NSAlert()
+            alert.messageText = "WebM 음성을 Opus로 변환할까요?"
+            alert.informativeText = "이 원본 음성은 WebM에 그대로 담을 수 없어요. 영상의 프레임과 해상도는 유지하며, 음성만 Opus로 변환합니다."
+            alert.addButton(withTitle: "Opus로 변환"); alert.addButton(withTitle: "취소")
+            guard alert.runModal() == .alertFirstButtonReturn else { return }
+            options.audioPolicy = .convertToOpus
+        }
         run(.video(.convert(options)))
     }
 }

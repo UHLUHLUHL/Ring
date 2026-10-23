@@ -5,7 +5,7 @@ struct VideoHubContent: View {
     @ObservedObject var model: RingModel
 
     private var animationFormat:String? {
-        guard model.videoStage == .format,let action=model.hoveredAction,["GIF","WEBP"].contains(action.id) else { return nil }
+        guard model.videoStage == .format,let action=model.hoveredAction,AnimationFormat(rawValue: action.id.lowercased()) != nil else { return nil }
         return action.id
     }
     private var selection:String {
