@@ -7,7 +7,11 @@ on:
   workflow_dispatch:
 jobs:
   run:
-    runs-on: macos-15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, macos-26]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - name: Unpack
@@ -26,11 +30,18 @@ jobs:
           APP="$RUNNER_TEMP/Ring.app"
           open -a "$APP" "ring://open?path=$PWD/ci15/sample-motion.mp4&x=700&y=450"
           sleep 6
+          screencapture -x out/prompt.png
+          # Dismiss the first-run Finder automation prompt so the ring is visible.
+          osascript -e 'tell application "System Events" to tell (first process whose frontmost is true) to click button "Don’t Allow" of window 1' 2>&1 | tee out/dismiss.txt || true
+          osascript -e 'tell application "System Events" to get name of every process whose visible is true' 2>&1 | tee -a out/dismiss.txt || true
+          sleep 1
+          open -a "$APP" "ring://open?path=$PWD/ci15/sample-motion.mp4&x=700&y=450"
+          sleep 4
           pgrep -lf Ring.app/Contents/MacOS/Ring | tee out/process.txt
           screencapture -x out/screen.png
           log show --last 2m --predicate 'process == "Ring"' --style compact 2>/dev/null | tail -40 > out/ring-log.txt || true
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: macos15-app
+          name: app-${{ matrix.os }}
           path: out
