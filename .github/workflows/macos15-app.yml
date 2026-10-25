@@ -1,0 +1,36 @@
+name: macos15-app
+# Experimental: run a locally built macOS-15-target Ring on a macOS 15 runner.
+on:
+  push:
+    branches: [glass-probe]
+    paths: [ci15/**, .github/workflows/macos15-app.yml]
+  workflow_dispatch:
+jobs:
+  run:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Unpack
+        run: |
+          sw_vers
+          ditto -x -k ci15/Ring.zip "$RUNNER_TEMP"
+          codesign --verify --deep --strict "$RUNNER_TEMP/Ring.app" && echo signature-ok
+          mkdir -p out
+      - name: Engine (WebP, GIF)
+        run: |
+          chmod +x ci15/engine-bench
+          ci15/engine-bench ci15/sample-motion.mp4 webp out/sample.webp | tr '\r' '\n' | grep -E '^webp' | tee out/engine.txt
+          ci15/engine-bench ci15/sample-motion.mp4 gif out/sample.gif | tr '\r' '\n' | grep -E '^gif' | tee -a out/engine.txt
+      - name: Ring window
+        run: |
+          APP="$RUNNER_TEMP/Ring.app"
+          open -a "$APP" "ring://open?path=$PWD/ci15/sample-motion.mp4&x=700&y=450"
+          sleep 6
+          pgrep -lf Ring.app/Contents/MacOS/Ring | tee out/process.txt
+          screencapture -x out/screen.png
+          log show --last 2m --predicate 'process == "Ring"' --style compact 2>/dev/null | tail -40 > out/ring-log.txt || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: macos15-app
+          path: out
