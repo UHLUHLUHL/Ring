@@ -27,8 +27,9 @@ jobs:
           ci15/engine-bench ci15/sample-motion.mp4 gif out/sample.gif | tr '\r' '\n' | grep -E '^gif' | tee -a out/engine.txt
       - name: Glass (macOS 15 path)
         run: |
-          xcrun swiftc -O -target arm64-apple-macos15.0 Tools/glass15/*.swift -o glass15
-          RING_LEGACY_GLASS=1 ./glass15 out | tee out/glass.txt
+          # Built locally with the macOS 26 SDK (Tools/glass15); runners may ship older SDKs.
+          chmod +x ci15/glass15
+          RING_LEGACY_GLASS=1 ci15/glass15 out | tee out/glass.txt
       - name: Ring window
         run: |
           APP="$RUNNER_TEMP/Ring.app"
