@@ -1,0 +1,27 @@
+name: glass-probe
+# Experimental: checks whether the private backdrop displacement filter exists
+# and visibly distorts content on each macOS version. Not part of the app build.
+on:
+  push:
+    branches: [glass-probe]
+  workflow_dispatch:
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, macos-26]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build probe
+        run: xcrun swiftc -O Tools/glass-probe/main.swift -o glass-probe
+      - name: Run probe
+        run: |
+          mkdir -p out
+          ./glass-probe out
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: glass-probe-${{ matrix.os }}
+          path: out
