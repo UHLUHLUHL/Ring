@@ -65,7 +65,7 @@ struct ImageInput {
             context.draw(decoded,in:CGRect(x:0,y:0,width:decoded.width,height:decoded.height))
             guard let expanded=context.makeImage() else { throw EngineError.io("팔레트 펼치기 실패") }
             image=expanded
-        } else { image=decoded }
+        } else { image=ImageCodec.exactOpaque8Bit(decoded) ?? decoded }
         self.source = source; self.image = image; self.properties = properties
         self.type = type as String; orientation = properties[kCGImagePropertyOrientation] as? Int ?? 1
     }
@@ -125,7 +125,28 @@ enum ImageCodec {
         guard [.first,.last,.premultipliedFirst,.premultipliedLast].contains(image.alphaInfo),image.bitsPerComponent == 8 else { return image }
         let context = try PDFEngine.bitmap(width:image.width,height:image.height,space:image.colorSpace!,depth:16)
         context.setBlendMode(.copy);context.draw(image,in:CGRect(x:0,y:0,width:image.width,height:image.height))
-        return context.makeImage()!
+        let promoted = context.makeImage()!
+        // Fully opaque images (e.g. rendered PDF pages) gain nothing from 16-bit straight alpha.
+        return exactOpaque8Bit(promoted) ?? promoted
+    }
+    /// 16-bit image whose samples are all exact 8-bit values (v × 257) and fully opaque,
+    /// as 8-bit RGB/gray without alpha. Lossless; nil when any sample needs 16 bits.
+    static func exactOpaque8Bit(_ image:CGImage) -> CGImage? {
+        guard image.bitsPerComponent == 16,let space=image.colorSpace,space.model == .rgb || space.model == .monochrome,
+              let wide=try? PDFEngine.bitmap(width:image.width,height:image.height,space:space,depth:16),let data=wide.data else { return nil }
+        let rect=CGRect(x:0,y:0,width:image.width,height:image.height)
+        wide.setBlendMode(.copy);wide.interpolationQuality = .none;wide.draw(image,in:rect)
+        let channels=space.model == .rgb ? 4:2,count=image.width*image.height*channels
+        let samples=UnsafeBufferPointer(start:data.bindMemory(to:UInt16.self,capacity:count),count:count)
+        for i in stride(from:0,to:count,by:channels) {
+            for c in 0..<channels-1 where UInt16(littleEndian:samples[i+c]) % 257 != 0 { return nil }
+            if UInt16(littleEndian:samples[i+channels-1]) != 0xFFFF { return nil }
+        }
+        let info=space.model == .rgb ? CGImageAlphaInfo.noneSkipLast.rawValue:CGImageAlphaInfo.none.rawValue
+        guard let narrow=CGContext(data:nil,width:image.width,height:image.height,bitsPerComponent:8,bytesPerRow:0,space:space,bitmapInfo:info) else { return nil }
+        narrow.setBlendMode(.copy);narrow.interpolationQuality = .none;narrow.draw(wide.makeImage()!,in:rect)
+        guard let result=narrow.makeImage(),(try? PixelCheck.compare(image,result))?.exact == true else { return nil }
+        return result
     }
     static func write(_ providedImage: CGImage, properties: [CFString:Any], format: ImageFormat, to output: URL) throws {
         let image = format == .png ? try promoteAlpha(providedImage) : providedImage
