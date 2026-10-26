@@ -21,7 +21,7 @@ source "$ROOT/Tools/engine-build-env.sh"
 echo "• app"
 for ARCH in arm64 x86_64; do
   compile_engine_bridge $ARCH "$BUILD/CodecBridge-$ARCH.o"
-  $SWIFTC -import-objc-header "$ROOT/Sources/Engine/CodecBridge.h" -Xlinker -dead_strip -target $ARCH-apple-macos26.0 -module-name Ring -o $BUILD/Ring-$ARCH $ROOT/Sources/App/*.swift $ROOT/Sources/Engine/*.swift "$BUILD/CodecBridge-$ARCH.o" "${ENGINE_LIBS[@]}"
+  $SWIFTC -import-objc-header "$ROOT/Sources/Engine/CodecBridge.h" -Xlinker -dead_strip -target $ARCH-apple-macos15.0 -module-name Ring -o $BUILD/Ring-$ARCH $ROOT/Sources/App/*.swift $ROOT/Sources/Engine/*.swift "$BUILD/CodecBridge-$ARCH.o" "${ENGINE_LIBS[@]}"
 done
 lipo -create $BUILD/Ring-arm64 $BUILD/Ring-x86_64 -output $APP/Contents/MacOS/Ring
 cp $ROOT/Resources/App-Info.plist $APP/Contents/Info.plist
@@ -32,7 +32,7 @@ iconutil -c icns $BUILD/AppIcon.iconset -o $APP/Contents/Resources/AppIcon.icns
 
 echo "• finder extension"
 for ARCH in arm64 x86_64; do
-$SWIFTC -target $ARCH-apple-macos26.0 -module-name RingFinder -parse-as-library -application-extension \
+$SWIFTC -target $ARCH-apple-macos15.0 -module-name RingFinder -parse-as-library -application-extension \
   -Xlinker -e -Xlinker _NSExtensionMain -framework FinderSync \
   -o $BUILD/RingFinder-$ARCH $ROOT/Sources/FinderExtension/*.swift
 done

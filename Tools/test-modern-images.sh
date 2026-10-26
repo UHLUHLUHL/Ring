@@ -7,7 +7,7 @@ case "$ARCH" in arm64|x86_64) ;; *) exit 2;; esac
 source "$ROOT/Tools/engine-build-env.sh"
 # Small real high-bit files exercise decoder rejection before any RGBA8 conversion.
 mkdir -p .work/modern-input-fixtures
-xcrun clang++ -std=c++17 -O2 -arch "$ARCH" -mmacosx-version-min=26.0 \
+xcrun clang++ -std=c++17 -O2 -arch "$ARCH" -mmacosx-version-min=15.0 \
   -I"$ROOT/Vendor/build/$ARCH/install/include" -x c++ - -x none \
   "$ROOT/Vendor/build/universal/libavif.a" "$ROOT/Vendor/build/universal/libaom.a" \
   "$ROOT/Vendor/build/universal/libjxl.a" "$ROOT/Vendor/build/universal/libjxl_cms.a" \
@@ -41,7 +41,7 @@ int main(int argc,char **argv) {
 CPP
 /usr/bin/arch -"$ARCH" ".work/modern-input-fixture-tool-$ARCH" "$ROOT/.work/modern-input-fixtures"
 compile_engine_bridge "$ARCH" ".work/CodecBridge-modern-$ARCH.o"
-xcrun swiftc -swift-version 5 -O -target "$ARCH-apple-macos26.0" -module-cache-path .work/module-cache -parse-as-library \
+xcrun swiftc -swift-version 5 -O -target "$ARCH-apple-macos15.0" -module-cache-path .work/module-cache -parse-as-library \
   -import-objc-header Sources/Engine/CodecBridge.h -Xlinker -dead_strip Sources/Engine/*.swift Tests/ModernImageTests.swift \
   ".work/CodecBridge-modern-$ARCH.o" "${ENGINE_LIBS[@]}" -o ".work/modern-image-tests-$ARCH"
 /usr/bin/arch -"$ARCH" ".work/modern-image-tests-$ARCH" "$ROOT/.work/modern-input-fixtures"

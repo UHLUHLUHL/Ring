@@ -3,6 +3,14 @@ import SwiftUI
 
 enum RingWindowLayout {
     static let size = CGSize(width: 560, height: 720)
+    /// Page documents get a Preview-like editor: thumbnails, page view and a control column.
+    static let pageEditorWidth: CGFloat = 960
+    static func width(for screen: RingModel.Screen) -> CGFloat {
+        switch screen {
+        case .tool(.pdfCompression), .tool(.pdfMerge), .tool(.pdfPages), .tool(.pdfSplit): return pageEditorWidth
+        default: return size.width
+        }
+    }
     /// Distance from the window's top edge to the ring centre.
     static let ringCenterY: CGFloat = 300
     static let dragRadius:CGFloat = (RingMetrics.hubDiameter-12)/2
@@ -216,10 +224,27 @@ final class RingWindowController {
         return NSPoint(x: c.x - size.width / 2, y: c.y - (size.height - RingWindowLayout.ringCenterY))
     }
 
+    /// The ring's frame before a tool panel resized and moved the window.
+    private var ringFrame: NSRect?
+
     /// Tool panels are bigger than the ring: slide the window so the whole panel is visible.
+    /// Back on the ring, restore its own frame; the panel's height cut off the ring's bottom.
     private func fitForScreen(_ screen: RingModel.Screen) {
-        guard screen != .ring, let vf = Self.screen(for: NSPoint(x: panel.frame.midX, y: panel.frame.midY))?.visibleFrame else { return }
+        if screen == .ring {
+            guard let frame = ringFrame else { return }
+            ringFrame = nil
+            var transaction = Transaction()
+            transaction.disablesAnimations = true
+            withTransaction(transaction) { model.viewportHeight = frame.height }
+            panel.setFrame(frame, display: true)
+            return
+        }
+        if ringFrame == nil { ringFrame = panel.frame }
+        guard let vf = Self.screen(for: NSPoint(x: panel.frame.midX, y: panel.frame.midY))?.visibleFrame else { return }
         var f = panel.frame
+        let width = min(model.viewportWidth, vf.width)
+        f.origin.x += (f.width - width) / 2
+        f.size.width = width
         model.maximumPanelHeight = vf.height - 12
         f.size.height = min(model.viewportHeight, model.maximumPanelHeight)
         model.viewportHeight = f.height

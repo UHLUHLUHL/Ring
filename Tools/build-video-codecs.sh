@@ -33,13 +33,13 @@ for ARCH in $ARCHES; do
  BASE="$ROOT/Vendor/build/$ARCH/video"
  SRC="$ROOT/Vendor/build/source/video"
  mkdir -p "$PREFIX" "$BASE/x264" "$BASE/ffmpeg"
- COMMON=(-DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES=$ARCH -DCMAKE_OSX_DEPLOYMENT_TARGET=26.0
+ COMMON=(-DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES=$ARCH -DCMAKE_OSX_DEPLOYMENT_TARGET=15.0
  -DCMAKE_INSTALL_PREFIX=$PREFIX -DCMAKE_INSTALL_LIBDIR=lib -DCMAKE_POSITION_INDEPENDENT_CODE=ON
  -DCMAKE_POLICY_VERSION_MINIMUM=3.5 -DCMAKE_SYSTEM_NAME=Darwin -DCMAKE_SYSTEM_PROCESSOR=$ARCH
  -DCMAKE_FIND_USE_PACKAGE_REGISTRY=OFF '-DCMAKE_IGNORE_PREFIX_PATH=/opt/homebrew;/usr/local' -DBUILD_SHARED_LIBS=OFF)
  if [[ ! -f "$PREFIX/lib/libx264.a" ]]; then
   HOST=$ARCH; [[ $ARCH == arm64 ]] && HOST=aarch64
-  (cd "$BASE/x264"; CC="clang -arch $ARCH -mmacosx-version-min=26.0" "$SRC/x264/configure" --host=$HOST-apple-darwin --prefix="$PREFIX" --enable-static --enable-pic --disable-cli --disable-opencl --bit-depth=8 --chroma-format=420; make -j$JOBS; make install-lib-static install-lib-dev)
+  (cd "$BASE/x264"; CC="clang -arch $ARCH -mmacosx-version-min=15.0" "$SRC/x264/configure" --host=$HOST-apple-darwin --prefix="$PREFIX" --enable-static --enable-pic --disable-cli --disable-opencl --bit-depth=8 --chroma-format=420; make -j$JOBS; make install-lib-static install-lib-dev)
  fi
  if [[ ! -f "$PREFIX/lib/libx265.a" ]]; then
   "$CMAKE" -S "$SRC/x265/source" -B "$BASE/x265" "${COMMON[@]}" -DENABLE_SHARED=OFF -DENABLE_CLI=OFF -DENABLE_ASSEMBLY=OFF -DENABLE_LIBNUMA=OFF -DHIGH_BIT_DEPTH=OFF
@@ -59,7 +59,7 @@ for ARCH in $ARCHES; do
   CPU=$ARCH; [[ $ARCH == arm64 ]] && CPU=aarch64
   (cd "$BASE/ffmpeg"; PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" PKG_CONFIG_LIBDIR="$PREFIX/lib/pkgconfig" \
    "$SRC/ffmpeg/configure" --prefix="$PREFIX" --cc=clang --cxx=clang++ --arch=$CPU --target-os=darwin --enable-cross-compile \
-   --extra-cflags="-arch $ARCH -mmacosx-version-min=26.0 -I$PREFIX/include" --extra-ldflags="-arch $ARCH -mmacosx-version-min=26.0 -L$PREFIX/lib" \
+   --extra-cflags="-arch $ARCH -mmacosx-version-min=15.0 -I$PREFIX/include" --extra-ldflags="-arch $ARCH -mmacosx-version-min=15.0 -L$PREFIX/lib" \
    --pkg-config-flags=--static --enable-static --disable-shared --enable-pic --enable-gpl --disable-autodetect \
    --disable-programs --disable-doc --disable-debug --disable-everything --enable-pthreads --enable-zlib \
    --enable-avcodec --enable-avformat --enable-swscale --enable-swresample \

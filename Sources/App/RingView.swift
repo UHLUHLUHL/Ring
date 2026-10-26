@@ -36,7 +36,7 @@ struct RootView: View {
                 .transition(.move(edge: .bottom).combined(with: .opacity))
             }
         }
-        .frame(width: RingWindowLayout.size.width, height: model.viewportHeight)
+        .frame(width: model.viewportWidth, height: model.viewportHeight)
         .environment(\.toolPanelMeasure, { [screen = model.screen] height in
             if model.screen == screen { model.sizeToolPanel(height) }
         })
@@ -77,7 +77,7 @@ struct RingScreen: View {
             }
             if model.isWorking && !model.isCompleting {
                 Button(model.isCancelling ? "취소 중…":"작업 취소") { model.cancelWork() }
-                    .buttonStyle(.glass).controlSize(.small).disabled(model.isCancelling)
+                    .ringGlassButton().controlSize(.small).disabled(model.isCancelling)
                     .accessibilityIdentifier("job.cancel")
                     .padding(.top, RingMetrics.canvas / 2 + RingMetrics.hubDiameter / 2 + 12)
                     .transition(.opacity.combined(with: .scale(scale: 0.92)))
@@ -273,7 +273,7 @@ struct RingWedges: View, Animatable {
                 // per frame instead of once per wedge — that kept the morph at 50–60 fps.
                 Color.clear
                     .frame(width: side, height: side)
-                    .glassEffect(RingMetrics.glass.interactive(), in: all)
+                    .ringGlass(RingMetrics.glass, interactive: true, in: all)
             } else {
                 // Native transparent panels need painted pixels to receive clicks.
                 // Follow the animated glass outline, never a full-size disc that
@@ -534,7 +534,7 @@ struct TabPill: View {
         // The bouncy knob may overshoot a pixel or two; never let it leave the track.
         .clipShape(Capsule())
         .padding(3)
-        .glassEffect(.regular.interactive(), in: Capsule())
+        .ringGlass(.regular, interactive: true, in: Capsule())
         .hitTestableGlass(Capsule())
         .onAppear { (leftEdge, rightEdge) = edges(for: model.tab) }
         .onChange(of: model.tab) { _, tab in
@@ -584,7 +584,7 @@ struct ShortcutHints: View {
             hint("esc", "닫기")
         }
         .padding(.horizontal, 10).padding(.vertical, 5)
-        .glassEffect(.regular, in: Capsule())
+        .ringGlass(.regular, in: Capsule())
     }
 
     private func hint(_ key: String, _ label: String) -> some View {
@@ -611,7 +611,7 @@ struct ToastView: View {
                 .font(.system(size: 12, weight: .semibold))
         }
         .padding(.leading, 9).padding(.trailing, 14).padding(.vertical, 8)
-        .glassEffect(.regular, in: Capsule())
+        .ringGlass(.regular, in: Capsule())
     }
 }
 

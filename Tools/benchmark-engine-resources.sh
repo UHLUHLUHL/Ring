@@ -9,7 +9,7 @@ ARCH=$(uname -m)
 mkdir -p "$OUTPUT/fixtures" .work/module-cache
 source "$ROOT/Tools/engine-build-env.sh"
 compile_engine_bridge "$ARCH" "$OUTPUT/bridge.o"
-xcrun swiftc -swift-version 5 -O -parse-as-library -target "$ARCH-apple-macos26.0" \
+xcrun swiftc -swift-version 5 -O -parse-as-library -target "$ARCH-apple-macos15.0" \
   -import-objc-header Sources/Engine/CodecBridge.h -module-cache-path .work/module-cache \
   -Xlinker -dead_strip Sources/Engine/*.swift Tests/MediaFixture.swift Tests/EngineResourceBench.swift \
   "$OUTPUT/bridge.o" "${ENGINE_LIBS[@]}" -o "$OUTPUT/resource-bench"

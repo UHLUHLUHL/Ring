@@ -52,12 +52,12 @@ private struct ToolForm<Content:View>:View {
                 HStack(spacing:8) {
                     Spacer()
                     Button("취소", action: model.backToRing)
-                        .buttonStyle(.glass)
+                        .ringGlassButton()
                     Button(buttonTitle) {
                         do { let job=try operation();error=nil;model.run(job) }
                         catch { self.error=error.localizedDescription }
                     }
-                    .buttonStyle(.glassProminent).keyboardShortcut(.defaultAction)
+                    .ringGlassButton(prominent: true).keyboardShortcut(.defaultAction)
                     .disabled(!ready || model.isWorking)
                     .accessibilityIdentifier("tool.save")
                 }
@@ -166,13 +166,62 @@ private struct ImageMetadataPanel:View {
     }
 }
 
+/// Preview-style layout for page documents: thumbnails and a large page on the left,
+/// settings and actions on the right.
+private struct PageEditorForm<Controls:View>:View {
+    @ObservedObject var model:RingModel
+    let title:String
+    let browser:PDFPageBrowser
+    let document:PDFDocument?
+    var placeholder="읽는 중…"
+    var ready=true
+    let operation:() throws -> EngineOperation
+    @ViewBuilder var controls:Controls
+    @State private var error:String?
+    private var pageHeight:CGFloat { max(320,min(560,model.maximumPanelHeight-110)) }
+    var body:some View {
+        GlassPanel(title:title,subtitle:model.file.name,width:RingWindowLayout.pageEditorWidth-40,onClose:model.backToRing) {
+            HStack(alignment:.top,spacing:16) {
+                PDFPageBrowserView(browser:browser,document:document)
+                    .frame(maxWidth:.infinity).frame(height:pageHeight)
+                    .background(.black.opacity(0.035),in:RoundedRectangle(cornerRadius:14,style:.continuous))
+                    .clipShape(RoundedRectangle(cornerRadius:14,style:.continuous))
+                    .overlay { if document == nil { Text(placeholder).font(.system(size:13)).foregroundStyle(.secondary).padding() } }
+                VStack(alignment:.leading,spacing:12) {
+                    controls
+                    if let error {
+                        Text(error).font(.system(size:12)).foregroundStyle(.red).fixedSize(horizontal:false,vertical:true)
+                            .accessibilityIdentifier("tool.validation")
+                    }
+                    Spacer(minLength:0)
+                    HStack(spacing:8) {
+                        Spacer()
+                        Button("취소",action:model.backToRing).ringGlassButton()
+                        Button("저장") {
+                            do { let job=try operation();error=nil;model.run(job) }
+                            catch { self.error=error.localizedDescription }
+                        }
+                        .ringGlassButton(prominent:true).keyboardShortcut(.defaultAction)
+                        .disabled(!ready || model.isWorking)
+                        .accessibilityIdentifier("tool.save")
+                    }
+                }
+                .frame(width:270).frame(height:pageHeight,alignment:.top)
+            }
+        }
+    }
+}
+
 private struct PDFCompressionPanel:View {
     @ObservedObject var model:RingModel
+    @StateObject private var browser=PDFPageBrowser()
+    @State private var document:PDFDocument?
+    @State private var placeholder="읽는 중…"
     @State private var smart=true
     @State private var dimension="2000"
     @State private var quality=82.0
     var body:some View {
-        ToolForm(model:model,title:"PDF 용량 줄이기",operation:{
+        PageEditorForm(model:model,title:"PDF 용량 줄이기",browser:browser,document:document,placeholder:placeholder,operation:{
             if !smart { return .compress }
             return .pdfSmartCompress(.init(maxImageDimension:try ToolSettings.integer(dimension,name:"이미지 긴 변",range:64...16384),jpegQuality:quality/100))
         }) {
@@ -185,17 +234,24 @@ private struct PDFCompressionPanel:View {
                     Text("\(Int(quality))%").monospacedDigit().frame(width:40)
                 }
             }
+        }.task {
+            document=PDFDocument(url:model.file.url)
+            if document == nil { placeholder="미리보기를 열 수 없어요" }
         }
     }
 }
 
 private struct PDFMergePanel:View {
     @ObservedObject var model:RingModel
+    @StateObject private var browser=PDFPageBrowser()
+    @State private var document:PDFDocument?
     @State private var files:[URL]=[]
     @State private var selected:Int?
     @State private var uniform=false
+    private var previewURL:URL? { selected.flatMap { files.indices.contains($0) ? files[$0]:nil } ?? files.first }
     var body:some View {
-        ToolForm(model:model,title:"PDF 병합",ready:files.count>=2,operation:{ .pdfMerge(sources:files,uniformWidth:uniform ? 0:nil) }) {
+        PageEditorForm(model:model,title:"PDF 병합",browser:browser,document:document,placeholder:files.isEmpty ? "PDF를 추가해 주세요":"미리보기를 열 수 없어요",ready:files.count>=2,operation:{ .pdfMerge(sources:files,uniformWidth:uniform ? 0:nil) }) {
+            Text("합칠 순서").font(.system(size:12,weight:.medium)).foregroundStyle(.secondary)
             ScrollView {
                 VStack(spacing:4) {
                     ForEach(Array(files.enumerated()),id:\.offset) { i,url in
@@ -205,16 +261,18 @@ private struct PDFMergePanel:View {
                         }.buttonStyle(.plain).accessibilityLabel("병합 \(i+1): \(url.lastPathComponent)")
                     }
                 }
-            }.frame(height:180).background(.black.opacity(0.035),in:RoundedRectangle(cornerRadius:10))
+            }.frame(maxHeight:.infinity).background(.black.opacity(0.035),in:RoundedRectangle(cornerRadius:10))
+            Button(action:add) { Text("PDF 추가").frame(maxWidth:.infinity) }.ringGlassButton()
             HStack {
-                Button("PDF 추가",action:add)
-                Spacer()
                 Button { move(-1) } label:{ Image(systemName:"arrow.up") }.accessibilityLabel("위로 이동").disabled(selected == nil || selected == 0)
                 Button { move(1) } label:{ Image(systemName:"arrow.down") }.accessibilityLabel("아래로 이동").disabled(selected == nil || selected == files.count-1)
-                Button("제거") { if let selected { files.remove(at:selected);self.selected=nil } }.disabled(selected == nil)
-            }.buttonStyle(.glass)
+                Spacer()
+                Button("제거") { if let selected { files.remove(at:selected);self.selected=files.isEmpty ? nil:min(selected,files.count-1) } }.disabled(selected == nil)
+            }.ringGlassButton()
             Toggle("가로폭 자동 균일화",isOn:$uniform)
-        }.onAppear { files=model.file.selection.filter { FileInfo(url:$0).kind == .pdf } }
+        }
+        .onAppear { files=model.file.selection.filter { FileInfo(url:$0).kind == .pdf };selected=files.isEmpty ? nil:0 }
+        .onChange(of:previewURL) { _,url in document=url.flatMap { PDFDocument(url:$0) } }
     }
     private func add() {
         let panel=NSOpenPanel();panel.allowedContentTypes=[.pdf];panel.allowsMultipleSelection=true;panel.canChooseDirectories=false;panel.prompt="추가"
@@ -228,28 +286,97 @@ private struct PDFMergePanel:View {
 private struct PDFPagesPanel:View {
     @ObservedObject var model:RingModel
     let split:Bool
+    @StateObject private var browser=PDFPageBrowser()
+    @State private var document:PDFDocument?
     @State private var count:Int?
     @State private var spec=""
     @State private var remove=false
     @State private var loadError:String?
     var body:some View {
-        ToolForm(model:model,title:split ? "PDF 분할":"PDF 페이지 정리",ready:count != nil,operation:{
-            guard let count else { throw EngineError.invalid("페이지를 먼저 읽어야 해요.") }
-            let groups=try ToolSettings.pageGroups(spec,count:count)
-            if split { return .pdfSplit(groups.map { $0.first!...$0.last! }) }
-            let listed=groups.flatMap { $0 }
-            let excluded=Set(listed)
-            let pages=remove ? (0..<count).filter { !excluded.contains($0) }:listed
-            guard !pages.isEmpty else { throw EngineError.invalid("최소 한 페이지를 남겨 주세요.") }
-            return .pdfPages(pages)
-        }) {
-            PanelRow(label:"페이지") { Text(count.map { "전체 \($0)페이지" } ?? (loadError ?? "읽는 중…")).font(.system(size:13,weight:.medium)).foregroundStyle(.secondary) }
+        PageEditorForm(model:model,title:split ? "PDF 분할":"PDF 페이지 정리",browser:browser,document:document,placeholder:loadError ?? "읽는 중…",ready:count != nil,operation:operation) {
+            Text(count.map { "전체 \($0)페이지" } ?? (loadError ?? "읽는 중…")).font(.system(size:13,weight:.medium)).foregroundStyle(.secondary)
             if !split { Picker("작업",selection:$remove) { Text("순서 지정·추출").tag(false);Text("페이지 삭제").tag(true) }.pickerStyle(.segmented).labelsHidden() }
+            Text(split ? "나눌 범위" : remove ? "지울 페이지" : "남길 페이지와 순서").font(.system(size:12,weight:.medium)).foregroundStyle(.secondary)
             TextField(split ? "예: 1-3, 4-6, 8":"예: 3, 1-2, 5",text:$spec).textFieldStyle(.roundedBorder).accessibilityLabel("페이지 범위")
+            Button(action:addSelection) { Text("선택한 페이지 넣기").frame(maxWidth:.infinity) }
+                .ringGlassButton().disabled(document == nil)
+                .accessibilityIdentifier("pdfPages.addSelection")
+            Text("왼쪽 썸네일에서 ⌘·⇧ 클릭으로 여러 페이지를 고를 수 있어요.").font(.system(size:11)).foregroundStyle(.secondary).fixedSize(horizontal:false,vertical:true)
         }.task {
-            do { let url=model.file.url;count=try await Task.detached { try PDFEngine.open(url).pageCount }.value }
-            catch { loadError=error.localizedDescription }
+            let url=model.file.url
+            do {
+                count=try await Task.detached { try PDFEngine.open(url).pageCount }.value
+                document=PDFDocument(url:url)
+            } catch { loadError=error.localizedDescription }
         }
+    }
+    /// Appends the thumbnail selection as one-based ranges, e.g. "1-3, 5".
+    private func addSelection() {
+        let pages=browser.selectedPages
+        guard !pages.isEmpty else { return }
+        var runs:[String]=[]
+        var first=pages[0],last=pages[0]
+        for page in pages.dropFirst()+[-2] {
+            if page == last+1 { last=page;continue }
+            runs.append(first == last ? "\(first+1)":"\(first+1)-\(last+1)")
+            first=page;last=page
+        }
+        let current=spec.trimmingCharacters(in:.whitespacesAndNewlines)
+        spec=(current.isEmpty ? "":current+", ")+runs.joined(separator:", ")
+    }
+    private func operation() throws -> EngineOperation {
+        guard let count else { throw EngineError.invalid("페이지를 먼저 읽어야 해요.") }
+        let groups=try ToolSettings.pageGroups(spec,count:count)
+        if split { return .pdfSplit(groups.map { $0.first!...$0.last! }) }
+        let listed=groups.flatMap { $0 }
+        let excluded=Set(listed)
+        let pages=remove ? (0..<count).filter { !excluded.contains($0) }:listed
+        guard !pages.isEmpty else { throw EngineError.invalid("최소 한 페이지를 남겨 주세요.") }
+        return .pdfPages(pages)
+    }
+}
+
+@MainActor
+private final class PDFPageBrowser:ObservableObject {
+    let pageView=PDFView()
+    let thumbnails=PDFThumbnailView()
+    /// Zero-based, ascending. PDFKit counts the current page as selected when nothing else is.
+    var selectedPages:[Int] {
+        guard let document=pageView.document else { return [] }
+        return Set((thumbnails.selectedPages ?? []).map { document.index(for:$0) }).filter { $0>=0 && $0<document.pageCount }.sorted()
+    }
+}
+
+private struct PDFPageBrowserView:NSViewRepresentable {
+    let browser:PDFPageBrowser
+    let document:PDFDocument?
+    func makeNSView(context:Context)->NSView {
+        let container=NSView()
+        let pages=browser.pageView,thumbs=browser.thumbnails
+        pages.displayMode = .singlePage
+        pages.autoScales=true
+        pages.backgroundColor = .clear
+        thumbs.pdfView=pages
+        thumbs.thumbnailSize=CGSize(width:88,height:114)
+        thumbs.backgroundColor = .clear
+        thumbs.allowsMultipleSelection=true
+        thumbs.allowsDragging=false
+        thumbs.setAccessibilityLabel("페이지 썸네일")
+        for view in [thumbs,pages] as [NSView] { view.translatesAutoresizingMaskIntoConstraints=false;container.addSubview(view) }
+        NSLayoutConstraint.activate([
+            thumbs.leadingAnchor.constraint(equalTo:container.leadingAnchor,constant:6),
+            thumbs.topAnchor.constraint(equalTo:container.topAnchor,constant:6),
+            thumbs.bottomAnchor.constraint(equalTo:container.bottomAnchor,constant:-6),
+            thumbs.widthAnchor.constraint(equalToConstant:120),
+            pages.leadingAnchor.constraint(equalTo:thumbs.trailingAnchor,constant:6),
+            pages.trailingAnchor.constraint(equalTo:container.trailingAnchor),
+            pages.topAnchor.constraint(equalTo:container.topAnchor),
+            pages.bottomAnchor.constraint(equalTo:container.bottomAnchor),
+        ])
+        return container
+    }
+    func updateNSView(_ view:NSView,context:Context) {
+        if browser.pageView.document !== document { browser.pageView.document=document }
     }
 }
 
@@ -590,7 +717,7 @@ private struct VideoToolPanel:View {
                         .font(.system(size: 13, weight: .bold))
                         .frame(width: 32, height: 32)
                 }
-                .buttonStyle(.glass)
+                .ringGlassButton()
                 .buttonBorderShape(.circle)
 
                 FilmstripTrimBar(
@@ -660,7 +787,7 @@ private struct VideoToolPanel:View {
                     Spacer(minLength:4)
                     ForEach([24,30,60],id:\.self) { rate in
                         Button("\(rate)") { fps=String(rate) }
-                            .buttonStyle(.glass)
+                            .ringGlassButton()
                             .tint(Double(fps)==Double(rate) ? .accentColor:nil)
                             .accessibilityLabel("\(rate)fps 프리셋")
                             .accessibilityIdentifier("animation.fps.\(rate)")
@@ -773,11 +900,11 @@ private struct VideoToolPanel:View {
                         Text("px")
                         Spacer(minLength:4)
                         Button("원본") { compressionDimension="";refreshCompressionDimensions() }
-                            .buttonStyle(.glass).tint(compressionDimension.isEmpty ? .accentColor:nil)
+                            .ringGlassButton().tint(compressionDimension.isEmpty ? .accentColor:nil)
                             .accessibilityIdentifier("video.dimensions.original")
                         ForEach([1280,1920,3840].filter { $0<compressionBase.width },id:\.self) { width in
                             Button(String(width)) { updateCompressionDimension(String(width),horizontal:true) }
-                                .buttonStyle(.glass).tint(Int(compressionWidth)==width ? .accentColor:nil)
+                                .ringGlassButton().tint(Int(compressionWidth)==width ? .accentColor:nil)
                                 .accessibilityIdentifier("video.width.\(width)")
                         }
                     }
@@ -900,12 +1027,12 @@ private struct DimensionPresets:View {
         HStack(spacing:6) {
             if automatic {
                 Button(prefix == "video" ? "원본":"자동") { text="" }
-                    .buttonStyle(.glass).tint(text.isEmpty ? .accentColor:nil)
+                    .ringGlassButton().tint(text.isEmpty ? .accentColor:nil)
                     .accessibilityIdentifier("\(prefix).maxDimension.auto")
             }
             ForEach(values,id:\.self) { value in
                 Button(String(value)) { text=String(value) }
-                    .buttonStyle(.glass)
+                    .ringGlassButton()
                     .tint(Int(text)==value ? .accentColor:nil)
                     .accessibilityLabel("긴 변 \(value)px 프리셋")
                     .accessibilityIdentifier("\(prefix).maxDimension.\(value)")

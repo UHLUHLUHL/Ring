@@ -14,7 +14,7 @@ enum RingMetrics {
     /// Side of the square the ring is drawn in (leaves room for the hover lift).
     static let canvas: CGFloat = (outer + 22) * 2
     /// Glass variant for the ring. `.clear` lets the lensing show; `ring://…&glass=regular` overrides.
-    static var glass: Glass = .clear
+    static var glass: RingGlassStyle = .clear
     /// Ring size when closed: it opens from here and closes back to it (guess, tuned by eye).
     static let closedGrow: CGFloat = 0.3
 }

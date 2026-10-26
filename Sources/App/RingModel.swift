@@ -16,6 +16,7 @@ final class RingModel: ObservableObject {
 
     private var settingsObserver: AnyCancellable?
     @Published var viewportHeight: CGFloat = RingWindowLayout.size.height
+    @Published private(set) var viewportWidth: CGFloat = RingWindowLayout.size.width
     @Published private(set) var previewHeightReduction: CGFloat = 0
     var maximumPanelHeight: CGFloat = RingWindowLayout.size.height
     private var toolPanelSized = false
@@ -76,6 +77,9 @@ final class RingModel: ObservableObject {
             if screen != oldValue {
                 toolPanelSized = false
                 previewHeightReduction = 0
+                var transaction = Transaction()
+                transaction.disablesAnimations = true
+                withTransaction(transaction) { viewportWidth = RingWindowLayout.width(for: screen) }
                 screenChanged(screen)
             }
         }

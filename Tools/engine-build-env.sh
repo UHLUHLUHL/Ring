@@ -6,20 +6,20 @@ done
 ENGINE_LIBS+=(-lc++ -lz -lm)
 compile_engine_bridge() {
   local ARCH=$1 OBJECT=$2
-  xcrun clang -std=c11 -O3 -arch "$ARCH" -mmacosx-version-min=26.0 \
+  xcrun clang -std=c11 -O3 -arch "$ARCH" -mmacosx-version-min=15.0 \
     -I"$ROOT/Sources/Engine" -I"$ROOT/Vendor/build/$ARCH/install/include" \
     -c "$ROOT/Sources/Engine/CodecBridge.c" -o "$OBJECT.base.o"
-  xcrun clang -std=c11 -O3 -arch "$ARCH" -mmacosx-version-min=26.0 \
+  xcrun clang -std=c11 -O3 -arch "$ARCH" -mmacosx-version-min=15.0 \
     -I"$ROOT/Sources/Engine" -I"$ROOT/Vendor/build/$ARCH/install/include" \
     -c "$ROOT/Sources/Engine/CodecV2.c" -o "$OBJECT.v2.o"
-  xcrun clang++ -std=c++17 -O2 -arch "$ARCH" -mmacosx-version-min=26.0 \
+  xcrun clang++ -std=c++17 -O2 -arch "$ARCH" -mmacosx-version-min=15.0 \
     -I"$ROOT/Sources/Engine" -I"$ROOT/Vendor/build/$ARCH/install/include" \
     -I"$ROOT/Vendor/build/source/qpdf/qpdf-12.4.2/include" \
     -c "$ROOT/Sources/Engine/PDFBridge.cpp" -o "$OBJECT.pdf.o"
-  xcrun clang++ -std=c++17 -O2 -arch "$ARCH" -mmacosx-version-min=26.0 \
+  xcrun clang++ -std=c++17 -O2 -arch "$ARCH" -mmacosx-version-min=15.0 \
     -I"$ROOT/Sources/Engine" -I"$ROOT/Vendor/build/$ARCH/install/include" \
     -c "$ROOT/Sources/Engine/ModernImageBridge.cpp" -o "$OBJECT.modern.o"
-  xcrun clang -std=c11 -O3 -arch "$ARCH" -mmacosx-version-min=26.0 \
+  xcrun clang -std=c11 -O3 -arch "$ARCH" -mmacosx-version-min=15.0 \
     -I"$ROOT/Sources/Engine" -I"$ROOT/Vendor/build/$ARCH/install/include" \
     -c "$ROOT/Sources/Engine/SoftwareVideo.c" -o "$OBJECT.video.o"
   xcrun ld -r -arch "$ARCH" "$OBJECT.base.o" "$OBJECT.v2.o" "$OBJECT.pdf.o" "$OBJECT.modern.o" "$OBJECT.video.o" -o "$OBJECT"

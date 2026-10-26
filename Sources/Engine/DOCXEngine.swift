@@ -114,6 +114,32 @@ enum DOCXEngine {
         return result+"</w:p>"
     }
     static func recognize(_ image:CGImage,nativePage:PDFPage? = nil) async throws -> String {
+        if #available(macOS 26, *) { return try await recognizeDocument(image,nativePage:nativePage) }
+        return try recognizeLines(image,nativePage:nativePage)
+    }
+    /// macOS 15 fallback: line-level text recognition. No table or paragraph
+    /// structure is available, so each recognized line becomes a paragraph.
+    static func recognizeLines(_ image:CGImage,nativePage:PDFPage?) throws -> String {
+        let request=VNRecognizeTextRequest()
+        request.recognitionLevel = .accurate
+        request.recognitionLanguages=["ko-KR","en-US"]
+        request.usesLanguageCorrection=true
+        try VNImageRequestHandler(cgImage:image).perform([request])
+        var blocks:[(CGRect,String)]=[]
+        for line in request.results ?? [] {
+            guard var transcript=line.topCandidates(1).first?.string else { continue }
+            let box=line.boundingBox
+            if let page=nativePage,page.rotation == 0 {
+                let bounds=page.bounds(for:.cropBox)
+                let rect=CGRect(x:bounds.minX+box.minX*bounds.width,y:bounds.minY+box.minY*bounds.height,width:box.width*bounds.width,height:box.height*bounds.height).insetBy(dx:-1,dy:-1)
+                if let text=page.selection(for:rect)?.string,!text.trimmingCharacters(in:.whitespacesAndNewlines).isEmpty { transcript=text }
+            }
+            blocks.append((box,paragraph(transcript)))
+        }
+        return reflow(blocks).map(\.1).joined()
+    }
+    @available(macOS 26, *)
+    static func recognizeDocument(_ image:CGImage,nativePage:PDFPage?) async throws -> String {
         var request=RecognizeDocumentsRequest()
         request.barcodeDetectionOptions.enabled=false
         request.textRecognitionOptions.recognitionLanguages=[Locale.Language(identifier:"ko"),Locale.Language(identifier:"en")]

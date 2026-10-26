@@ -52,7 +52,7 @@ struct HomeView: View {
             }
             .padding(16)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .glassEffect(.regular, in: RoundedRectangle(cornerRadius: 20, style: .continuous))
+            .ringGlass(.regular, in: RoundedRectangle(cornerRadius: 20, style: .continuous))
 
             HStack(spacing: 8) {
                 Circle()
@@ -60,7 +60,7 @@ struct HomeView: View {
                     .frame(width: 8, height: 8)
                 Text(statusText).font(.system(size: 12)).foregroundStyle(.secondary)
                 Spacer()
-                Button("다시 확인") { refresh() }.buttonStyle(.glass).controlSize(.small)
+                Button("다시 확인") { refresh() }.ringGlassButton().controlSize(.small)
             }
 
             HStack(alignment: .center, spacing: 12) {
@@ -72,10 +72,10 @@ struct HomeView: View {
                 }
                 Spacer(minLength: 0)
                 if hotKey != .standard && !recording {
-                    Button("기본값") { apply(.standard) }.buttonStyle(.glass).controlSize(.small)
+                    Button("기본값") { apply(.standard) }.ringGlassButton().controlSize(.small)
                 }
                 Button(recording ? "입력 대기…" : hotKey.display) { recording ? stopRecording() : startRecording() }
-                    .buttonStyle(.glass).controlSize(.small)
+                    .ringGlassButton().controlSize(.small)
                     .frame(minWidth: 90, alignment: .trailing)
             }
 
@@ -86,7 +86,7 @@ struct HomeView: View {
                 }
             }
 
-            Button("링 기능 구성…") { showingFeatures = true }.buttonStyle(.glass)
+            Button("링 기능 구성…") { showingFeatures = true }.ringGlassButton()
                 .frame(maxWidth: .infinity, alignment: .leading)
 
             settingRow(isOn: $showHints) {
@@ -104,10 +104,10 @@ struct HomeView: View {
                 .frame(maxWidth:.infinity,alignment:.leading)
 
             HStack(spacing: 8) {
-                Button("종료") { NSApp.terminate(nil) }.buttonStyle(.glass)
-                Button("파일 열기…",action:openFiles).buttonStyle(.glass)
+                Button("종료") { NSApp.terminate(nil) }.ringGlassButton()
+                Button("파일 열기…",action:openFiles).ringGlassButton()
                 Spacer()
-                Button("확장 설정 열기") { openExtensionSettings() }.buttonStyle(.glass)
+                Button("확장 설정 열기") { openExtensionSettings() }.ringGlassButton()
             }
             .controlSize(.large)
         }
@@ -249,7 +249,7 @@ private struct RingFeatureSettings: View {
             }
             Text("영상 코덱은 선택한 파일에서 지원하는 항목만 표시해요. WebM에 음성 변환이 필요하면 실행 전에 확인합니다.")
                 .font(.caption).foregroundStyle(.secondary)
-            HStack { Spacer(); Button("완료") { dismiss() }.buttonStyle(.glassProminent) }
+            HStack { Spacer(); Button("완료") { dismiss() }.ringGlassButton(prominent: true) }
         }.padding(24).frame(width: 440)
     }
 }

@@ -45,7 +45,7 @@ struct GlassPanel<Content: View>: View {
                             .font(.system(size: 11, weight: .bold))
                             .frame(width: 28, height: 28)
                     }
-                    .buttonStyle(.glass)
+                    .ringGlassButton()
                     .buttonBorderShape(.circle)
                     Spacer()
                     Text(subtitle)
@@ -66,7 +66,7 @@ struct GlassPanel<Content: View>: View {
             if value.ready { measure(value.height) }
         }
         .opacity(ready ? 1 : 0)
-        .glassEffect(.regular, in: RoundedRectangle(cornerRadius: 30, style: .continuous))
+        .ringGlass(.regular, in: RoundedRectangle(cornerRadius: 30, style: .continuous))
         .hitTestableGlass(RoundedRectangle(cornerRadius: 30, style: .continuous))
     }
 }
@@ -318,13 +318,13 @@ struct CropRatioControls: View {
             if !ratio.isSquare && ratio != .free {
                 ForEach([false, true], id: \.self) { value in
                     Button { portrait = value } label: { Image(systemName: value ? "rectangle.portrait" : "rectangle") }
-                        .buttonStyle(.glass).tint(portrait == value ? .accentColor : nil)
+                        .ringGlassButton().tint(portrait == value ? .accentColor : nil)
                         .accessibilityLabel(value ? "세로 비율" : "가로 비율")
                 }
             }
             Spacer(minLength: 4)
             if let size { Text(verbatim: size).font(.system(size: 11).monospacedDigit()).foregroundStyle(.secondary) }
-            Button("재설정", action: reset).buttonStyle(.glass).disabled(!canReset)
+            Button("재설정", action: reset).ringGlassButton().disabled(!canReset)
         }
     }
 }
@@ -410,10 +410,10 @@ struct CropPanel: View {
             }
             HStack(spacing: 8) {
                 Spacer()
-                Button("취소", action: model.backToRing).buttonStyle(.glass)
+                Button("취소", action: model.backToRing).ringGlassButton()
                 Button("적용") { model.applyRegion(crop) }
                     .disabled(model.isWorking)
-                    .buttonStyle(.glassProminent)
+                    .ringGlassButton(prominent: true)
                     .keyboardShortcut(.defaultAction)
             }
             .controlSize(.regular)
@@ -561,12 +561,12 @@ struct AddBackgroundPanel: View {
                 Button("초기화") {
                     withAnimation(.snappy) { background = .gradient(0); padding = 160; corner = 24; shadow = 24; ratio = .auto }
                 }
-                .buttonStyle(.glass)
+                .ringGlassButton()
                 Spacer()
-                Button("취소", action: model.backToRing).buttonStyle(.glass)
+                Button("취소", action: model.backToRing).ringGlassButton()
                 Button("배경 넣어 저장", action: saveBackground)
                     .disabled(model.isWorking)
-                    .buttonStyle(.glassProminent)
+                    .ringGlassButton(prominent: true)
                     .keyboardShortcut(.defaultAction)
             }
             .controlSize(.regular)

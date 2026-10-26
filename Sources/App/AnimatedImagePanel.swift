@@ -172,9 +172,9 @@ struct AnimatedImagePanel: View {
                 }
                 HStack(spacing: 8) {
                     Spacer()
-                    Button("취소", action: back).buttonStyle(.glass)
+                    Button("취소", action: back).ringGlassButton()
                     Button(frameFormat.map { "\($0.rawValue.uppercased()) 한 장 저장" } ?? "\(outputFormat.rawValue.uppercased())로 저장", action: save)
-                        .buttonStyle(.glassProminent).keyboardShortcut(.defaultAction)
+                        .ringGlassButton(prominent: true).keyboardShortcut(.defaultAction)
                         .disabled(playback.image == nil || playback.error != nil || info.editingIssue != nil || model.isWorking)
                         .accessibilityIdentifier("animation.save")
                 }
@@ -224,7 +224,7 @@ struct AnimatedImagePanel: View {
                 Button { playback.toggle() } label: {
                     Image(systemName: playback.playing ? "pause.fill" : "play.fill").frame(width: 18)
                 }
-                .buttonStyle(.glass).accessibilityLabel(playback.playing ? "미리보기 일시 정지" : "움짤 미리보기 재생")
+                .ringGlassButton().accessibilityLabel(playback.playing ? "미리보기 일시 정지" : "움짤 미리보기 재생")
                 .accessibilityIdentifier("animation.play").disabled(playback.image == nil || playback.error != nil)
                 Slider(value: Binding(get: { Double(playback.index) }, set: { playback.seek(Int($0)) }),
                        in: 0...Double(info.frameCount - 1))
